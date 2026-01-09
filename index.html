@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="description"
+        content="KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering.">
+  <meta name="keywords" content="KBQA, LLM, Reinforcement Learning, GRPO, RRS, Knowledge Graph">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering</title>
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+
+  <style>
+    body { font-family: 'Noto Sans', sans-serif; }
+    .title { font-family: 'Google Sans', sans-serif; }
+    .publication-title { font-family: 'Google Sans', sans-serif; font-weight: bold; }
+    .publication-authors { font-family: 'Google Sans', sans-serif; font-size: 1.2rem; }
+    .author-block { display: inline-block; margin-right: 10px; }
+    .publication-links { margin-top: 20px; }
+    .abstract-text { font-size: 1.1rem; line-height: 1.6; text-align: justify; }
+    /* 图片容器样式，增加自适应和阴影 */
+    .teaser-image-container {
+      margin-bottom: 20px;
+      padding: 10px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+    }
+    .teaser-image { width: 100%; height: auto; border-radius: 5px; }
+    
+    .bibtex-section { background-color: #f5f5f5; padding: 20px; border-radius: 10px; overflow-x: auto; font-size: 0.9rem;}
+    pre { background-color: transparent; padding: 0; }
+    footer { margin-top: 50px; padding-bottom: 30px; background-color: #fafafa; }
+    
+    /* 简单的 placeholder 样式，用于没有图片时 */
+    .img-placeholder {
+      background-color: #f0f0f0;
+      color: #666;
+      padding: 40px;
+      text-align: center;
+      border-radius: 10px;
+      border: 2px dashed #ccc;
+    }
+  </style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">KBQA-R1: Reinforcing Large Language Models <br>for Knowledge Base Question Answering</h1>
+          
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">Xin Sun<sup>1</sup>,</span>
+            <span class="author-block">Zhongqi Chen<sup>1</sup>,</span>
+            <span class="author-block">Xing Zheng<sup>1</sup>,</span>
+            <span class="author-block">Qiang Liu<sup>1</sup>,</span>
+            <span class="author-block">Shu Wu<sup>1</sup>,</span>
+            <span class="author-block">Bowen Song<sup>1</sup>,</span>
+            <span class="author-block">Zilei Wang<sup>1</sup>,</span>
+            <span class="author-block">Weiqiang Wang<sup>1</sup>,</span>
+            <span class="author-block">Liang Wang<sup>1</sup></span>
+          </div>
+
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><sup>1</sup>Chinese Academy of Sciences (CAS)</span>
+          </div>
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <span class="link-block">
+                <a href="https://arxiv.org/abs/2512.10999" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="ai ai-arxiv"></i></span>
+                  <span>arXiv</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://github.com/sunxin000/KBQA-R1" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fab fa-github"></i></span>
+                  <span>Code</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://arxiv.org/pdf/2512.10999.pdf" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                  <span>Paper</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <div class="teaser-image-container">
+          <img src="./static/images/framework.jpg" class="teaser-image" alt="KBQA-R1 Framework"
+               onerror="this.style.display='none'; document.getElementById('placeholder').style.display='block';">
+          
+          <div id="placeholder" class="img-placeholder" style="display:none;">
+            <i class="fas fa-image fa-3x"></i><br><br>
+            <b>Image Not Found</b><br>
+            Please upload your framework image to: <br>
+            <code>./static/images/framework.jpg</code>
+          </div>
+        </div>
+        
+        <h2 class="subtitle has-text-centered">
+          <b>KBQA-R1</b> utilizes reinforcement learning with <b>Group Relative Policy Optimization (GRPO)</b> and <b>Referenced Rejection Sampling (RRS)</b> to ground LLM reasoning in knowledge base execution.
+        </h2>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified abstract-text">
+          <p>
+            Knowledge Base Question Answering (KBQA) challenges models to bridge the gap between natural language and strict knowledge graph schemas by generating executable logical forms. While Large Language Models (LLMs) have advanced this field, current approaches often struggle with a dichotomy of failure: they either generate hallucinated queries without verifying schema existence or exhibit rigid, template-based reasoning that mimics synthesized traces without true comprehension.
+          </p>
+          <p>
+            To address these limitations, we present <strong>KBQA-R1</strong>, a framework that shifts the paradigm from text imitation to interaction optimization via Reinforcement Learning. Treating KBQA as a multi-turn decision process, our model learns to navigate the knowledge base using a list of actions, leveraging <strong>Group Relative Policy Optimization (GRPO)</strong> to refine its strategies based on concrete execution feedback. Furthermore, we introduce <strong>Referenced Rejection Sampling (RRS)</strong>, a data synthesis method that resolves cold-start challenges by strictly aligning reasoning traces with ground-truth action sequences.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-full-width">
+        <h2 class="title is-3">Methodology</h2>
+        <div class="content has-text-justified">
+          <p>
+             Our framework consists of two main contributions designed to enhance the reasoning and grounding capabilities of LLMs in KBQA tasks:
+          </p>
+          <div class="columns is-vcentered">
+            <div class="column is-12">
+              <h4 class="title is-5">1. Group Relative Policy Optimization (GRPO) for KBQA</h4>
+              <p>
+                We formulate KBQA as a decision-making process where the LLM interacts with the Knowledge Base. Instead of relying solely on supervised fine-tuning, we use GRPO to optimize the policy. This allows the model to learn from the <i>outcome</i> of its queries (execution feedback) rather than just imitating human traces, leading to more robust generalization.
+              </p>
+              
+              <h4 class="title is-5">2. Referenced Rejection Sampling (RRS)</h4>
+              <p>
+                To tackle the cold-start problem in RL, we introduce RRS. This technique synthesizes high-quality, executable reasoning paths by rejecting traces that do not align with ground-truth logical forms. This provides a strong initialization for the RL process.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3">Code & Usage</h2>
+    <div class="content has-text-justified">
+      <p>
+        The official implementation is available on GitHub. It includes the data processing scripts, the GRPO training loop, and the evaluation code for WebQSP and GrailQA.
+      </p>
+      <div style="text-align: center; margin-top: 20px;">
+        <a href="https://github.com/sunxin000/KBQA-R1" class="button is-dark is-rounded is-medium">
+          <span class="icon"><i class="fab fa-github"></i></span>
+          <span>View on GitHub</span>
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3">BibTeX</h2>
+    <div class="bibtex-section">
+      <pre><code>@article{sun2025kbqa,
+  title={KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering},
+  author={Sun, Xin and Chen, Zhongqi and Zheng, Xing and Liu, Qiang and Wu, Shu and Song, Bowen and Wang, Zilei and Wang, Weiqiang and Wang, Liang},
+  journal={arXiv preprint arXiv:2512.10999},
+  year={2025}
+}</code></pre>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="content has-text-centered">
+      <p>
+        This website is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/">Creative Commons Attribution-ShareAlike 4.0 International License</a>.
+      </p>
+      <p>
+        Template adapted from <a href="https://github.com/nerfies/nerfies.github.io">Nerfies</a>.
+      </p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html><!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="description"
+        content="KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering.">
+  <meta name="keywords" content="KBQA, LLM, Reinforcement Learning, GRPO, RRS, Knowledge Graph">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering</title>
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+
+  <style>
+    body { font-family: 'Noto Sans', sans-serif; }
+    .title { font-family: 'Google Sans', sans-serif; }
+    .publication-title { font-family: 'Google Sans', sans-serif; font-weight: bold; }
+    .publication-authors { font-family: 'Google Sans', sans-serif; font-size: 1.2rem; }
+    .author-block { display: inline-block; margin-right: 10px; }
+    .publication-links { margin-top: 20px; }
+    .abstract-text { font-size: 1.1rem; line-height: 1.6; text-align: justify; }
+    /* 图片容器样式，增加自适应和阴影 */
+    .teaser-image-container {
+      margin-bottom: 20px;
+      padding: 10px;
+      border: 1px solid #eee;
+      border-radius: 10px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+    }
+    .teaser-image { width: 100%; height: auto; border-radius: 5px; }
+    
+    .bibtex-section { background-color: #f5f5f5; padding: 20px; border-radius: 10px; overflow-x: auto; font-size: 0.9rem;}
+    pre { background-color: transparent; padding: 0; }
+    footer { margin-top: 50px; padding-bottom: 30px; background-color: #fafafa; }
+    
+    /* 简单的 placeholder 样式，用于没有图片时 */
+    .img-placeholder {
+      background-color: #f0f0f0;
+      color: #666;
+      padding: 40px;
+      text-align: center;
+      border-radius: 10px;
+      border: 2px dashed #ccc;
+    }
+  </style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">KBQA-R1: Reinforcing Large Language Models <br>for Knowledge Base Question Answering</h1>
+          
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">Xin Sun<sup>1</sup>,</span>
+            <span class="author-block">Zhongqi Chen<sup>1</sup>,</span>
+            <span class="author-block">Xing Zheng<sup>1</sup>,</span>
+            <span class="author-block">Qiang Liu<sup>1</sup>,</span>
+            <span class="author-block">Shu Wu<sup>1</sup>,</span>
+            <span class="author-block">Bowen Song<sup>1</sup>,</span>
+            <span class="author-block">Zilei Wang<sup>1</sup>,</span>
+            <span class="author-block">Weiqiang Wang<sup>1</sup>,</span>
+            <span class="author-block">Liang Wang<sup>1</sup></span>
+          </div>
+
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><sup>1</sup>Chinese Academy of Sciences (CAS)</span>
+          </div>
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <span class="link-block">
+                <a href="https://arxiv.org/abs/2512.10999" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="ai ai-arxiv"></i></span>
+                  <span>arXiv</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://github.com/sunxin000/KBQA-R1" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fab fa-github"></i></span>
+                  <span>Code</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://arxiv.org/pdf/2512.10999.pdf" class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon"><i class="fas fa-file-pdf"></i></span>
+                  <span>Paper</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <div class="teaser-image-container">
+          <img src="./static/images/framework.jpg" class="teaser-image" alt="KBQA-R1 Framework"
+               onerror="this.style.display='none'; document.getElementById('placeholder').style.display='block';">
+          
+          <div id="placeholder" class="img-placeholder" style="display:none;">
+            <i class="fas fa-image fa-3x"></i><br><br>
+            <b>Image Not Found</b><br>
+            Please upload your framework image to: <br>
+            <code>./static/images/framework.jpg</code>
+          </div>
+        </div>
+        
+        <h2 class="subtitle has-text-centered">
+          <b>KBQA-R1</b> utilizes reinforcement learning with <b>Group Relative Policy Optimization (GRPO)</b> and <b>Referenced Rejection Sampling (RRS)</b> to ground LLM reasoning in knowledge base execution.
+        </h2>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified abstract-text">
+          <p>
+            Knowledge Base Question Answering (KBQA) challenges models to bridge the gap between natural language and strict knowledge graph schemas by generating executable logical forms. While Large Language Models (LLMs) have advanced this field, current approaches often struggle with a dichotomy of failure: they either generate hallucinated queries without verifying schema existence or exhibit rigid, template-based reasoning that mimics synthesized traces without true comprehension.
+          </p>
+          <p>
+            To address these limitations, we present <strong>KBQA-R1</strong>, a framework that shifts the paradigm from text imitation to interaction optimization via Reinforcement Learning. Treating KBQA as a multi-turn decision process, our model learns to navigate the knowledge base using a list of actions, leveraging <strong>Group Relative Policy Optimization (GRPO)</strong> to refine its strategies based on concrete execution feedback. Furthermore, we introduce <strong>Referenced Rejection Sampling (RRS)</strong>, a data synthesis method that resolves cold-start challenges by strictly aligning reasoning traces with ground-truth action sequences.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-full-width">
+        <h2 class="title is-3">Methodology</h2>
+        <div class="content has-text-justified">
+          <p>
+             Our framework consists of two main contributions designed to enhance the reasoning and grounding capabilities of LLMs in KBQA tasks:
+          </p>
+          <div class="columns is-vcentered">
+            <div class="column is-12">
+              <h4 class="title is-5">1. Group Relative Policy Optimization (GRPO) for KBQA</h4>
+              <p>
+                We formulate KBQA as a decision-making process where the LLM interacts with the Knowledge Base. Instead of relying solely on supervised fine-tuning, we use GRPO to optimize the policy. This allows the model to learn from the <i>outcome</i> of its queries (execution feedback) rather than just imitating human traces, leading to more robust generalization.
+              </p>
+              
+              <h4 class="title is-5">2. Referenced Rejection Sampling (RRS)</h4>
+              <p>
+                To tackle the cold-start problem in RL, we introduce RRS. This technique synthesizes high-quality, executable reasoning paths by rejecting traces that do not align with ground-truth logical forms. This provides a strong initialization for the RL process.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3">Code & Usage</h2>
+    <div class="content has-text-justified">
+      <p>
+        The official implementation is available on GitHub. It includes the data processing scripts, the GRPO training loop, and the evaluation code for WebQSP and GrailQA.
+      </p>
+      <div style="text-align: center; margin-top: 20px;">
+        <a href="https://github.com/sunxin000/KBQA-R1" class="button is-dark is-rounded is-medium">
+          <span class="icon"><i class="fab fa-github"></i></span>
+          <span>View on GitHub</span>
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop">
+    <h2 class="title is-3">BibTeX</h2>
+    <div class="bibtex-section">
+      <pre><code>@article{sun2025kbqa,
+  title={KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering},
+  author={Sun, Xin and Chen, Zhongqi and Zheng, Xing and Liu, Qiang and Wu, Shu and Song, Bowen and Wang, Zilei and Wang, Weiqiang and Wang, Liang},
+  journal={arXiv preprint arXiv:2512.10999},
+  year={2025}
+}</code></pre>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="content has-text-centered">
+      <p>
+        This website is licensed under a <a rel="license" href="http://creativecommons.org/licenses/by-sa/4.0/">Creative Commons Attribution-ShareAlike 4.0 International License</a>.
+      </p>
+      <p>
+        Template adapted from <a href="https://github.com/nerfies/nerfies.github.io">Nerfies</a>.
+      </p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
