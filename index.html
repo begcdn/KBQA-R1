@@ -9,7 +9,6 @@
   <title>KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering</title>
 
   <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro" rel="stylesheet">
-
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
@@ -22,29 +21,22 @@
     .author-block { display: inline-block; margin-right: 10px; }
     .publication-links { margin-top: 20px; }
     .abstract-text { font-size: 1.1rem; line-height: 1.6; text-align: justify; }
-    /* 图片容器样式，增加自适应和阴影 */
-    .teaser-image-container {
+    
+    /* 图片容器样式 */
+    .image-container {
       margin-bottom: 20px;
       padding: 10px;
       border: 1px solid #eee;
       border-radius: 10px;
       box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+      background-color: #fff;
     }
-    .teaser-image { width: 100%; height: auto; border-radius: 5px; }
+    .result-image { width: 100%; height: auto; border-radius: 5px; }
+    .caption { font-size: 0.9rem; color: #555; margin-top: 10px; font-style: italic; }
     
     .bibtex-section { background-color: #f5f5f5; padding: 20px; border-radius: 10px; overflow-x: auto; font-size: 0.9rem;}
     pre { background-color: transparent; padding: 0; }
     footer { margin-top: 50px; padding-bottom: 30px; background-color: #fafafa; }
-    
-    /* 简单的 placeholder 样式，用于没有图片时 */
-    .img-placeholder {
-      background-color: #f0f0f0;
-      color: #666;
-      padding: 40px;
-      text-align: center;
-      border-radius: 10px;
-      border: 2px dashed #ccc;
-    }
   </style>
 </head>
 <body>
@@ -104,21 +96,12 @@
   <div class="container is-max-desktop">
     <div class="columns is-centered has-text-centered">
       <div class="column is-four-fifths">
-        <div class="teaser-image-container">
-          <img src="./static/images/framework.png" class="teaser-image" alt="KBQA-R1 Framework"
-               onerror="this.style.display='none'; document.getElementById('placeholder').style.display='block';">
-          
-          <div id="placeholder" class="img-placeholder" style="display:none;">
-            <i class="fas fa-image fa-3x"></i><br><br>
-            <b>Image Not Found</b><br>
-            Please upload your framework image to: <br>
-            <code>./static/images/framework.png</code>
+        <div class="image-container">
+          <img src="./static/images/teaser.png" class="result-image" alt="KBQA-R1 Teaser">
+          <div class="caption">
+            Figure 1: <b>KBQA-R1 Overview.</b> Our model treats KBQA as a multi-turn decision process, optimizing interaction via Reinforcement Learning to bridge the gap between LLM reasoning and strict knowledge base execution.
           </div>
         </div>
-        
-        <h2 class="subtitle has-text-centered">
-          <b>KBQA-R1</b> utilizes reinforcement learning with <b>Group Relative Policy Optimization (GRPO)</b> and <b>Referenced Rejection Sampling (RRS)</b> to ground LLM reasoning in knowledge base execution.
-        </h2>
       </div>
     </div>
   </div>
@@ -146,24 +129,22 @@
   <div class="container is-max-desktop">
     <div class="columns is-centered">
       <div class="column is-full-width">
-        <h2 class="title is-3">Methodology</h2>
+        <h2 class="title is-3 has-text-centered">Methodology</h2>
         <div class="content has-text-justified">
           <p>
-             Our framework consists of two main contributions designed to enhance the reasoning and grounding capabilities of LLMs in KBQA tasks:
+            The KBQA-R1 framework consists of two main stages: (1) <b>Cold-Start Data Synthesis</b> via Referenced Rejection Sampling (RRS), and (2) <b>Reinforcement Learning</b> via Group Relative Policy Optimization (GRPO).
           </p>
-          <div class="columns is-vcentered">
-            <div class="column is-12">
-              <h4 class="title is-5">1. Group Relative Policy Optimization (GRPO) for KBQA</h4>
-              <p>
-                We formulate KBQA as a decision-making process where the LLM interacts with the Knowledge Base. Instead of relying solely on supervised fine-tuning, we use GRPO to optimize the policy. This allows the model to learn from the <i>outcome</i> of its queries (execution feedback) rather than just imitating human traces, leading to more robust generalization.
-              </p>
-              
-              <h4 class="title is-5">2. Referenced Rejection Sampling (RRS)</h4>
-              <p>
-                To tackle the cold-start problem in RL, we introduce RRS. This technique synthesizes high-quality, executable reasoning paths by rejecting traces that do not align with ground-truth logical forms. This provides a strong initialization for the RL process.
-              </p>
+          
+          <div class="image-container has-text-centered">
+            <img src="./static/images/pipeline.png" class="result-image" alt="KBQA-R1 Pipeline">
+            <div class="caption">
+              Figure 2: <b>The Framework of KBQA-R1.</b> Left: RRS constructs high-quality SFT data by filtering trajectories that match ground-truth logical forms. Right: GRPO optimizes the policy by rewarding successful execution and reasoning steps.
             </div>
           </div>
+
+          <p>
+            Specifically, we model the reasoning process as a sequence of actions (e.g., relation retrieval, set operations). The model receives feedback from the environment (Virtuoso engine) to adjust its policy, ensuring generated queries are not only syntactically correct but also executable against the specific KB schema.
+          </p>
         </div>
       </div>
     </div>
@@ -172,16 +153,21 @@
 
 <section class="section">
   <div class="container is-max-desktop">
-    <h2 class="title is-3">Code & Usage</h2>
-    <div class="content has-text-justified">
-      <p>
-        The official implementation is available on GitHub. It includes the data processing scripts, the GRPO training loop, and the evaluation code for WebQSP and GrailQA.
-      </p>
-      <div style="text-align: center; margin-top: 20px;">
-        <a href="https://github.com/sunxin000/KBQA-R1" class="button is-dark is-rounded is-medium">
-          <span class="icon"><i class="fab fa-github"></i></span>
-          <span>View on GitHub</span>
-        </a>
+    <div class="columns is-centered">
+      <div class="column is-full-width">
+        <h2 class="title is-3 has-text-centered">Experimental Results</h2>
+        <div class="content has-text-justified">
+          <p>
+            We evaluated KBQA-R1 on three standard benchmarks: WebQSP, GrailQA, and GraphQuestions. The results demonstrate that our RL-based approach significantly outperforms strong baselines, particularly in scenarios requiring multi-hop reasoning and schema linking.
+          </p>
+          
+          <div class="image-container has-text-centered">
+            <img src="./static/images/results.png" class="result-image" alt="Experimental Results">
+            <div class="caption">
+              Figure 3: <b>Main Results.</b> Comparison with state-of-the-art methods on WebQSP and GrailQA benchmarks. KBQA-R1 achieves superior performance by effectively grounding reasoning in execution feedback.
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
