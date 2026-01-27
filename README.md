@@ -8,12 +8,6 @@ This repository contains the official implementation of **KBQA-R1**, an action-c
   <img src="assets/kbqa_r1_framework.png" alt="KBQA-R1 Framework" width="800"/>
 </p>
 
-## Key Features
-
-- **Action-Centric Design**: Operates within a well-defined action space (Find_Relation, Merge, Order, Compare, Time_Constraint, Count, Finish)
-- **Referenced Rejection Sampling (RRS)**: Novel data synthesis strategy for high-quality SFT warm-start
-- **GRPO Optimization**: Outcome-based RL with low-variance advantage estimation
-- **Multi-Dataset Support**: WebQSP, GrailQA, and GraphQ datasets
 
 ## Installation
 
