@@ -1,6 +1,5 @@
 # KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering
 
-[![arXiv](https://img.shields.io/badge/arXiv-2512.10999-b31b1b.svg)](https://arxiv.org/abs/2512.10999)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 This repository contains the official implementation of **KBQA-R1**, an action-centric reinforcement learning framework for Knowledge Base Question Answering (KBQA). KBQA-R1 treats KBQA as a multi-turn Markov Decision Process (MDP) and optimizes the policy using Group Relative Policy Optimization (GRPO) with outcome-based rewards.
@@ -176,18 +175,6 @@ kbqa-r1/
 
 
 
-## Citation
-
-If you find this work useful, please cite our paper:
-
-```bibtex
-@article{kbqa-r1,
-  title={KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering},
-  author={Sun, Xin and Chen, Zhongqi and Zheng, Xing and Liu, Qiang and Wu, Shu and Song, Bowen and Wang, Zilei and Wang, Weiqiang and Wang, Liang},
-  journal={arXiv preprint arXiv:2512.10999},
-  year={2025}
-}
-```
 
 ## License
 
