@@ -2,6 +2,16 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/MODIFIED_INTERACTION.jpg" alt="Modified Figure 1" width="800"/><br>
+  <em><b>Modified Figure 1:</b> A complete illustration of the interaction process.</em>
+</p>
+
+<p align="center">
+  <img src="assets/SAMPLE.jpg" alt="Step-by-step Example" width="800"/><br>
+  <em><b>Figure 2:</b> A concrete step-by-step example detailing the entire reasoning trajectory, showing how the model explores and reaches the correct answer.</em>
+</p>
+
 This repository contains the official implementation of **KBQA-R1**, an action-centric reinforcement learning framework for Knowledge Base Question Answering (KBQA). KBQA-R1 treats KBQA as a multi-turn Markov Decision Process (MDP) and optimizes the policy using Group Relative Policy Optimization (GRPO) with outcome-based rewards.
 
 <p align="center">
