@@ -7,9 +7,19 @@
   <em><b>Modified Figure 1:</b> A complete illustration of the interaction process.</em>
 </p>
 
+## Step-by-step Example
+
 <p align="center">
   <img src="assets/SAMPLE.jpg" alt="Step-by-step Example" width="800"/><br>
   <em><b>Figure 2:</b> A concrete step-by-step example detailing the entire reasoning trajectory, showing how the model explores and reaches the correct answer.</em>
+</p>
+
+
+## Case Study
+
+<p align="center">
+  <img src="assets/case.png" alt="Case Study Analysis" width="800"/><br>
+  <em><b>Figure 3:</b> A detailed case study illustrating the model's reasoning, exploration, and self-correction mechanics.</em>
 </p>
 
 This repository contains the official implementation of **KBQA-R1**, an action-centric reinforcement learning framework for Knowledge Base Question Answering (KBQA). KBQA-R1 treats KBQA as a multi-turn Markov Decision Process (MDP) and optimizes the policy using Group Relative Policy Optimization (GRPO) with outcome-based rewards.
@@ -17,6 +27,10 @@ This repository contains the official implementation of **KBQA-R1**, an action-c
 <p align="center">
   <img src="assets/kbqa_r1_framework.png" alt="KBQA-R1 Framework" width="800"/>
 </p>
+
+
+
+
 
 
 ## Installation
