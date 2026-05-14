@@ -1,4 +1,4 @@
-# KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering
+# [ICML 2026]KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
