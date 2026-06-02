@@ -8,6 +8,23 @@ This repository contains the official implementation of **KBQA-R1**, an action-c
   <img src="assets/kbqa_r1_framework.png" alt="KBQA-R1 Framework" width="800"/>
 </p>
 
+## Model Checkpoints
+
+The released KBQA-R1 checkpoints are available in a single Hugging Face repository: [unixin/kbqa-r1](https://huggingface.co/unixin/kbqa-r1).
+
+- `grailqa/`: KBQA-R1 checkpoint for GrailQA.
+- `webqsp/`: KBQA-R1 checkpoint for WebQSP.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+repo_id = "unixin/kbqa-r1"
+subfolder = "webqsp"  # or "grailqa"
+
+tokenizer = AutoTokenizer.from_pretrained(repo_id, subfolder=subfolder)
+model = AutoModelForCausalLM.from_pretrained(repo_id, subfolder=subfolder)
+```
+
 ## Key Features
 
 - **Action-Centric Design**: Operates within a well-defined action space (Find_Relation, Merge, Order, Compare, Time_Constraint, Count, Finish)
