@@ -1,8 +1,9 @@
 # [ICML 2026]KBQA-R1: Reinforcing Large Language Models for Knowledge Base Question Answering
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-2601.11443-b31b1b.svg)](https://arxiv.org/abs/2601.11443)
+[![arXiv](https://img.shields.io/badge/arXiv-2512.10999-b31b1b.svg)](https://arxiv.org/abs/2512.10999)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-unixin%2Fkbqa--r1-yellow?logo=huggingface)](https://huggingface.co/unixin/kbqa-r1)
+[![ICML 2026](https://img.shields.io/badge/ICML-2026-4b8bbe.svg)](https://icml.cc/Conferences/2026)
 
 This repository contains the official implementation of **KBQA-R1**, an action-centric reinforcement learning framework for Knowledge Base Question Answering (KBQA). KBQA-R1 treats KBQA as a multi-turn Markov Decision Process (MDP) and optimizes the policy using Group Relative Policy Optimization (GRPO) with outcome-based rewards.
 
