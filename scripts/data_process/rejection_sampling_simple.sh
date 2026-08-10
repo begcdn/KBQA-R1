@@ -11,7 +11,7 @@ export RAY_DEBUG=1
 export RAY_memory_monitor_refresh_ms=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-REPO_ROOT="/ossfs/workspace/kbqa-r1"
+REPO_ROOT=${REPO_ROOT:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 use_dynamic_bsz=true
 # 检测 GPU 数量
 detect_gpu_count() {
@@ -37,20 +37,27 @@ if [ "$GPU_COUNT" -eq 16 ]; then
     N_GPUS_PER_NODE=16
     TENSOR_MODEL_PARALLEL_SIZE=4
     GPU_MEM_UTIL=0.6
-    export BASE_MODEL='/aml/share/aml/sota_models/Qwen3/Qwen3-32B'
-    export MODEL_PATH='/aml/share/aml/sota_models/Qwen3/Qwen3-32B'
+    export BASE_MODEL=${BASE_MODEL:-'/aml/share/aml/sota_models/Qwen3/Qwen3-32B'}
+    export MODEL_PATH=${MODEL_PATH:-"${BASE_MODEL}"}
 
     echo "PPU machine detected: Using 16 GPUs"
-elif [ "$GPU_COUNT" -eq 8 ]; then
+elif [ "$GPU_COUNT" -ge 8 ]; then
     export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
     N_GPUS_PER_NODE=8
     TENSOR_MODEL_PARALLEL_SIZE=4
     GPU_MEM_UTIL=0.6
     # export BASE_MODEL='/ossfs/workspace/aml0/Qwen3/Qwen3-32B'
     # export MODEL_PATH='/ossfs/workspace/aml0/Qwen3/Qwen3-32B'
-    export BASE_MODEL='/ossfs/workspace/aml0/Qwen3/Qwen2.5-72B-Instruct'
-    export MODEL_PATH='/ossfs/workspace/aml0/Qwen3/Qwen2.5-72B-Instruct'
+    export BASE_MODEL=${BASE_MODEL:-'/ossfs/workspace/aml0/Qwen3/Qwen2.5-72B-Instruct'}
+    export MODEL_PATH=${MODEL_PATH:-"${BASE_MODEL}"}
     echo "Standard machine detected: Using 8 GPUs"
+else
+    N_GPUS_PER_NODE=${GPU_COUNT}
+    TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-1}
+    GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.75}
+    : "${MODEL_PATH:?Set MODEL_PATH when running on fewer than 8 GPUs}"
+    export BASE_MODEL=${BASE_MODEL:-"${MODEL_PATH}"}
+    echo "Small GPU host detected: Using ${GPU_COUNT} GPU(s)"
 fi
 
 # 基础配置
@@ -96,12 +103,24 @@ TRAIN_FILES_STR+="]"
 # Rejection sampling 参数
 MAX_SAMPLES=${MAX_SAMPLES:-3}           # 每个样本最多采样次数
 REWARD_THRESHOLD=${REWARD_THRESHOLD:-0.8}  # 奖励阈值
-NUM_SAMPLES=${NUM_SAMPLES:-}            # 处理样本数量（空=全部）
+NUM_SAMPLES=${NUM_SAMPLES:-null}         # null processes the full split
+HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
+HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-6}
+HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-24}
 
 # GPU 配置
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${GPU_COUNT}}
 TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-8}
+if (( NGPUS_PER_NODE < 4 )); then
+    VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
+    MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-2}
+    MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-8192}
+else
+    VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-1024}
+    MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-48}
+    MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-16384}
+fi
 
 # 生成时间戳
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -137,11 +156,11 @@ echo "Output Dir   : ${OUTPUT_DIR}"
 echo "Model        : ${BASE_MODEL}"
 echo "Max Samples  : ${MAX_SAMPLES}"
 echo "Reward Thresh: ${REWARD_THRESHOLD}"
-echo "Num Samples  : ${NUM_SAMPLES:-all}"
+echo "Num Samples  : ${NUM_SAMPLES}"
 echo "GPUs         : ${NGPUS_PER_NODE}"
 echo "Experiment   : ${EXPERIMENT_NAME}"
+echo "HyPER-R1     : ${HYPER_R1_ENABLE}"
 echo "========================================"
-
 # 核心思路：使用 main_ppo_kbqa.py 的 val_only=true 模式
 # 这样会：
 # 1. 初始化所有 workers（actor_rollout_wg 等）
@@ -164,7 +183,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     data.filter_overlong_prompts=true \
     data.truncation='left' \
     data.train_batch_size=512 \
-    data.val_batch_size=1024 \
+    data.val_batch_size=${VAL_BATCH_SIZE} \
     data.max_prompt_length=14336 \
     data.max_response_length=1024 \
     data.max_start_length=2048 \
@@ -186,19 +205,19 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=48 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
     actor_rollout_ref.actor.state_masking=true \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=48 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_BATCHED_TOKENS} \
     actor_rollout_ref.rollout.n=${MAX_SAMPLES} \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=0.9 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=48 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     algorithm.kl_ctrl.kl_coef=0.001 \
     trainer.logger=['console','tensorboard'] \
@@ -221,6 +240,9 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sexpr_config.enable_entity_linking=true \
     sexpr_config.enable_semantic_validation=true \
     sexpr_config.use_complete_sparql_converter=true \
+    hyper_r1.enable=${HYPER_R1_ENABLE} \
+    hyper_r1.max_active=${HYPER_R1_MAX_ACTIVE} \
+    hyper_r1.max_nodes=${HYPER_R1_MAX_NODES} \
     max_turns=${SEXPR_MAX_TURNS} \
     use_odbc=true \
     use_aioodbc=false \
@@ -259,8 +281,3 @@ echo "    --log_file ${LOG_FILE} \\"
 echo "    --reward_threshold ${REWARD_THRESHOLD} \\"
 echo "    --output_file ${OUTPUT_DIR}/train_sft.parquet"
 echo "========================================"
-
-
-cd /ossfs/workspace/
-sleep 10
-python train.py

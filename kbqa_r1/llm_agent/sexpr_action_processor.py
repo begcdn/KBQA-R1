@@ -9,6 +9,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple
 
+from ..fork_r1 import ForkDecision, build_fork_decision
 from ..sexpr.action_parser import ActionResult, ActionType
 from ..sexpr.constants import COMPARISON_MODE_MAPPING
 from ..sexpr.limit import name_relation_list, tc_time_list
@@ -85,6 +86,12 @@ class SExprActionProcessor:
         self._sample_candidate_relations: Dict[int, List] = {}
         self._sample_ranked_top5: Dict[int, List] = {}
         self._sample_per_action_states: Dict[int, Dict] = {}
+
+        # Persistent across turns. The ordinary per-action dictionaries above
+        # are intentionally cleared every turn and therefore cannot support
+        # trajectory-level counterfactual credit.
+        self._fork_r1_decisions: Dict[int, List[ForkDecision]] = defaultdict(list)
+        self._fork_r1_current_turn = 0
 
         # Optional debug breakpoint configuration
         try:
@@ -244,6 +251,15 @@ class SExprActionProcessor:
         self._cand_notmet_count = 0
         # Also reset per-step relation similarity for new batch
         self._per_step_relation_similarity.clear()
+        self._fork_r1_decisions.clear()
+
+    def set_fork_r1_turn(self, turn: int):
+        self._fork_r1_current_turn = int(turn)
+
+    def get_fork_r1_decisions(self, sample_id: int = None):
+        if sample_id is None:
+            return {key: list(value) for key, value in self._fork_r1_decisions.items()}
+        return list(self._fork_r1_decisions.get(sample_id, []))
     
     def get_candidate_stats(self):
         """Get candidate statistics"""
@@ -1396,6 +1412,33 @@ class SExprActionProcessor:
             if selected_relations:
                 # Use the best relation
                 best_relation = selected_relations[0]
+
+                # Save the exact pre-action state and a hard sibling before the
+                # selected JOIN mutates the state manager. This ledger is the
+                # native intervention point used by Fork-R1.
+                if sample_id is not None and action_index is not None:
+                    state_snapshot = self.state_manager.snapshot_sample_state(sample_id)
+                    similarity_scores = getattr(
+                        self.relation_retrieval, "last_similarity_scores", None
+                    )
+                    decision = build_fork_decision(
+                        sample_id=sample_id,
+                        turn=self._fork_r1_current_turn,
+                        action_index=action_index,
+                        step_number=int(getattr(action, "step_number", 0) or 0),
+                        entity_argument=entity_arg,
+                        relation_prompt=relation_description,
+                        selected_relation=best_relation,
+                        candidates=candidate_relations,
+                        scores=similarity_scores,
+                        state_before=state_snapshot["function_state"],
+                        expression_counter=state_snapshot["expression_counter"],
+                        entities=state_snapshot["entities"],
+                        prompt=state_snapshot["prompt"],
+                        raw_action=str(getattr(action, "raw_text", "") or ""),
+                    )
+                    if decision is not None:
+                        self._fork_r1_decisions[sample_id].append(decision)
                 
                 # Record only TOP-1 score for this step (not all candidate scores)
                 # This gives meaningful distribution of selected relation quality
@@ -1742,4 +1785,3 @@ class SExprActionProcessor:
         
         action.is_valid = True
         return action
-

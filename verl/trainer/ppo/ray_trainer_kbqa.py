@@ -232,6 +232,20 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        hyper_enabled = bool(config.get("hyper_r1_enable", False))
+        if hyper_enabled:
+            if "hyper_r1_action_mask" not in data.batch:
+                raise RuntimeError(
+                    "HyPER-R1 is enabled but hyper_r1_action_mask is missing"
+                )
+            from kbqa_r1.hyper_r1 import concentrate_graph_credit
+
+            data.batch["advantages"] = concentrate_graph_credit(
+                data.batch["advantages"],
+                data.batch["hyper_r1_action_mask"],
+                weight=float(config.get("hyper_r1_credit_weight", 1.0)),
+            )
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -251,6 +265,32 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        # Fork-R1 keeps standard outcome GRPO for the trajectory, then adds
+        # paired intervention credit only to the factual graph-action tokens.
+        fork_fields = {
+            "fork_r1_action_mask",
+            "fork_r1_factual_reward",
+            "fork_r1_counterfactual_reward",
+        }
+        fork_enabled = bool(config.get("fork_r1_enable", False))
+        missing_fork_fields = fork_fields.difference(data.batch.keys())
+        if fork_enabled and missing_fork_fields:
+            raise RuntimeError(
+                "Fork-R1 is enabled but counterfactual rollout fields are missing: "
+                + ", ".join(sorted(missing_fork_fields))
+            )
+        if not missing_fork_fields:
+            from kbqa_r1.fork_r1 import apply_counterfactual_credit
+
+            weight = float(config.get("fork_r1_credit_weight", 1.0))
+            data.batch["advantages"] = apply_counterfactual_credit(
+                data.batch["advantages"],
+                data.batch["fork_r1_action_mask"],
+                data.batch["fork_r1_factual_reward"],
+                data.batch["fork_r1_counterfactual_reward"],
+                weight=weight,
+            )
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -428,7 +468,16 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        metadata=None,
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -441,6 +490,10 @@ class RayPPOTrainer:
             "score": scores,
             "step": [self.global_steps] * n,
         }
+        if metadata is not None:
+            if len(metadata) != n:
+                raise ValueError("generation metadata must align with dumped samples")
+            base_data["metadata"] = metadata
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -561,6 +614,9 @@ class RayPPOTrainer:
             enable_sexpr_mode=True,
             enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
             enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
+            hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+            hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
+            hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
             sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
             use_odbc=self.config.get('use_odbc', False),
             use_aioodbc=self.config.get('use_aioodbc', True),
@@ -614,6 +670,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_metadata = []
         max_val_samples = getattr(self.config.trainer, "max_val_samples", None)
 
         # 统计总的 validation 样本数，用于 tqdm total
@@ -699,6 +756,14 @@ class RayPPOTrainer:
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
             sample_gts.extend(ground_truths)
+            metadata = test_batch.non_tensor_batch.get("extra_info")
+            if metadata is None:
+                sample_metadata.extend({} for _ in range(len(test_batch)))
+            else:
+                sample_metadata.extend(
+                    dict(value) if isinstance(value, dict) else {}
+                    for value in metadata
+                )
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -755,6 +820,9 @@ class RayPPOTrainer:
                     enable_sexpr_mode=True,
                     enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
                     enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
+                    hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+                    hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
+                    hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
                     sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                     use_odbc=self.config.get('use_odbc', False),
                     use_aioodbc=self.config.get('use_aioodbc', True),
@@ -820,6 +888,14 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            if "hyper_r1_execution_counts" in test_batch.batch:
+                execution_counts = (
+                    test_batch.batch["hyper_r1_execution_counts"].detach().cpu().tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_execution_calls"].extend(
+                    float(value) for value in execution_counts
+                )
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -901,6 +977,7 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                metadata=sample_metadata,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -1360,6 +1437,9 @@ class RayPPOTrainer:
                                 enable_sexpr_mode=True,
                                 enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
                                 enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
+                                hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+                                hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
+                                hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
                                 sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                                 use_odbc=self.config.get('use_odbc', False),
                                 use_aioodbc=self.config.get('use_aioodbc', True),
@@ -1614,6 +1694,31 @@ class RayPPOTrainer:
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
+
+                        if self.config.algorithm.get("hyper_r1_enable", False):
+                            required = {
+                                "hyper_r1_execution_counts",
+                                "response_mask",
+                            }
+                            missing = required.difference(batch.batch.keys())
+                            if missing:
+                                raise RuntimeError(
+                                    "HyPER-R1 rollout fields are missing: "
+                                    + ", ".join(sorted(missing))
+                                )
+                            from kbqa_r1.hyper_r1 import charge_execution_budget
+
+                            batch.batch["token_level_rewards"] = charge_execution_budget(
+                                batch.batch["token_level_rewards"],
+                                batch.batch["response_mask"],
+                                batch.batch["hyper_r1_execution_counts"],
+                                max_nodes=int(
+                                    self.config.get("hyper_r1", {}).get("max_nodes", 24)
+                                ),
+                                cost=float(
+                                    self.config.algorithm.get("hyper_r1_budget_cost", 0.05)
+                                ),
+                            )
 
                         batch = compute_advantage(
                             batch,

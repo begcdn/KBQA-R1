@@ -7,7 +7,7 @@ set -euo pipefail
 # -----------------------------
 # Repo and dataset defaults
 # -----------------------------
-REPO_ROOT="/ossfs/workspace/kbqa-r1"
+REPO_ROOT=${REPO_ROOT:-"$(cd "$(dirname "$0")/../.." && pwd)"}
 export WANDB_MODE=offline
 export WANDB_API_KEY=${WANDB_API_KEY:-""}
 PROJECT_NAME=${PROJECT_NAME:-"KBQA-R1-SFT"}
@@ -146,7 +146,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     model.path="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
     model.use_remove_padding=true \
-    trainer.default_local_dir="checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
+  trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.save_freq=after_each_epoch \
@@ -170,7 +170,7 @@ else
     model.partial_pretrain="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
     use_remove_padding=true \
-    trainer.default_local_dir="checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
+    trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.total_training_steps=${TOTAL_STEPS} \
@@ -189,6 +189,3 @@ echo "========================================"
 echo "Experiment: ${EXP_NAME}"
 echo "Logs: ${LOG_DIR}/${EXP_NAME//\//_}.log"
 echo "========================================"
-
-cd /ossfs/workspace
-python train.py

@@ -7,11 +7,13 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
 from verl import DataProto
+from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
+from kbqa_r1.hyper_r1 import HypothesisGraph, combine_function_states
 
 # Import S-Expression components
 from ..sexpr import (ActionParser, FunctionBuilder, SExprExecutor,
@@ -66,6 +68,13 @@ class SExprLLMGenerationManager:
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        self.hyper_r1_enable = bool(getattr(config, "hyper_r1_enable", False))
+        self.hyper_graph = HypothesisGraph(
+            max_active=int(getattr(config, "hyper_r1_max_active", 6)),
+            max_nodes=int(getattr(config, "hyper_r1_max_nodes", 24)),
+        )
+        self._hyper_selected: Dict[int, str] = {}
+        self._hyper_action_records: Dict[int, List[dict]] = {}
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -203,6 +212,285 @@ class SExprLLMGenerationManager:
     def _record_timeout(self, sample_id: int, step: int):
         """Wrapper for timeout recording"""
         self.timeout_tracker.record_timeout(step, sample_id)
+
+    @staticmethod
+    def _target_expression(function_state: List[str]) -> str:
+        for statement in reversed(function_state):
+            match = re.match(r"^(expression\d+)\s*=", str(statement).strip())
+            if match:
+                return match.group(1)
+        raise ValueError("function state has no target expression")
+
+    @staticmethod
+    def _expression_counter(function_state: List[str]) -> int:
+        ids = [
+            int(value)
+            for statement in function_state
+            for value in re.findall(r"\bexpression(\d+)\b", str(statement))
+        ]
+        return max(ids, default=0)
+
+    def _inject_hyper_graph(self, response: str, sample_id: int) -> str:
+        if not self.hyper_r1_enable:
+            return response
+        graph_text = self.hyper_graph.serialize(sample_id)
+        marker = "\n</information>"
+        if marker in response:
+            return response.replace(marker, f"\n{graph_text}{marker}", 1)
+        return response + "\n" + graph_text
+
+    def _hyper_info(self, sample_id: int, message: str, is_final_turn: bool) -> str:
+        info = (
+            "<information>\n"
+            + message
+            + "\n"
+            + self.hyper_graph.serialize(sample_id)
+            + "\n</information>"
+        )
+        return self.result_processor._add_guidance_prompt(info, is_final_turn)
+
+    def _record_hyper_action(self, sample_id: int, action, turn: int, node_id: str = ""):
+        self._hyper_action_records.setdefault(sample_id, []).append(
+            {
+                "turn": int(turn),
+                "action": action.action_type.value,
+                "node_id": node_id,
+                "raw_action": str(action.raw_text or ""),
+            }
+        )
+
+    def _process_hyper_control(self, action, sample_id: int, turn: int) -> str:
+        from ..sexpr.action_parser import ActionType
+
+        is_final_turn = turn == self.config.max_turns - 1
+        try:
+            if action.action_type == ActionType.SELECT_HYPOTHESIS:
+                node = self.hyper_graph.require_active(sample_id, action.arguments[0])
+                current = self.state_manager.snapshot_sample_state(sample_id)
+                self.state_manager.restore_sample_state(
+                    sample_id,
+                    {
+                        "function_state": list(node.function_state),
+                        "expression_counter": self._expression_counter(list(node.function_state)),
+                        "entities": current["entities"],
+                        "prompt": current["prompt"],
+                    },
+                )
+                self._hyper_selected[sample_id] = node.node_id
+                self._record_hyper_action(sample_id, action, turn, node.node_id)
+                return self._hyper_info(
+                    sample_id,
+                    f"Selected {node.node_id}. Further Find_relation actions now expand this hypothesis.",
+                    is_final_turn,
+                )
+
+            if action.action_type == ActionType.PRUNE_HYPOTHESIS:
+                node_id = action.arguments[0]
+                self.hyper_graph.prune(sample_id, node_id)
+                if self._hyper_selected.get(sample_id) == node_id:
+                    self._hyper_selected.pop(sample_id, None)
+                self._record_hyper_action(sample_id, action, turn, node_id)
+                return self._hyper_info(sample_id, f"Pruned {node_id}.", is_final_turn)
+
+            if action.action_type == ActionType.COMMIT_HYPOTHESIS:
+                node = self.hyper_graph.commit(sample_id, action.arguments[0])
+                self._hyper_selected[sample_id] = node.node_id
+                self._record_hyper_action(sample_id, action, turn, node.node_id)
+                values = ", ".join(node.denotation)
+                return self._hyper_info(
+                    sample_id,
+                    f"Committed {node.node_id}. Return exactly these values in <answer>: {values}",
+                    is_final_turn,
+                )
+
+            if action.action_type == ActionType.COMBINE_HYPOTHESES:
+                left = self.hyper_graph.require_active(sample_id, action.arguments[0])
+                right = self.hyper_graph.require_active(sample_id, action.arguments[1])
+                state, target = combine_function_states(
+                    left.function_state,
+                    left.target_expression,
+                    right.function_state,
+                    right.target_expression,
+                )
+                sexpr_result = self.sexpr_generator.generate_sexpr_from_strings(state, target)
+                if not sexpr_result.is_valid:
+                    raise ValueError(sexpr_result.error_message)
+                execution = self.sexpr_executor.execute_sexpr(
+                    sexpr_result.sexpr, function_state=state
+                )
+                if not execution.is_successful:
+                    raise ValueError(execution.error_message)
+                mids = self.result_processor.extract_mid_list(execution.results)
+                node = self.hyper_graph.add_executed(
+                    sample_id=sample_id,
+                    function_state=state,
+                    target_expression=target,
+                    sexpr=sexpr_result.sexpr,
+                    denotation=mids,
+                    parent_id=left.node_id,
+                    operation="combine",
+                    provenance=[f"combined_with:{right.node_id}"],
+                )
+                current = self.state_manager.snapshot_sample_state(sample_id)
+                self.state_manager.restore_sample_state(
+                    sample_id,
+                    {
+                        "function_state": state,
+                        "expression_counter": self._expression_counter(state),
+                        "entities": current["entities"],
+                        "prompt": current["prompt"],
+                    },
+                )
+                effective_id = node.equivalent_to or node.node_id
+                self._hyper_selected[sample_id] = effective_id
+                self._record_hyper_action(sample_id, action, turn, effective_id)
+                return self._hyper_info(
+                    sample_id,
+                    f"Combined {left.node_id} and {right.node_id} into {effective_id}.",
+                    is_final_turn,
+                )
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return self._hyper_info(sample_id, f"Graph action failed: {exc}", is_final_turn)
+        raise ValueError(f"unsupported HyPER-R1 action: {action.action_type}")
+
+    def _register_hyper_execution(
+        self,
+        sample_id: int,
+        processed_actions,
+        sexpr_result,
+        execution_result,
+        mid_list: List[str],
+    ) -> None:
+        """Record the factual program and one hard executable sibling."""
+        if not self.hyper_r1_enable:
+            return
+        from ..sexpr.action_parser import ActionType
+
+        function_state = list(self.state_manager.get_sample_function_state(sample_id))
+        if not self.hyper_graph.has_capacity(sample_id):
+            logger.info(
+                "[HyPER-R1] Node budget reached for sample %s; retaining the existing graph",
+                sample_id,
+            )
+            return
+        target = self._target_expression(function_state)
+        parent_id = self._hyper_selected.get(sample_id)
+        decisions = self.action_processor.get_fork_r1_decisions(sample_id)
+        decision = decisions[-1] if decisions else None
+        has_relation = any(
+            action.action_type == ActionType.FIND_RELATION for action in processed_actions
+        )
+        if decision is not None and decision.turn != self.action_processor._fork_r1_current_turn:
+            decision = None
+
+        operation = (
+            "expand"
+            if has_relation
+            else processed_actions[-1].action_type.value.lower()
+        )
+        contrast_group = None
+        relation_id = None
+        relation_prompt = None
+        score = 0.0
+        if has_relation and decision is not None:
+            contrast_group = (
+                f"turn{decision.turn}:action{decision.action_index}:parent{parent_id or 'root'}"
+            )
+            relation_id = decision.chosen_relation
+            relation_prompt = decision.relation_prompt
+            score = max(0.0, min(1.0, 0.5 + decision.resolver_margin / 2.0))
+
+        factual = self.hyper_graph.add_executed(
+            sample_id=sample_id,
+            function_state=function_state,
+            target_expression=target,
+            sexpr=sexpr_result.sexpr,
+            denotation=mid_list,
+            parent_id=parent_id,
+            operation=operation,
+            relation_id=relation_id,
+            relation_prompt=relation_prompt,
+            resolver_score=score,
+            contrast_group=contrast_group,
+            provenance=["policy_choice"],
+        )
+        self._hyper_selected[sample_id] = factual.equivalent_to or factual.node_id
+        for processed_action in processed_actions:
+            self._record_hyper_action(
+                sample_id,
+                processed_action,
+                self.action_processor._fork_r1_current_turn,
+                self._hyper_selected[sample_id],
+            )
+
+        if not has_relation or decision is None:
+            return
+        if not self.hyper_graph.has_capacity(sample_id):
+            return
+        try:
+            alternative_state = append_intervened_join(decision)
+            alternative_target = self._target_expression(alternative_state)
+            alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
+                alternative_state, alternative_target
+            )
+            if not alternative_sexpr.is_valid:
+                return
+            alternative_execution = self.sexpr_executor.execute_sexpr(
+                alternative_sexpr.sexpr, function_state=alternative_state
+            )
+            if not alternative_execution.is_successful:
+                return
+            alternative_mids = self.result_processor.extract_mid_list(
+                alternative_execution.results
+            )
+            self.hyper_graph.add_executed(
+                sample_id=sample_id,
+                function_state=alternative_state,
+                target_expression=alternative_target,
+                sexpr=alternative_sexpr.sexpr,
+                denotation=alternative_mids,
+                parent_id=parent_id,
+                operation="expand",
+                relation_id=decision.alternative_relation,
+                relation_prompt=decision.relation_prompt,
+                resolver_score=max(0.0, min(1.0, score - decision.resolver_margin)),
+                contrast_group=contrast_group,
+                provenance=["hard_sibling"],
+            )
+        except (KeyError, ValueError, RuntimeError):
+            logger.exception("[HyPER-R1] Failed to execute hard sibling for sample %s", sample_id)
+
+    def _attach_hyper_training_fields(self, output: DataProto, batch_size: int) -> DataProto:
+        """Build token-local masks after the final committed lineage is known."""
+        if not self.hyper_r1_enable:
+            return output
+        responses = output.batch["responses"]
+        action_mask = torch.zeros_like(responses, dtype=torch.float32)
+        execution_counts = torch.zeros(batch_size, dtype=torch.float32, device=responses.device)
+        for sample_id in range(batch_size):
+            graph = self.hyper_graph.state(sample_id)
+            execution_counts[sample_id] = float(graph.execution_calls)
+            target = graph.committed_id or self._hyper_selected.get(sample_id)
+            lineage = set(self.hyper_graph.lineage(sample_id, target)) if target else set()
+            for record in self._hyper_action_records.get(sample_id, []):
+                if record.get("node_id") not in lineage:
+                    continue
+                raw_action = record.get("raw_action") or ""
+                if not raw_action:
+                    continue
+                action_ids = self.tokenizer(
+                    raw_action, add_special_tokens=False
+                )["input_ids"]
+                if not action_ids:
+                    continue
+                width = len(action_ids)
+                row = responses[sample_id].tolist()
+                for start in range(len(row) - width + 1):
+                    if row[start : start + width] == list(action_ids):
+                        action_mask[sample_id, start : start + width] = 1.0
+        output.batch["hyper_r1_action_mask"] = action_mask
+        output.batch["hyper_r1_execution_counts"] = execution_counts
+        return output
     
     def get_timeout_statistics(self) -> dict:
         """Get timeout statistics"""
@@ -211,6 +499,70 @@ class SExprLLMGenerationManager:
     def reset_timeout_statistics(self):
         """Reset timeout statistics"""
         self.timeout_tracker.reset()
+
+    def execute_fork_decision(
+        self,
+        decision: ForkDecision,
+        branch_sample_id: int,
+        is_final_turn: bool = False,
+    ) -> str:
+        """Execute one relation intervention from its exact pre-action state."""
+        branch_state = append_intervened_join(decision)
+        expression_ids = []
+        for statement in branch_state:
+            lhs = statement.split("=", 1)[0].strip()
+            if lhs.startswith("expression") and lhs[10:].isdigit():
+                expression_ids.append(int(lhs[10:]))
+        target_expression = f"expression{max(expression_ids)}"
+        snapshot = {
+            "function_state": branch_state,
+            "expression_counter": max(expression_ids, default=decision.expression_counter),
+            "entities": list(decision.entities),
+            "prompt": decision.prompt,
+        }
+        self.state_manager.restore_sample_state(branch_sample_id, snapshot)
+        self.action_processor.clear_sample_action_states(branch_sample_id)
+        self.action_processor._set_action_relation_state(
+            sample_id=branch_sample_id,
+            action_index=decision.action_index,
+            selected_relation={
+                "relation_id": decision.alternative_relation,
+                "relation_name": decision.alternative_relation,
+                "score": 1.0,
+            },
+            candidate_relations=[decision.alternative_relation],
+            ranked_top5=[],
+            state_dict={
+                "entity_argument": decision.entity_argument,
+                "relation_prompt": decision.relation_prompt,
+            },
+        )
+
+        sexpr_result = self.sexpr_generator.generate_sexpr_from_strings(
+            branch_state, target_expression
+        )
+        if not sexpr_result.is_valid:
+            return (
+                "<information>\nCounterfactual S-Expression failed: "
+                f"{sexpr_result.error_message}\n</information>"
+            )
+        execution_result = self.sexpr_executor.execute_sexpr(
+            sexpr_result.sexpr, function_state=branch_state
+        )
+        if not execution_result.is_successful:
+            return (
+                "<information>\nCounterfactual execution failed: "
+                f"{execution_result.error_message}\n</information>"
+            )
+        mids = self.result_processor.extract_mid_list(execution_result.results)
+        return self.result_processor.build_enriched_info_block(
+            execution_result,
+            sexpr_result,
+            mids,
+            decision.action_index,
+            branch_sample_id,
+            is_final_turn=is_final_turn,
+        )
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations (same as original)"""
@@ -267,7 +619,13 @@ class SExprLLMGenerationManager:
             if answer_match:
                 logger.info(f"[SEXPR] Sample {i}: Completed (found answer)")
                 logger.info(f"[SEXPR] Sample {i}: prediction: {pred}")
-                # 清除样本状态，因为已经完成
+                if self.hyper_r1_enable and i in self._hyper_selected:
+                    selected_id = self._hyper_selected[i]
+                    selected = self.hyper_graph.state(i).nodes.get(selected_id)
+                    if selected is not None and selected.is_active and selected.denotation:
+                        self.hyper_graph.commit(i, selected_id)
+                # Clear the linear executor state. The hypothesis graph remains
+                # available until the rollout tensors and credit masks are built.
                 self.state_manager.clear_sample_state(i)
                 return (i, local_next_obs, True, False)
 
@@ -365,6 +723,33 @@ class SExprLLMGenerationManager:
             logger.info(f"[SEXPR] Sample {index}: No valid actions found in prediction")
             info_block = "<information>\nNo valid actions found. Please provide reasoning actions.\n</information>"
             return self.result_processor._add_guidance_prompt(info_block, is_final_turn)
+
+        if self.hyper_r1_enable:
+            from ..sexpr.action_parser import ActionType
+
+            graph_action_types = {
+                ActionType.SELECT_HYPOTHESIS,
+                ActionType.PRUNE_HYPOTHESIS,
+                ActionType.COMMIT_HYPOTHESIS,
+                ActionType.COMBINE_HYPOTHESES,
+            }
+            graph_actions = [a for a in actions if a.action_type in graph_action_types]
+            if graph_actions:
+                if len(actions) != 1:
+                    return self._hyper_info(
+                        index,
+                        "Use exactly one Select, Prune, Combine, or Commit action per turn.",
+                        is_final_turn,
+                    )
+                return self._process_hyper_control(graph_actions[0], index, turn)
+
+            relation_actions = [a for a in actions if a.action_type == ActionType.FIND_RELATION]
+            if len(relation_actions) > 1:
+                return self._hyper_info(
+                    index,
+                    "HyPER-R1 executes one relation decision per turn so its alternatives share an exact pre-action state.",
+                    is_final_turn,
+                )
         
         # Update action attempts for special actions present in this prediction
         present_special = set()
@@ -545,6 +930,13 @@ class SExprLLMGenerationManager:
         if execution_result.is_successful:
             # Update successes for special actions if execution succeeded and has results
             mid_list = self.result_processor.extract_mid_list(execution_result.results)
+            self._register_hyper_execution(
+                index,
+                processed_actions,
+                sexpr_result,
+                execution_result,
+                mid_list,
+            )
             # Surface per-action relation states for UI (legacy removed)
             
             # Transfer per-action relation states for multiple Find_relation support
@@ -577,7 +969,7 @@ class SExprLLMGenerationManager:
                 action = processed_actions[0]
                 action_index = getattr(action, 'action_index', None) or getattr(action, 'step_number', 0)
 
-            return self.result_processor.build_enriched_info_block(
+            response = self.result_processor.build_enriched_info_block(
                 execution_result,
                 sexpr_result,
                 mid_list,
@@ -585,6 +977,7 @@ class SExprLLMGenerationManager:
                 index,
                 is_final_turn=is_final_turn,
             )
+            return self._inject_hyper_graph(response, index)
         else:
             # Check if this is a timeout error
             if self._is_timeout_error(execution_result.error_message):
@@ -880,6 +1273,10 @@ class SExprLLMGenerationManager:
         # 初始化所有样本的持久化状态
         if self.config.enable_sexpr_mode:
             self.state_manager.initialize_batch_states(batch_size)
+            if self.hyper_r1_enable:
+                self.hyper_graph.clear()
+                self._hyper_selected.clear()
+                self._hyper_action_records.clear()
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
 
@@ -919,6 +1316,8 @@ class SExprLLMGenerationManager:
         # Main generation loop
         for turn in range(self.config.max_turns):
             meta_info['turn'] = turn
+            if self.action_processor:
+                self.action_processor.set_fork_r1_turn(turn)
             
             if not active_mask.sum():
                 # 即使提前结束，也要记录最后一轮的截断信息
@@ -1230,5 +1629,24 @@ class SExprLLMGenerationManager:
                 meta_info[f'sexpr/actions/{name}/attempts'] = float(attempts)
                 meta_info[f'sexpr/actions/{name}/successes'] = float(successes)
                 meta_info[f'sexpr/actions/{name}/success_rate'] = float(rate)
+
+            # Object metadata remains on the driver and is consumed by the
+            # Fork-R1 trainer before tensor-only worker updates.
+            meta_info['fork_r1/decision_ledgers'] = {
+                sample_id: [decision.to_dict() for decision in decisions]
+                for sample_id, decisions in self.action_processor.get_fork_r1_decisions().items()
+            }
+            if self.hyper_r1_enable:
+                meta_info['hyper_r1/graphs'] = {
+                    sample_id: self.hyper_graph.to_dict(sample_id)
+                    for sample_id in range(batch_size)
+                }
+                meta_info['hyper_r1/action_records'] = {
+                    sample_id: list(records)
+                    for sample_id, records in self._hyper_action_records.items()
+                }
         
-        return self.batch_utils.compose_final_output(original_left_side, original_right_side, meta_info)
+        output = self.batch_utils.compose_final_output(
+            original_left_side, original_right_side, meta_info
+        )
+        return self._attach_hyper_training_fields(output, batch_size)

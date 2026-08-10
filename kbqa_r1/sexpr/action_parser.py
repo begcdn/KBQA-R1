@@ -20,6 +20,10 @@ class ActionType(Enum):
     COMPARE = "Compare"
     TIME_CONSTRAINT = "Time_constraint"
     COUNT = "Count"
+    SELECT_HYPOTHESIS = "Select"
+    PRUNE_HYPOTHESIS = "Prune"
+    COMMIT_HYPOTHESIS = "Commit"
+    COMBINE_HYPOTHESES = "Combine"
     # FINISH = "Finish"  # Removed: Not needed for kbqa-r1 training
 
 @dataclass
@@ -71,6 +75,22 @@ class ActionParser:
                 "pattern": r"(?:Action(\d+):\s*|^)Count\s*\[\s*([^\]]+)\s*\]",
                 "description": "Count operation for number determination"
             },
+            ActionType.SELECT_HYPOTHESIS: {
+                "pattern": r"(?:Action(\d+):\s*|^)Select\s*\[\s*(H\d+)\s*\]",
+                "description": "Restore one active executable hypothesis for further reasoning"
+            },
+            ActionType.PRUNE_HYPOTHESIS: {
+                "pattern": r"(?:Action(\d+):\s*|^)Prune\s*\[\s*(H\d+)\s*\]",
+                "description": "Reject one active executable hypothesis"
+            },
+            ActionType.COMMIT_HYPOTHESIS: {
+                "pattern": r"(?:Action(\d+):\s*|^)Commit\s*\[\s*(H\d+)\s*\]",
+                "description": "Commit one active executable hypothesis as the answer"
+            },
+            ActionType.COMBINE_HYPOTHESES: {
+                "pattern": r"(?:Action(\d+):\s*|^)Combine\s*\[\s*(H\d+)\s*\|\s*(H\d+)\s*\]",
+                "description": "Intersect two active executable hypotheses"
+            },
             # ActionType.FINISH: {
             #     "pattern": r"(?:Action(\d+):\s*|^)Finish\s*\[\s*([^\]]+)\s*\]",
             #     "description": "Conclude and output expression"
@@ -111,7 +131,12 @@ class ActionParser:
                         arg2 = match.group(3).strip()  # relation
                         arg3 = match.group(4).strip()  # number
                         arguments = [arg1, arg2, arg3]
-                    elif action_type in [ActionType.MERGE, ActionType.TIME_CONSTRAINT, ActionType.FIND_RELATION]:
+                    elif action_type in [
+                        ActionType.MERGE,
+                        ActionType.TIME_CONSTRAINT,
+                        ActionType.FIND_RELATION,
+                        ActionType.COMBINE_HYPOTHESES,
+                    ]:
                         # Two-argument actions
                         arg1 = match.group(2).strip()
                         arg2 = match.group(3).strip()
@@ -235,5 +260,4 @@ class ActionParser:
         else:
             args_str = action.arguments[0] if action.arguments else ""
         return f"Action{action.step_number}: {action.action_type.value} [ {args_str} ]"
-
 

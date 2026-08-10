@@ -106,3 +106,8 @@ class AlgoConfig(BaseConfig):
     start_state_marker: str = "<information>"
     end_state_marker: str = "</information>"
     no_think_rl: bool = False
+    hyper_r1_enable: bool = False
+    hyper_r1_credit_weight: float = 1.0
+    hyper_r1_budget_cost: float = 0.05
+    fork_r1_enable: bool = False
+    fork_r1_credit_weight: float = 1.0

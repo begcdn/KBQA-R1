@@ -26,6 +26,12 @@ class SExprGenerationConfig:
     enable_action_validation: bool = True  # Validate actions before execution
     enable_sexpr_validation: bool = True  # Validate S-Expressions before conversion
     fallback_to_sparql: bool = False  # Fallback to SPARQL mode if S-Expression fails
+
+    # HyPER-R1 executable hypothesis graph. Disabled for released KBQA-R1
+    # compatibility and enabled explicitly in HyPER-R1 training/evaluation.
+    hyper_r1_enable: bool = False
+    hyper_r1_max_active: int = 6
+    hyper_r1_max_nodes: int = 24
     
     # GPU utilization management
     gpu_utilization_config: Optional[GPUUtilizationConfig] = None  # GPU utilization manager configuration

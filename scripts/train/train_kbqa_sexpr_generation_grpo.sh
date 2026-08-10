@@ -5,7 +5,7 @@ set -xeuo pipefail
 
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-REPO_ROOT="/ossfs/workspace/kbqa-r1"
+REPO_ROOT=${REPO_ROOT:-"$(cd "${SCRIPT_DIR}/../.." && pwd)"}
 export VLLM_LOGGING_LEVEL=DEBUG
 
 # export PYTHONPATH="${REPO_ROOT}/verl_newest:${PYTHONPATH:-}"
@@ -80,15 +80,15 @@ TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/train.parquet"}
 VAL_FILE=${VAL_FILE:-"${DATA_DIR}/test.parquet"}
 
 # Default base model (Llama-3)
-DEFAULT_BASE_MODEL='/ossfs/workspace/aml2/aml_ri/fengyi/Llama-3.1-8B-Instruct'
+DEFAULT_BASE_MODEL=${DEFAULT_BASE_MODEL:-'/ossfs/workspace/aml2/aml_ri/fengyi/Llama-3.1-8B-Instruct'}
 
 
 # Dataset-specific SFT checkpoints
-SFT_MODEL_WEBQSP='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/webqsp-sft-from-rs/20251202_034557/global_step_94/huggingface'
+SFT_MODEL_WEBQSP=${SFT_MODEL_WEBQSP:-'/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/webqsp-sft-from-rs/20251202_034557/global_step_94/huggingface'}
 # SFT_MODEL_WEBQSP='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/webqsp-sft-from-rs/20251031_172831/global_step_84/huggingface'
 # SFT_MODEL_GRAILQA='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/grailqa-sft-from-rs/20251102_221931/global_step_1342/huggingface'
 # SFT_MODEL_GRAPHQ='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/graphq-sft-from-rs/20251102_193738/global_step_144/huggingface'
-SFT_MODEL_GRAPHQ='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/graphq-sft-from-rs/20251202_022546/global_step_96/huggingface'
+SFT_MODEL_GRAPHQ=${SFT_MODEL_GRAPHQ:-'/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/graphq-sft-from-rs/20251202_022546/global_step_96/huggingface'}
 
 # if [[ "${GPU_TYPE}" == "H20" ]]; then
 #     # H20 configuration: use nas_zhongqi paths
@@ -97,7 +97,7 @@ SFT_MODEL_GRAPHQ='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/graphq-sft-fr
 # else
     # A100 configuration: use kbqa-r1 paths
     # SFT_MODEL_GRAILQA='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/grailqa-sft-from-rs/20251102_221931/global_step_1342/huggingface'
-SFT_MODEL_GRAILQA='/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/grailqa-sft-from-rs/20251202_025127/global_step_1818/huggingface'
+SFT_MODEL_GRAILQA=${SFT_MODEL_GRAILQA:-'/ossfs/workspace/kbqa-r1/checkpoints/KBQA-R1-SFT/grailqa-sft-from-rs/20251202_025127/global_step_1818/huggingface'}
 
 
 # Control whether to use the SFT model for RL (default: true)
@@ -144,7 +144,7 @@ if [[ "${GPU_TYPE}" == "H20" ]]; then
     echo "[INFO] Checkpoints will be saved to nas_zhongqi: ${CHECKPOINT_DIR}"
 else
     # A100 configuration: use aml/share
-    CHECKPOINT_DIR=${CHECKPOINT_DIR:-'/aml/share/aml/465910'}
+    CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${REPO_ROOT}/checkpoints"}
     echo "[INFO] Checkpoints will be saved to aml/share: ${CHECKPOINT_DIR}"
 fi
 
@@ -198,12 +198,29 @@ max_prompt_length=${max_prompt_length:-14336}
 # Reduce max_response_length to avoid GPU memory issues
 max_response_length=${max_response_length:-1024}
 actor_lr=${actor_lr:-1e-6}
+hyper_r1_enable=${hyper_r1_enable:-false}
+hyper_r1_max_active=${hyper_r1_max_active:-6}
+hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
+hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
+hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 
-train_batch_size=${train_batch_size:-256}
-# FIXED: Increase mini batch size from 16 to 64 for better throughput
-ppo_mini_batch_size=${ppo_mini_batch_size:-128}
-# FIXED: Reduce responses per prompt to match original (was 8, now 5)
-n_resp_per_prompt=${n_resp_per_prompt:-5}
+if (( GPU_COUNT < 4 )); then
+    train_batch_size=${train_batch_size:-32}
+    ppo_mini_batch_size=${ppo_mini_batch_size:-16}
+    n_resp_per_prompt=${n_resp_per_prompt:-4}
+    actor_micro_batch_size=${actor_micro_batch_size:-1}
+    log_prob_micro_batch_size=${log_prob_micro_batch_size:-2}
+    rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization:-0.45}
+    max_num_batched_tokens=${max_num_batched_tokens:-8192}
+else
+    train_batch_size=${train_batch_size:-256}
+    ppo_mini_batch_size=${ppo_mini_batch_size:-128}
+    n_resp_per_prompt=${n_resp_per_prompt:-5}
+    actor_micro_batch_size=${actor_micro_batch_size:-40}
+    log_prob_micro_batch_size=${log_prob_micro_batch_size:-128}
+    rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization:-0.70}
+    max_num_batched_tokens=${max_num_batched_tokens:-16384}
+fi
 # n_resp_per_prompt_val=${n_resp_per_prompt_val:-5}
 
 # PERFORMANCE FIX: Increase tensor parallel from 2 to 4 to match original script
@@ -254,6 +271,7 @@ echo "Train File   : ${TRAIN_FILE}"
 echo "Val File     : ${VAL_FILE}"
 echo "Model Path   : ${MODEL_PATH}"
 echo "Experiment   : ${EXPERIMENT_NAME}"
+echo "HyPER-R1     : ${hyper_r1_enable} (active=${hyper_r1_max_active}, nodes=${hyper_r1_max_nodes})"
 echo "Checkpoints  : ${CHECKPOINT_DIR}/${EXPERIMENT_NAME}"
 echo "Log File     : ${LOG_FILE} (only main run log; internal sexpr file logs disabled)"
 echo "GPUs / node  : ${NGPUS_PER_NODE} (using ${TRAINING_GPUS} for training)"
@@ -277,6 +295,9 @@ python3 -m verl.trainer.main_ppo_kbqa \
     +trainer.max_val_samples=500 \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
+    algorithm.hyper_r1_enable=${hyper_r1_enable} \
+    algorithm.hyper_r1_credit_weight=${hyper_r1_credit_weight} \
+    algorithm.hyper_r1_budget_cost=${hyper_r1_budget_cost} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.dtype=float16 \
     actor_rollout_ref.ref.dtype=float16 \
@@ -319,14 +340,14 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=128 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=40 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${actor_micro_batch_size} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.calculate_log_probs=true \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${infer_tp} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.70 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization} \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.3 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.temperature=1.0 \
@@ -334,7 +355,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.actor.state_masking=true \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     trainer.logger=['console','tensorboard'] \
     trainer.resume_mode="auto" \
     trainer.default_local_dir="${CHECKPOINT_DIR}/${EXPERIMENT_NAME}" \
@@ -356,6 +377,9 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sexpr_config.enable_entity_linking=true \
     sexpr_config.enable_semantic_validation=true \
     sexpr_config.use_complete_sparql_converter=true \
+    hyper_r1.enable=${hyper_r1_enable} \
+    hyper_r1.max_active=${hyper_r1_max_active} \
+    hyper_r1.max_nodes=${hyper_r1_max_nodes} \
     +sexpr_config.enable_logging=false \
     max_turns=${max_turns} \
     use_odbc=true \
@@ -388,9 +412,3 @@ echo "KBQA-R1  training finished (exit code $?)"
 echo "Logs        : ${LOG_FILE}"
 echo "Checkpoints : ${CHECKPOINT_DIR}/${EXPERIMENT_NAME}"
 echo "========================================"
-
-
-cd /ossfs/workspace
-pkill -f main_ppo_kbqa
-sleep 100
-python train.py

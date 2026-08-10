@@ -77,6 +77,21 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Enable HyPER-R1 graph-localized credit.
+  hyper_r1_enable: false
+
+  # Multiplier on committed graph-action advantages.
+  hyper_r1_credit_weight: 1.0
+
+  # Normalized cost charged for exact graph executions.
+  hyper_r1_budget_cost: 0.05
+
+  # Legacy counterfactual component, disabled in HyPER-R1 by default.
+  fork_r1_enable: false
+
+  # Legacy counterfactual credit weight.
+  fork_r1_credit_weight: 1.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
@@ -373,6 +388,18 @@ sexpr_config:
 
   # Use complete SPARQL converter
   use_complete_sparql_converter: true
+
+# HyPER-R1 executable hypothesis graph.
+hyper_r1:
+
+  # Enable graph-state rollouts.
+  enable: false
+
+  # Maximum number of alternatives visible to the policy.
+  max_active: 6
+
+  # Hard cap on exact executions per question.
+  max_nodes: 24
 
 # ODBC configuration for Virtuoso knowledge base connection
 odbc_config:

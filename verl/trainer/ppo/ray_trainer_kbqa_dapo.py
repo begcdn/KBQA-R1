@@ -154,6 +154,9 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
                                     enable_sexpr_validation=self.config.get("sexpr_config", {}).get(
                                         "enable_semantic_validation", True
                                     ),
+                                    hyper_r1_enable=self.config.get("hyper_r1", {}).get("enable", False),
+                                    hyper_r1_max_active=self.config.get("hyper_r1", {}).get("max_active", 6),
+                                    hyper_r1_max_nodes=self.config.get("hyper_r1", {}).get("max_nodes", 24),
                                     sparql_url=self.config.get("sparql", {}).get(
                                         "url", "http://localhost:8000/execute"
                                     ),

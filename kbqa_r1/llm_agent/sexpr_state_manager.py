@@ -6,6 +6,7 @@ Manages persistent state for samples during S-Expression processing
 import logging
 import os
 import re
+from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
 
 from ..sexpr.limit import duplicated_relation_list, ping_pong_relations
@@ -419,6 +420,29 @@ class SExprStateManager:
         for i in range(batch_size):
             self.clear_sample_state(i)
             logger.debug(f"[SEXPR] Initialized persistent state for sample {i}")
+
+    def snapshot_sample_state(self, sample_id: int) -> Dict[str, object]:
+        """Capture an executable state immediately before a Fork-R1 decision."""
+        return {
+            "function_state": deepcopy(self._sample_function_states.get(sample_id, [])),
+            "expression_counter": self._sample_expression_counters.get(sample_id, 0),
+            "entities": deepcopy(self._sample_entities.get(sample_id, [])),
+            "prompt": self._sample_prompts.get(sample_id, ""),
+        }
+
+    def restore_sample_state(self, sample_id: int, snapshot: Dict[str, object]):
+        """Restore a state so factual and counterfactual branches share a prefix."""
+        self.clear_sample_state(sample_id)
+        self._sample_function_states[sample_id] = deepcopy(snapshot.get("function_state", []))
+        self._sample_expression_counters[sample_id] = int(snapshot.get("expression_counter", 0))
+        self._sample_entities[sample_id] = deepcopy(snapshot.get("entities", []))
+        prompt = str(snapshot.get("prompt", ""))
+        if prompt:
+            self._sample_prompts[sample_id] = prompt
+
+    def clone_sample_state(self, source_id: int, target_id: int):
+        """Clone a state into a second environment branch."""
+        self.restore_sample_state(target_id, self.snapshot_sample_state(source_id))
     
     def get_all_function_states(self) -> Dict[int, List[str]]:
         """获取所有样本的function_state（用于调试）"""
