@@ -31,6 +31,13 @@ def candidates(question, state, join):
     ]
 
 
+def gold_first_candidates(question, state, join):
+    return [
+        RelationOption(join.relation, 0.92, 1),
+        RelationOption("r.wrong", 0.81, 2),
+    ]
+
+
 def test_compile_rejects_unsupported_operator():
     try:
         compile_gold_plan(["expression1 = COUNT(expression0)"])
@@ -92,6 +99,23 @@ def test_skips_execution_equivalent_alternative():
     }
     demos = DemonstrationBuilder(equivalent_executor, candidates).build(row)
     assert demos == []
+
+
+def test_teaches_correct_direct_commit_without_needless_switching():
+    row = {
+        "ID": "direct",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold', expression1)",
+        ],
+        "answer": ["m.gold"],
+    }
+    demo = DemonstrationBuilder(fake_executor, gold_first_candidates).build(row)[0]
+    assert demo.family == "correct_top1_commit"
+    assert demo.hypotheses["H0"].role == "gold"
+    assert [step.action for step in demo.steps] == ["Prune", "Select", "Commit"]
+    assert DemonstrationValidator(fake_executor).validate(demo) == []
 
 
 def test_rejects_rows_without_annotated_answers():

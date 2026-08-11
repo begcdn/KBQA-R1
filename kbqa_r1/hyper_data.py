@@ -260,20 +260,33 @@ class DemonstrationBuilder:
                 continue
             accepted.append((option, alternative_prefix, prefix_values, terminal_values))
 
-        # Recovery supervision is useful only when the inference-time retriever
-        # would actually prefer the distractor.  Lower-ranked negatives are
-        # ordinary contrastive examples, not evidence for delayed commitment.
-        accepted = [item for item in accepted if item[0].rank < gold_option.rank]
-        if not accepted:
+        terminal_gold = (
+            join.target == plan.target_expression and gold_prefix_values == gold_answers
+        )
+        recovery = [item for item in accepted if item[0].rank < gold_option.rank]
+        direct_success = [
+            item
+            for item in accepted
+            if gold_option.rank == 1 and item[0].rank > gold_option.rank and terminal_gold
+        ]
+        if recovery:
+            family = "wrong_sibling_recovery"
+            pool = recovery
+        elif direct_success:
+            family = "correct_top1_commit"
+            pool = direct_success
+        else:
             return None
-        accepted.sort(key=lambda item: (-item[0].score, item[0].rank, item[0].relation))
-        option, alternative_prefix, prefix_values, terminal_values = accepted[0]
+        pool.sort(key=lambda item: (-item[0].score, item[0].rank, item[0].relation))
+        option, alternative_prefix, prefix_values, terminal_values = pool[0]
+        wrong_id = "H0" if family == "wrong_sibling_recovery" else "H1"
+        gold_id = "H1" if family == "wrong_sibling_recovery" else "H0"
         wrong = ExecutedHypothesis(
-            "H0", tuple(alternative_prefix), join.target, prefix_values,
+            wrong_id, tuple(alternative_prefix), join.target, prefix_values,
             relation=option.relation, role="distractor",
         )
         gold = ExecutedHypothesis(
-            "H1", tuple(gold_prefix), join.target, gold_prefix_values,
+            gold_id, tuple(gold_prefix), join.target, gold_prefix_values,
             relation=join.relation, role="gold",
         )
         hypotheses = {wrong.hypothesis_id: wrong, gold.hypothesis_id: gold}
@@ -281,7 +294,7 @@ class DemonstrationBuilder:
             DemonstrationStep("Prune", (wrong.hypothesis_id,), tuple(hypotheses), ("fails_full_intent",)),
             DemonstrationStep("Select", (gold.hypothesis_id,), (gold.hypothesis_id,), ("matches_full_intent",)),
         ]
-        if join.target == plan.target_expression and gold_prefix_values == gold_answers:
+        if terminal_gold:
             steps.append(
                 DemonstrationStep(
                     "Commit", (gold.hypothesis_id,), (gold.hypothesis_id,),
@@ -292,7 +305,7 @@ class DemonstrationBuilder:
             demo_id=f"{question_id}:join:{join.index}:{_digest(option.relation)}",
             question_id=question_id,
             question=question,
-            family="wrong_sibling_recovery",
+            family=family,
             hypotheses=hypotheses,
             steps=steps,
             gold_answers=gold_answers,
