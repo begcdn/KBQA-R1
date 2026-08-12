@@ -298,17 +298,27 @@ def compute_advantage(
 
     hyper_enabled = bool(config.get("hyper_r1_enable", False))
     if hyper_enabled:
-        if "hyper_r1_action_mask" not in data.batch:
+        required = {"hyper_r1_action_ids", "terminal_reward"}
+        missing = required.difference(data.batch.keys())
+        if "hyper_r1_action_records" not in data.non_tensor_batch:
+            missing.add("hyper_r1_action_records")
+        if missing:
             raise RuntimeError(
-                "HyPER-R1 is enabled but hyper_r1_action_mask is missing"
+                "HyPER-R1 decision-credit fields are missing: "
+                + ", ".join(sorted(missing))
             )
-        from kbqa_r1.hyper_r1 import concentrate_graph_credit
+        from kbqa_r1.hyper_r1 import apply_grouped_decision_credit
 
-        data.batch["advantages"] = concentrate_graph_credit(
+        advantages, compared_mask = apply_grouped_decision_credit(
             data.batch["advantages"],
-            data.batch["hyper_r1_action_mask"],
+            data.batch["hyper_r1_action_ids"],
+            data.batch["terminal_reward"],
+            data.non_tensor_batch["uid"],
+            data.non_tensor_batch["hyper_r1_action_records"],
             weight=float(config.get("hyper_r1_credit_weight", 1.0)),
         )
+        data.batch["advantages"] = advantages
+        data.batch["hyper_r1_compared_action_mask"] = compared_mask
     return data
 
 
@@ -899,12 +909,57 @@ class RayPPOTrainer:
                 reward_extra_infos_dict["hyper_r1_execution_calls"].extend(
                     float(value) for value in execution_counts
                 )
+            if "hyper_r1_action_records" in test_batch.non_tensor_batch:
+                for records in test_batch.non_tensor_batch["hyper_r1_action_records"]:
+                    records = list(records or ())
+                    selected = [
+                        str(record.get("node_id", ""))
+                        for record in records
+                        if record.get("action") == "Select"
+                    ]
+                    reward_extra_infos_dict["hyper_r1_branch_switch"].append(
+                        float(len(set(selected)) >= 2)
+                    )
+                    reward_extra_infos_dict["hyper_r1_used_combine"].append(
+                        float(any(record.get("action") == "Combine" for record in records))
+                    )
+                    reward_extra_infos_dict["hyper_r1_max_active"].append(
+                        float(max((record.get("active_before", 0) for record in records), default=0))
+                    )
+                    reward_extra_infos_dict["hyper_r1_preserved_alternatives"].append(
+                        float(any(record.get("active_before", 0) >= 2 for record in records))
+                    )
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
+            if self.config.algorithm.get("hyper_r1_enable", False):
+                if "hyper_r1_commit_valid" not in test_batch.batch:
+                    raise RuntimeError(
+                        "HyPER-R1 validation is missing hyper_r1_commit_valid"
+                    )
+                from kbqa_r1.hyper_r1 import enforce_commit_reward
+
+                validation_mask = compute_response_mask(test_batch)
+                reward_tensor = enforce_commit_reward(
+                    reward_tensor,
+                    validation_mask,
+                    test_batch.batch["hyper_r1_commit_valid"],
+                    invalid_penalty=float(
+                        self.config.algorithm.get(
+                            "hyper_r1_invalid_commit_penalty", 0.25
+                        )
+                    ),
+                )
+                reward_extra_infos_dict["hyper_r1_commit_valid"].extend(
+                    float(value)
+                    for value in test_batch.batch["hyper_r1_commit_valid"]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
@@ -1610,6 +1665,18 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    if self.config.algorithm.get("hyper_r1_enable", False):
+                        graph_metadata = gen_batch_output.meta_info.get("hyper_r1/graphs")
+                        action_metadata = gen_batch_output.meta_info.get("hyper_r1/action_records")
+                        if graph_metadata is None or action_metadata is None:
+                            raise RuntimeError("HyPER-R1 rollout metadata is missing")
+                        batch.non_tensor_batch["hyper_r1_graph"] = np.array(
+                            [graph_metadata[i] for i in range(len(batch))], dtype=object
+                        )
+                        batch.non_tensor_batch["hyper_r1_action_records"] = np.array(
+                            [action_metadata.get(i, []) for i in range(len(batch))], dtype=object
+                        )
+
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1678,6 +1745,54 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # HyPER-R1's task contract is part of the environment
+                        # reward, not part of language-model regularization.
+                        # Gate the raw task score first so invalid commits cannot
+                        # earn answer reward, and retain this clean outcome for
+                        # same-state sibling credit. KL is applied afterwards to
+                        # every rollout, including invalid ones.
+                        if self.config.algorithm.get("hyper_r1_enable", False):
+                            required = {
+                                "hyper_r1_execution_counts",
+                                "hyper_r1_commit_valid",
+                                "response_mask",
+                            }
+                            missing = required.difference(batch.batch.keys())
+                            if missing:
+                                raise RuntimeError(
+                                    "HyPER-R1 rollout fields are missing: "
+                                    + ", ".join(sorted(missing))
+                                )
+                            from kbqa_r1.hyper_r1 import (
+                                charge_execution_budget,
+                                enforce_commit_reward,
+                            )
+
+                            hyper_task_rewards = enforce_commit_reward(
+                                batch.batch["token_level_scores"],
+                                batch.batch["response_mask"],
+                                batch.batch["hyper_r1_commit_valid"],
+                                invalid_penalty=float(
+                                    self.config.algorithm.get(
+                                        "hyper_r1_invalid_commit_penalty", 0.25
+                                    )
+                                ),
+                            )
+                            hyper_task_rewards = charge_execution_budget(
+                                hyper_task_rewards,
+                                batch.batch["response_mask"],
+                                batch.batch["hyper_r1_execution_counts"],
+                                max_nodes=int(
+                                    self.config.get("hyper_r1", {}).get("max_nodes", 24)
+                                ),
+                                cost=float(
+                                    self.config.algorithm.get("hyper_r1_budget_cost", 0.05)
+                                ),
+                                group_ids=batch.non_tensor_batch["uid"],
+                            )
+                            batch.batch["token_level_scores"] = hyper_task_rewards
+                            batch.batch["terminal_reward"] = hyper_task_rewards.sum(dim=-1)
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1699,31 +1814,6 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        if self.config.algorithm.get("hyper_r1_enable", False):
-                            required = {
-                                "hyper_r1_execution_counts",
-                                "response_mask",
-                            }
-                            missing = required.difference(batch.batch.keys())
-                            if missing:
-                                raise RuntimeError(
-                                    "HyPER-R1 rollout fields are missing: "
-                                    + ", ".join(sorted(missing))
-                                )
-                            from kbqa_r1.hyper_r1 import charge_execution_budget
-
-                            batch.batch["token_level_rewards"] = charge_execution_budget(
-                                batch.batch["token_level_rewards"],
-                                batch.batch["response_mask"],
-                                batch.batch["hyper_r1_execution_counts"],
-                                max_nodes=int(
-                                    self.config.get("hyper_r1", {}).get("max_nodes", 24)
-                                ),
-                                cost=float(
-                                    self.config.algorithm.get("hyper_r1_budget_cost", 0.05)
-                                ),
-                            )
-
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1733,6 +1823,24 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        if self.config.algorithm.get("hyper_r1_enable", False):
+                            metrics["hyper_r1/commit_valid_rate"] = float(
+                                batch.batch["hyper_r1_commit_valid"].float().mean().item()
+                            )
+                            metrics["hyper_r1/mean_execution_calls"] = float(
+                                batch.batch["hyper_r1_execution_counts"].float().mean().item()
+                            )
+                            action_tokens = batch.batch["hyper_r1_action_ids"] > 0
+                            compared_tokens = batch.batch[
+                                "hyper_r1_compared_action_mask"
+                            ] > 0
+                            metrics["hyper_r1/action_token_rate"] = float(
+                                action_tokens.float().mean().item()
+                            )
+                            metrics["hyper_r1/compared_action_token_rate"] = float(
+                                compared_tokens.sum().item()
+                                / max(1, action_tokens.sum().item())
+                            )
 
                     # update critic
                     if self.use_critic:

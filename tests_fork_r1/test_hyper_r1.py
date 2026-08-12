@@ -5,9 +5,10 @@ from kbqa_r1.hyper_r1 import (
     HypothesisEdgeKind,
     HypothesisGraph,
     HypothesisStatus,
+    apply_grouped_decision_credit,
     combine_function_states,
-    concentrate_graph_credit,
     charge_execution_budget,
+    enforce_commit_reward,
     graph_action_token_mask,
 )
 
@@ -37,15 +38,27 @@ def test_contrast_siblings_remain_active():
     assert any(edge.kind == HypothesisEdgeKind.CONTRAST for edge in graph.state(0).edges)
 
 
-def test_same_denotation_merges_without_erasing_provenance():
+def test_same_denotation_with_different_meaning_stays_distinct():
     graph = HypothesisGraph(max_active=4)
     canonical = add(graph, "r.alias_a", ["m.answer"], group="choice")
     duplicate = add(graph, "r.alias_b", ["m.answer"], group="choice")
 
+    assert canonical.is_active and duplicate.is_active
+    assert duplicate.equivalent_to is None
+    assert len(graph.active_nodes(0)) == 2
+    assert not any(
+        edge.kind == HypothesisEdgeKind.EQUIVALENCE
+        for edge in graph.state(0).edges
+    )
+
+
+def test_identical_program_is_deduplicated():
+    graph = HypothesisGraph(max_active=4)
+    canonical = add(graph, "r.same", ["m.answer"], group="choice")
+    duplicate = add(graph, "r.same", ["m.answer"], group="choice")
+
     assert duplicate.status == HypothesisStatus.MERGED
     assert duplicate.equivalent_to == canonical.node_id
-    assert len(graph.active_nodes(0)) == 1
-    assert any(edge.kind == HypothesisEdgeKind.EQUIVALENCE for edge in graph.state(0).edges)
 
 
 def test_empty_hypotheses_do_not_merge():
@@ -79,6 +92,72 @@ def test_commit_requires_nonempty_active_hypothesis():
     assert committed.status == HypothesisStatus.COMMITTED
     assert graph.state(0).committed_id == answer.node_id
     assert empty.status == HypothesisStatus.PRUNED
+    assert "committed" in graph.execution_error(
+        0, opens_frontier=True, frontier_width=3
+    ).lower()
+
+
+def test_executable_continuation_requires_select_and_full_frontier_capacity():
+    graph = HypothesisGraph(max_active=4, max_nodes=8)
+    first = add(graph, "r.first", ["m.first"])
+    add(graph, "r.second", ["m.second"])
+
+    assert "Select" in graph.execution_error(
+        0, opens_frontier=False, frontier_width=2
+    )
+    graph.select(0, first.node_id)
+    assert graph.execution_error(0, opens_frontier=False, frontier_width=2) is None
+    assert "full relation frontier" in graph.execution_error(
+        0, opens_frontier=True, frontier_width=4
+    )
+
+
+def test_non_frontier_execution_cannot_escape_exhausted_node_budget():
+    graph = HypothesisGraph(max_active=2, max_nodes=2)
+    first = add(graph, "r.first", ["m.first"])
+    add(graph, "r.second", ["m.second"])
+    graph.select(0, first.node_id)
+
+    assert "node budget" in graph.execution_error(
+        0, opens_frontier=False, frontier_width=1
+    ).lower()
+
+
+def test_combine_node_retains_both_parent_edges():
+    graph = HypothesisGraph(max_active=4)
+    left = add(graph, "r.left", ["m.shared"])
+    right = add(graph, "r.right", ["m.shared"])
+    graph.mark_expanded(0, left.node_id)
+    graph.mark_expanded(0, right.node_id)
+    combined = graph.add_executed(
+        sample_id=0,
+        function_state=("expression3 = AND(expression1, expression2)",),
+        target_expression="expression3",
+        sexpr="(AND left right)",
+        denotation=["m.shared"],
+        parent_id=left.node_id,
+        parent_ids=(left.node_id, right.node_id),
+        operation="combine",
+    )
+
+    incoming = {
+        edge.source
+        for edge in graph.state(0).edges
+        if edge.target == combined.node_id
+    }
+    assert incoming == {left.node_id, right.node_id}
+    assert f"parents={left.node_id}+{right.node_id} operation=combine" in graph.serialize(0)
+
+
+def test_combine_validation_is_atomic():
+    graph = HypothesisGraph(max_active=3)
+    left = add(graph, "r.left", ["m.left"])
+
+    with pytest.raises(ValueError, match="distinct"):
+        graph.combination_parents(0, left.node_id, left.node_id)
+
+    assert left.is_active
+    assert graph.state(0).execution_calls == 1
 
 
 def test_serialization_exposes_compact_executable_state():
@@ -89,7 +168,7 @@ def test_serialization_exposes_compact_executable_state():
     assert node.node_id in text
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
-    assert "Actions: Select, Explore/Expand, Combine, Prune, or Commit" in text
+    assert "Actions: Select, Find_relation, Combine, Prune, or Commit" in text
 
 
 def test_expanding_parent_frees_one_frontier_slot_but_keeps_history():
@@ -124,18 +203,72 @@ def test_combine_function_states_preserves_both_fork_branches():
     assert target == "expression3"
 
 
-def test_graph_credit_is_concentrated_on_committed_actions():
-    advantages = torch.tensor([[2.0, 2.0, 2.0]])
-    mask = torch.tensor([[0.0, 1.0, 0.0]])
-    result = concentrate_graph_credit(advantages, mask, weight=0.5)
-    assert result.tolist() == [[2.0, 3.0, 2.0]]
+def test_graph_credit_compares_different_actions_from_same_state():
+    advantages = torch.zeros((3, 4))
+    action_ids = torch.tensor(
+        [[0, 1, 1, 0], [0, 1, 1, 0], [0, 1, 1, 0]]
+    )
+    rewards = torch.tensor([1.0, 0.0, 0.7])
+    records = [
+        [{"state_key": "S", "action_key": "commit-H1"}],
+        [{"state_key": "S", "action_key": "commit-H2"}],
+        [{"state_key": "unique", "action_key": "commit-H3"}],
+    ]
+
+    result, compared = apply_grouped_decision_credit(
+        advantages,
+        action_ids,
+        rewards,
+        ["question", "question", "question"],
+        records,
+        weight=0.5,
+    )
+
+    assert result[0, 1:3].tolist() == pytest.approx([0.5, 0.5])
+    assert result[1, 1:3].tolist() == pytest.approx([-0.5, -0.5])
+    assert result[2].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert compared[2].sum().item() == 0
 
 
-def test_execution_budget_is_charged_once_on_last_response_token():
+def test_decision_state_distinguishes_remaining_turn_budget():
+    graph = HypothesisGraph(max_active=3)
+    add(graph, "r.answer", ["m.answer"])
+
+    assert graph.decision_state_key(0, turn=1) != graph.decision_state_key(0, turn=4)
+
+
+def test_invalid_commit_cannot_keep_answer_reward():
+    rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+    mask = torch.tensor([[1, 1, 1], [1, 1, 1]])
+    result = enforce_commit_reward(
+        rewards, mask, torch.tensor([True, False]), invalid_penalty=0.25
+    )
+
+    assert result[0].tolist() == [0.0, 0.0, 1.0]
+    assert result[1].tolist() == [0.0, 0.0, -0.25]
+
+
+def test_final_answer_must_equal_committed_denotation():
+    graph = HypothesisGraph(max_active=3)
+    answer = add(graph, "r.answer", ["m.one", "m.two"])
+    graph.commit(0, answer.node_id)
+
+    assert graph.answer_matches_commit(0, "<answer>m.two m.one</answer>")
+    assert not graph.answer_matches_commit(0, "<answer>m.one</answer>")
+
+
+def test_execution_budget_only_charges_excess_over_sibling_rollout():
     rewards = torch.zeros((2, 4))
     mask = torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]])
     counts = torch.tensor([6.0, 3.0])
-    result = charge_execution_budget(rewards, mask, counts, max_nodes=6, cost=0.12)
-    assert result[0, 2].item() == pytest.approx(-0.12)
-    assert result[1, 1].item() == pytest.approx(-0.06)
-    assert torch.count_nonzero(result).item() == 2
+    result = charge_execution_budget(
+        rewards,
+        mask,
+        counts,
+        max_nodes=6,
+        cost=0.12,
+        group_ids=["question", "question"],
+    )
+    assert result[0, 2].item() == pytest.approx(-0.06)
+    assert result[1, 1].item() == 0.0
+    assert torch.count_nonzero(result).item() == 1

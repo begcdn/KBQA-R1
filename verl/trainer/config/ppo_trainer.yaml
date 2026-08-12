@@ -83,8 +83,11 @@ algorithm:
   # Multiplier on committed graph-action advantages.
   hyper_r1_credit_weight: 1.0
 
-  # Normalized cost charged for exact graph executions.
+  # Cost per execution beyond the cheapest sibling rollout for that question.
   hyper_r1_budget_cost: 0.05
+
+  # Penalty when no committed hypothesis exactly grounds the final answer.
+  hyper_r1_invalid_commit_penalty: 0.25
 
   # Legacy counterfactual component, disabled in HyPER-R1 by default.
   fork_r1_enable: false

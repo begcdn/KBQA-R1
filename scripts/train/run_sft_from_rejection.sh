@@ -136,6 +136,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
   # sft_trainer (engine config: sft_trainer_engine.yaml)
   ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
+    data.messages_key=messages \
     data.pad_mode=no_padding \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     checkpoint.save_contents=['hf_model'] \
@@ -159,8 +160,7 @@ else
   # fsdp_sft_trainer (legacy path; no data.pad_mode key)
   ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.fsdp_sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
-    data.multiturn.enable=true \
-    data.multiturn.messages_key=messages \
+    data.messages_key=messages \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     trainer.checkpoint.save_contents=['hf_model'] \
     data.max_length=16384 \

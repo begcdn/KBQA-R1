@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from hashlib import sha256
+import json
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import re
 
 import torch
@@ -49,6 +51,7 @@ class HypothesisNode:
     denotation: Tuple[str, ...]
     parent_id: Optional[str]
     operation: str
+    parent_ids: Tuple[str, ...] = ()
     relation_id: Optional[str] = None
     relation_prompt: Optional[str] = None
     resolver_score: float = 0.0
@@ -67,6 +70,7 @@ class HypothesisGraphState:
     sample_id: int
     nodes: Dict[str, HypothesisNode] = field(default_factory=dict)
     edges: List[HypothesisEdge] = field(default_factory=list)
+    selected_id: Optional[str] = None
     committed_id: Optional[str] = None
     execution_calls: int = 0
     next_node_index: int = 0
@@ -80,6 +84,91 @@ def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(sorted(set(normalized)))
+
+
+def extract_answer_values(text: str) -> Tuple[str, ...]:
+    """Read the final answer tag using the same identity-preserving normalization."""
+    matches = list(re.finditer(r"<answer>(.*?)</answer>", str(text), re.I | re.S))
+    if not matches:
+        return ()
+    content = matches[-1].group(1).strip()
+    if not content:
+        return ()
+    if content.startswith("[") and content.endswith("]"):
+        try:
+            values = json.loads(content.replace("'", '"'))
+        except json.JSONDecodeError:
+            values = None
+        if isinstance(values, list):
+            return normalize_denotation(values)
+    return normalize_denotation(re.split(r"[\s,]+", content))
+
+
+def relation_path(function_state: Sequence[str]) -> Tuple[str, ...]:
+    """Expose the executed relation sequence without leaking private labels."""
+    relations: List[str] = []
+    pattern = re.compile(r"\bJOIN\(\s*['\"](.+?)['\"]\s*,")
+    for statement in function_state:
+        match = pattern.search(str(statement))
+        if match:
+            relations.append(match.group(1))
+    return tuple(relations)
+
+
+def _node_source(provenance: Sequence[str]) -> str:
+    if "policy_choice" in provenance:
+        return "policy"
+    if "ranked_alternative" in provenance or "hard_sibling" in provenance:
+        return "alternative"
+    return "derived"
+
+
+def serialize_frontier(
+    nodes: Sequence[Mapping[str, Any]],
+    *,
+    active_ids: Sequence[str],
+    selected_id: Optional[str],
+    committed_id: Optional[str],
+    max_active: int,
+    node_count: int,
+    execution_calls: int,
+    max_answers: int = 4,
+) -> str:
+    """Canonical policy observation shared by demonstrations and live rollouts."""
+    active = set(active_ids)
+    visible = active | ({committed_id} if committed_id else set())
+    lines = [
+        "<hypothesis_graph>",
+        f"active={len(active)} capacity={max_active} nodes={node_count} "
+        f"executions={execution_calls} selected={selected_id or 'none'} "
+        f"committed={committed_id or 'none'}",
+    ]
+    for node in nodes:
+        node_id = str(node["node_id"])
+        if node_id not in visible:
+            continue
+        denotation = normalize_denotation(node.get("denotation", ()))
+        answers = ", ".join(denotation[:max_answers]) or "empty"
+        if len(denotation) > max_answers:
+            answers += f", ... (+{len(denotation) - max_answers})"
+        status = "committed" if node_id == committed_id else "active"
+        path = " -> ".join(relation_path(node.get("function_state", ()))) or "root"
+        provenance = tuple(node.get("provenance", ()))
+        parents = tuple(node.get("parent_ids", ()))
+        parent_text = "+".join(parents) if parents else node.get("parent_id") or "ROOT"
+        operation = str(node.get("operation") or "expand")
+        lines.append(
+            f"{node_id} [{status}] parents={parent_text} operation={operation} "
+            f"via={node.get('relation_id') or node.get('operation') or 'derived'} "
+            f"source={_node_source(provenance)} depth={int(node.get('depth', 0))} "
+            f"path={path} answers={len(denotation)}: {answers}"
+        )
+    lines.append(
+        "Actions: Select, Find_relation, Combine, Prune, or Commit. "
+        "Prune only when visible path or execution evidence contradicts the question."
+    )
+    lines.append("</hypothesis_graph>")
+    return "\n".join(lines)
 
 
 _EXPRESSION_RE = re.compile(r"\bexpression\d+\b")
@@ -170,6 +259,7 @@ class HypothesisGraph:
         sexpr: str,
         denotation: Iterable[str],
         parent_id: Optional[str],
+        parent_ids: Sequence[str] = (),
         operation: str,
         relation_id: Optional[str] = None,
         relation_prompt: Optional[str] = None,
@@ -183,8 +273,10 @@ class HypothesisGraph:
                 f"HyPER-R1 node budget exhausted for sample {sample_id}: "
                 f"{len(graph.nodes)}/{self.max_nodes}"
             )
-        if parent_id is not None and parent_id not in graph.nodes:
-            raise KeyError(f"unknown parent hypothesis: {parent_id}")
+        all_parent_ids = tuple(parent_ids or ((parent_id,) if parent_id else ()))
+        unknown_parents = [value for value in all_parent_ids if value not in graph.nodes]
+        if unknown_parents:
+            raise KeyError(f"unknown parent hypotheses: {unknown_parents}")
         if len(self.active_nodes(sample_id)) >= self.max_active:
             raise RuntimeError(
                 f"HyPER-R1 active frontier is full for sample {sample_id}: "
@@ -202,6 +294,7 @@ class HypothesisGraph:
             sexpr=str(sexpr),
             denotation=normalize_denotation(denotation),
             parent_id=parent_id,
+            parent_ids=all_parent_ids,
             operation=str(operation),
             relation_id=relation_id,
             relation_prompt=relation_prompt,
@@ -212,10 +305,10 @@ class HypothesisGraph:
         graph.nodes[node_id] = node
         graph.execution_calls += 1
 
-        if parent_id is not None:
+        for edge_parent in all_parent_ids:
             graph.edges.append(
                 HypothesisEdge(
-                    source=parent_id,
+                    source=edge_parent,
                     target=node_id,
                     kind=(
                         HypothesisEdgeKind.COMPOSITION
@@ -253,7 +346,7 @@ class HypothesisGraph:
                     source=node_id,
                     target=equivalent.node_id,
                     kind=HypothesisEdgeKind.EQUIVALENCE,
-                    label="same_denotation",
+                    label="same_program",
                 )
             )
 
@@ -262,13 +355,65 @@ class HypothesisGraph:
     def _find_equivalent(
         self, graph: HypothesisGraphState, candidate: HypothesisNode
     ) -> Optional[HypothesisNode]:
-        if not candidate.denotation:
-            return None
+        # Equal answers at one step do not imply equal meaning. HyPER-R1 keeps
+        # such paths separate and deduplicates only byte-for-byte programs.
         for node in graph.nodes.values():
             if node.node_id == candidate.node_id or not node.is_active:
                 continue
-            if node.denotation == candidate.denotation:
+            if (
+                node.function_state == candidate.function_state
+                and node.target_expression == candidate.target_expression
+                and node.sexpr == candidate.sexpr
+            ):
                 return node
+        return None
+
+    def select(self, sample_id: int, node_id: str) -> HypothesisNode:
+        graph = self.state(sample_id)
+        if graph.committed_id is not None:
+            raise ValueError("the hypothesis graph is already committed")
+        node = self.require_active(sample_id, node_id)
+        if not node.denotation:
+            raise ValueError("cannot select an empty hypothesis")
+        graph.selected_id = node_id
+        return node
+
+    def selected_node(self, sample_id: int) -> Optional[HypothesisNode]:
+        graph = self.state(sample_id)
+        if graph.selected_id is None:
+            return None
+        return graph.nodes.get(graph.selected_id)
+
+    def execution_error(
+        self,
+        sample_id: int,
+        *,
+        opens_frontier: bool,
+        frontier_width: int,
+    ) -> Optional[str]:
+        """Return why an executable policy action is illegal in this state."""
+        graph = self.state(sample_id)
+        if graph.committed_id is not None:
+            return "The graph is committed. Return the committed values in <answer>."
+        active = self.active_nodes(sample_id)
+        if active and graph.selected_id is None:
+            return "Select an active hypothesis before any executable continuation."
+        if not active and graph.nodes and graph.selected_id is None:
+            return "No active hypothesis can be continued."
+        if not graph.nodes and not opens_frontier:
+            return "Begin the executable frontier with Find_relation."
+        if opens_frontier:
+            active_after = len(active) - (1 if graph.selected_id is not None else 0)
+            if (
+                active_after + frontier_width > self.max_active
+                or not self.has_capacity(sample_id, frontier_width)
+            ):
+                return (
+                    "The full relation frontier does not fit. Prune an unsupported "
+                    "hypothesis before exploring; no partial frontier was executed."
+                )
+        elif not self.has_capacity(sample_id):
+            return "The executed-node budget is exhausted; Commit an active hypothesis."
         return None
 
     def mark_expanded(self, sample_id: int, node_id: Optional[str]) -> None:
@@ -278,14 +423,31 @@ class HypothesisGraph:
         node = self.require_active(sample_id, node_id)
         node.status = HypothesisStatus.EXPANDED
         node.provenance.append("expanded")
+        if self.state(sample_id).selected_id == node_id:
+            self.state(sample_id).selected_id = None
 
     def available_active_slots(self, sample_id: int) -> int:
         return self.max_active - len(self.active_nodes(sample_id))
+
+    def combination_parents(
+        self, sample_id: int, left_id: str, right_id: str
+    ) -> Tuple[HypothesisNode, HypothesisNode]:
+        """Validate a composition before execution or graph mutation."""
+        if left_id == right_id:
+            raise ValueError("Combine requires two distinct active hypotheses")
+        if not self.has_capacity(sample_id):
+            raise RuntimeError("HyPER-R1 node budget exhausted before Combine")
+        return (
+            self.require_active(sample_id, left_id),
+            self.require_active(sample_id, right_id),
+        )
 
     def prune(self, sample_id: int, node_id: str, reason: str = "policy") -> None:
         node = self.require_active(sample_id, node_id)
         node.status = HypothesisStatus.PRUNED
         node.provenance.append(reason)
+        if self.state(sample_id).selected_id == node_id:
+            self.state(sample_id).selected_id = None
 
     def commit(self, sample_id: int, node_id: str) -> HypothesisNode:
         graph = self.state(sample_id)
@@ -297,8 +459,60 @@ class HypothesisGraph:
                 other.status = HypothesisStatus.PRUNED
                 other.provenance.append("commit")
         node.status = HypothesisStatus.COMMITTED
+        graph.selected_id = None
         graph.committed_id = node_id
         return node
+
+    def committed_node(self, sample_id: int) -> Optional[HypothesisNode]:
+        graph = self.state(sample_id)
+        if graph.committed_id is None:
+            return None
+        return graph.nodes.get(graph.committed_id)
+
+    def answer_matches_commit(self, sample_id: int, response: str) -> bool:
+        node = self.committed_node(sample_id)
+        return bool(node is not None and extract_answer_values(response) == node.denotation)
+
+    def decision_state_key(self, sample_id: int, turn: Optional[int] = None) -> str:
+        """Stable semantic key for comparing decisions from the same state."""
+        graph = self.state(sample_id)
+        payload = {
+            "selected": self._node_program_key(graph.nodes.get(graph.selected_id)),
+            "active": sorted(
+                (self._node_program_key(node) for node in self.active_nodes(sample_id)),
+                key=repr,
+            ),
+            "node_count": len(graph.nodes),
+            "execution_calls": graph.execution_calls,
+            "turn": None if turn is None else int(turn),
+        }
+        return sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()[:20]
+
+    @staticmethod
+    def _node_program_key(node: Optional[HypothesisNode]) -> Optional[Tuple[Any, ...]]:
+        if node is None:
+            return None
+        return (node.function_state, node.target_expression, node.operation, node.relation_id)
+
+    def action_key(
+        self,
+        sample_id: int,
+        action: str,
+        node_ids: Sequence[str],
+        details: Sequence[str] = (),
+    ) -> str:
+        graph = self.state(sample_id)
+        programs = [
+            self._node_program_key(graph.nodes.get(node_id)) for node_id in node_ids
+        ]
+        payload = {
+            "action": str(action),
+            "programs": programs,
+            "details": [str(value) for value in details],
+        }
+        return sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:20]
 
     def require_active(self, sample_id: int, node_id: str) -> HypothesisNode:
         """Return an active node or raise a user-facing graph-action error."""
@@ -329,43 +543,22 @@ class HypothesisGraph:
     def serialize(self, sample_id: int, max_answers: int = 4) -> str:
         """Compact policy observation; names remain the executor's responsibility."""
         graph = self.state(sample_id)
-        lines = [
-            "<hypothesis_graph>",
-            f"active={len(self.active_nodes(sample_id))} "
-            f"capacity={self.max_active} nodes={len(graph.nodes)} "
-            f"executions={graph.execution_calls}",
-        ]
-        for node in graph.nodes.values():
-            if node.status not in {HypothesisStatus.ACTIVE, HypothesisStatus.COMMITTED}:
-                continue
-            answers = ", ".join(node.denotation[:max_answers]) or "empty"
-            if len(node.denotation) > max_answers:
-                answers += f", ... (+{len(node.denotation) - max_answers})"
-            parent = node.parent_id or "ROOT"
-            rel = node.relation_id or node.operation
-            source = (
-                "policy"
-                if "policy_choice" in node.provenance
-                else "alternative"
-                if "ranked_alternative" in node.provenance or "hard_sibling" in node.provenance
-                else "derived"
-            )
-            lines.append(
-                f"{node.node_id} [{node.status.value}] parent={parent} "
-                f"via={rel} source={source} depth={node.depth} "
-                f"answers={len(node.denotation)}: {answers}"
-            )
-        lines.append(
-            "Actions: Select, Explore/Expand, Combine, Prune, or Commit. "
-            "Prune before exploration when the active frontier is full."
+        return serialize_frontier(
+            [node.__dict__ for node in graph.nodes.values()],
+            active_ids=[node.node_id for node in self.active_nodes(sample_id)],
+            selected_id=graph.selected_id,
+            committed_id=graph.committed_id,
+            max_active=self.max_active,
+            node_count=len(graph.nodes),
+            execution_calls=graph.execution_calls,
+            max_answers=max_answers,
         )
-        lines.append("</hypothesis_graph>")
-        return "\n".join(lines)
 
     def to_dict(self, sample_id: int) -> dict:
         graph = self.state(sample_id)
         return {
             "sample_id": sample_id,
+            "selected_id": graph.selected_id,
             "committed_id": graph.committed_id,
             "execution_calls": graph.execution_calls,
             "nodes": [
@@ -373,6 +566,7 @@ class HypothesisGraph:
                     **node.__dict__,
                     "function_state": list(node.function_state),
                     "denotation": list(node.denotation),
+                    "parent_ids": list(node.parent_ids),
                     "status": node.status.value,
                 }
                 for node in graph.nodes.values()
@@ -403,15 +597,76 @@ def graph_action_token_mask(
     return mask
 
 
-def concentrate_graph_credit(
+def apply_grouped_decision_credit(
     advantages: torch.Tensor,
-    action_mask: torch.Tensor,
-    weight: float,
+    action_ids: torch.Tensor,
+    terminal_rewards: torch.Tensor,
+    group_ids: Sequence[str],
+    action_records: Sequence[Sequence[Mapping[str, Any]]],
+    weight: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Credit actions only when sibling rollouts tried a different decision.
+
+    GRPO already samples several trajectories per question.  For every exact
+    semantic frontier state, this compares an action's terminal reward with the
+    rewards of *different* actions sampled from that same state. Unique actions
+    receive no invented local credit.
+    """
+    if advantages.shape != action_ids.shape:
+        raise ValueError("advantages and action_ids must have the same shape")
+    if terminal_rewards.ndim != 1 or terminal_rewards.shape[0] != advantages.shape[0]:
+        raise ValueError("terminal_rewards must contain one value per rollout")
+    if len(group_ids) != advantages.shape[0] or len(action_records) != advantages.shape[0]:
+        raise ValueError("group ids and records must align with rollouts")
+
+    outcomes: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+    for row, records in enumerate(action_records):
+        reward = float(terminal_rewards[row].item())
+        for record in records:
+            key = (str(group_ids[row]), str(record["state_key"]))
+            outcomes.setdefault(key, {}).setdefault(str(record["action_key"]), []).append(reward)
+
+    result = advantages.clone()
+    compared = torch.zeros_like(action_ids, dtype=torch.float32)
+    for row, records in enumerate(action_records):
+        reward = float(terminal_rewards[row].item())
+        for action_index, record in enumerate(records, 1):
+            alternatives = outcomes.get(
+                (str(group_ids[row]), str(record["state_key"])), {}
+            )
+            other = [
+                value
+                for action_key, values in alternatives.items()
+                if action_key != str(record["action_key"])
+                for value in values
+            ]
+            if not other:
+                continue
+            delta = max(-1.0, min(1.0, reward - sum(other) / len(other)))
+            token_mask = action_ids == action_index
+            result[row][token_mask[row]] += float(weight) * delta
+            compared[row][token_mask[row]] = 1.0
+    return result, compared
+
+
+def enforce_commit_reward(
+    token_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    commit_valid: torch.Tensor,
+    invalid_penalty: float = 0.25,
 ) -> torch.Tensor:
-    """Increase outcome-credit magnitude on deliberate graph-control actions."""
-    if advantages.shape != action_mask.shape:
-        raise ValueError("advantages and action_mask must have the same shape")
-    return advantages * (1.0 + float(weight) * action_mask.to(advantages.dtype))
+    """Make an answer-grounded Commit a necessary condition for reward."""
+    if token_rewards.shape != response_mask.shape:
+        raise ValueError("token_rewards and response_mask must have the same shape")
+    if commit_valid.ndim != 1 or commit_valid.shape[0] != token_rewards.shape[0]:
+        raise ValueError("commit_valid must contain one value per rollout")
+    result = token_rewards.clone()
+    invalid = commit_valid.to(dtype=torch.bool).logical_not()
+    result[invalid] = 0
+    lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
+    rows = torch.arange(result.shape[0], device=result.device)
+    result[rows[invalid], lengths[invalid]] = -abs(float(invalid_penalty))
+    return result
 
 
 def charge_execution_budget(
@@ -420,8 +675,9 @@ def charge_execution_budget(
     execution_counts: torch.Tensor,
     max_nodes: int,
     cost: float,
+    group_ids: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
-    """Charge one normalized search cost on the last generated token."""
+    """Charge only executions beyond the cheapest sibling rollout."""
     if token_rewards.shape != response_mask.shape:
         raise ValueError("token_rewards and response_mask must have the same shape")
     if execution_counts.ndim != 1 or execution_counts.shape[0] != token_rewards.shape[0]:
@@ -430,7 +686,21 @@ def charge_execution_budget(
         raise ValueError("max_nodes must be positive")
     result = token_rewards.clone()
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
-    penalties = float(cost) * execution_counts.to(result.dtype) / float(max_nodes)
+    baseline = torch.zeros_like(execution_counts)
+    if group_ids is not None:
+        if len(group_ids) != execution_counts.shape[0]:
+            raise ValueError("group_ids must align with rollouts")
+        minima: Dict[str, float] = {}
+        for group_id, count in zip(group_ids, execution_counts.tolist()):
+            key = str(group_id)
+            minima[key] = min(minima.get(key, float("inf")), float(count))
+        baseline = torch.tensor(
+            [minima[str(group_id)] for group_id in group_ids],
+            device=execution_counts.device,
+            dtype=execution_counts.dtype,
+        )
+    excess = (execution_counts - baseline).clamp_min(0)
+    penalties = float(cost) * excess.to(result.dtype) / float(max_nodes)
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows, lengths] -= penalties
     return result

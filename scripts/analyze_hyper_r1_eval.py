@@ -85,12 +85,36 @@ def summarize(rows: Iterable[dict]) -> dict:
             for item in items
             if "hyper_r1_execution_calls" in item
         ]
-        return {
+        result = {
             "questions": len(items),
             "mean_f1": mean(f1) if f1 else 0.0,
             "exact_match": mean(value == 1.0 for value in f1) if f1 else 0.0,
             "mean_execution_calls": mean(execution) if execution else None,
         }
+        optional_rates = {
+            "commit_valid_rate": "hyper_r1_commit_valid",
+            "branch_switch_rate": "hyper_r1_branch_switch",
+            "combine_usage_rate": "hyper_r1_used_combine",
+            "preserved_alternatives_rate": "hyper_r1_preserved_alternatives",
+        }
+        for output_key, row_key in optional_rates.items():
+            values = [_number(item, row_key) for item in items if row_key in item]
+            result[output_key] = mean(values) if values else None
+        frontier = [
+            _number(item, "hyper_r1_max_active")
+            for item in items
+            if "hyper_r1_max_active" in item
+        ]
+        result["mean_max_active_frontier"] = mean(frontier) if frontier else None
+        for name, key in (
+            ("branch_switch_f1", "hyper_r1_branch_switch"),
+            ("conjunction_f1", "hyper_r1_used_combine"),
+        ):
+            selected_items = [item for item in items if _number(item, key) > 0]
+            result[name] = (
+                mean(_f1(item) for item in selected_items) if selected_items else None
+            )
+        return result
 
     result = {"overall": metrics(rows), "by_level": {}}
     for level, items in sorted(grouped.items()):

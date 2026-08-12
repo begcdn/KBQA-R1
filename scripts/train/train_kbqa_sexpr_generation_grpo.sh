@@ -204,6 +204,8 @@ hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
 hyper_r1_frontier_width=${hyper_r1_frontier_width:-3}
 hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
+hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
+structure_format_score=${structure_format_score:-0.1}
 
 if (( GPU_COUNT < 4 )); then
     train_batch_size=${train_batch_size:-32}
@@ -299,6 +301,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     algorithm.hyper_r1_enable=${hyper_r1_enable} \
     algorithm.hyper_r1_credit_weight=${hyper_r1_credit_weight} \
     algorithm.hyper_r1_budget_cost=${hyper_r1_budget_cost} \
+    algorithm.hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.dtype=float16 \
     actor_rollout_ref.ref.dtype=float16 \
@@ -403,7 +406,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sparql.url="http://0.0.0.0:8000/execute" \
     reward_model.reward_manager=kbqa \
     reward_model.reward_kwargs.mid_f1_weight=1.0 \
-    reward_model.reward_kwargs.structure_format_score=0.1 \
+    reward_model.reward_kwargs.structure_format_score=${structure_format_score} \
     reward_model.val_reward_kwargs.mid_f1_weight=1.0 \
     reward_model.val_reward_kwargs.structure_format_score=0.0 \
     custom_reward_function.path="${REPO_ROOT}/kbqa_custom_reward.py" \

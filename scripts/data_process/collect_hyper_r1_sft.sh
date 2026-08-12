@@ -18,4 +18,5 @@ exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --max-input-rows "${MAX_INPUT_ROWS}" \
   --relation-topk 20 \
   --frontier-width 3 \
-  --max-active 6
+  --max-active 6 \
+  --max-turns 10

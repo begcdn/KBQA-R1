@@ -107,6 +107,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-null}         # null processes the full split
 HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
 HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-6}
 HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-24}
+HYPER_R1_FRONTIER_WIDTH=${HYPER_R1_FRONTIER_WIDTH:-3}
 
 # GPU 配置
 NNODES=${NNODES:-1}
@@ -141,7 +142,7 @@ export WANDB_MODE=offline
 export SEXPR_MODE=true
 export ENABLE_ACTION_REASONING=true
 export ENABLE_RELATION_RETRIEVAL=true
-export SEXPR_MAX_TURNS=7
+export SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-7}
 export SEXPR_VALIDATION_LEVEL=STANDARD
 export PYTHON_LOG_LEVEL=INFO
 export VERL_LOGGING_LEVEL=INFO
@@ -189,6 +190,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     data.max_start_length=2048 \
     data.max_obs_length=4196 \
     algorithm.adv_estimator=grpo \
+    algorithm.hyper_r1_enable=${HYPER_R1_ENABLE} \
     actor_rollout_ref.ref.strategy=fsdp2 \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.offload_policy=true \
@@ -243,6 +245,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     hyper_r1.enable=${HYPER_R1_ENABLE} \
     hyper_r1.max_active=${HYPER_R1_MAX_ACTIVE} \
     hyper_r1.max_nodes=${HYPER_R1_MAX_NODES} \
+    hyper_r1.frontier_width=${HYPER_R1_FRONTIER_WIDTH} \
     max_turns=${SEXPR_MAX_TURNS} \
     use_odbc=true \
     use_aioodbc=false \
@@ -261,6 +264,11 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sparql_batch_size=128 \
     sparql_max_concurrent=16 \
     sparql.url="http://0.0.0.0:8000/execute" \
+    reward_model.reward_manager=kbqa \
+    reward_model.reward_kwargs.mid_f1_weight=1.0 \
+    reward_model.reward_kwargs.structure_format_score=0.0 \
+    reward_model.val_reward_kwargs.mid_f1_weight=1.0 \
+    reward_model.val_reward_kwargs.structure_format_score=0.0 \
     custom_reward_function.path="${REPO_ROOT}/kbqa_custom_reward.py" \
     2>&1 | tee "${LOG_FILE}"
 

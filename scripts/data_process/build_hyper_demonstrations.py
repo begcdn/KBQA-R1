@@ -19,6 +19,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationBuilder,
     DemonstrationValidator,
     IneligibleProgram,
+    ProgramExecutionError,
     ProgramStatement,
     RelationOption,
     step_sft_records,
@@ -74,12 +75,12 @@ class LiveProgramExecutor:
     def __call__(self, functions: Sequence[str], target: str) -> Iterable[str]:
         generated = self.generator.generate_sexpr_from_strings(list(functions), target)
         if not generated.is_valid:
-            return []
+            raise ProgramExecutionError(generated.error_message)
         executed = self.executor.execute_sexpr(
             generated.sexpr, function_state=list(functions)
         )
         if not executed.is_successful:
-            return []
+            raise ProgramExecutionError(executed.error_message)
         return _flatten_results(executed.results)
 
 
@@ -115,6 +116,7 @@ def main() -> None:
     parser.add_argument("--relation-topk", type=int, default=20)
     parser.add_argument("--frontier-width", type=int, default=3)
     parser.add_argument("--max-active", type=int, default=6)
+    parser.add_argument("--max-turns", type=int, default=10)
     args = parser.parse_args()
 
     from kbqa_r1.sexpr.relation_retrieval import RelationRetrieval
@@ -142,6 +144,7 @@ def main() -> None:
         LiveCandidateProvider(retrieval, args.relation_topk),
         max_active=args.max_active,
         frontier_width=args.frontier_width,
+        max_turns=args.max_turns,
     )
     validator = DemonstrationValidator(executor, max_active=args.max_active)
 
@@ -194,6 +197,24 @@ def main() -> None:
         parquet_written = False
 
     families = Counter(demo.family for demo in demonstrations)
+    qualified_families = Counter(demo.family for demo in qualified)
+    gold_ranks = Counter(
+        str(demo.private_metadata["gold_rank"])
+        for demo in demonstrations
+        if demo.private_metadata.get("gold_rank") is not None
+    )
+    source_types = Counter()
+    for demo in demonstrations:
+        for step in demo.steps:
+            if step.action != "Find_relation":
+                continue
+            source = str(step.arguments[0])
+            if source.startswith("expression"):
+                source_types["expression"] += 1
+            elif source.startswith("m.") or source.startswith("g."):
+                source_types["mid"] += 1
+            else:
+                source_types["literal_or_name"] += 1
     proposal_stats = dict(sorted(builder.stats.items()))
     relation_total = proposal_stats.get("relation_decisions", 0)
     conjunction_total = proposal_stats.get("conjunction_decisions", 0)
@@ -202,13 +223,24 @@ def main() -> None:
         "accepted_demonstrations": len(demonstrations),
         "qualified_before_balancing": len(qualified),
         "families": dict(sorted(families.items())),
+        "qualified_families_before_balancing": dict(sorted(qualified_families.items())),
+        "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
+        "find_relation_source_types": dict(sorted(source_types.items())),
         "frontier_width": args.frontier_width,
         "max_active": args.max_active,
+        "max_turns": args.max_turns,
+        "maximum_selected_trajectory_turns": max(
+            (len(demo.steps) + 1 for demo in demonstrations), default=0
+        ),
         "sft_rows": len(trajectory_rows),
         "train_parquet_written": parquet_written,
         "skipped": dict(sorted(skipped.items())),
         "proposal_statistics": proposal_stats,
         "proposal_recall": {
+            "measurement": (
+                "teacher-forced semantic relation hints; measures whether the normal "
+                "retriever contains the gold action, not inference-time relation recall"
+            ),
             "relation_at_frontier": (
                 proposal_stats.get("proposal_hit", 0) / relation_total
                 if relation_total else None
@@ -221,7 +253,8 @@ def main() -> None:
         "actions": dict(
             sorted(Counter(step.action for demo in demonstrations for step in demo.steps).items())
         ),
-        "teacher_rationales_added": False,
+        "teacher_action_selection_uses_gold_program": True,
+        "teacher_rationales": "deterministic templates grounded in verified public steps",
         "explicit_gold_labels_exposed_to_student": False,
         "gold_injected_into_proposals": False,
     }
