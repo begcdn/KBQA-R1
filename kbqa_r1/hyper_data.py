@@ -7,11 +7,15 @@ actions, denotations, or the committed answer.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .hyper_prompt import append_hyper_instructions
+from .hyper_r1 import combine_function_states
 
 
 _ASSIGNMENT = re.compile(r"^\s*(expression\d+)\s*=\s*(.+?)\s*$")
@@ -130,6 +134,7 @@ class DemonstrationStep:
     action: str
     arguments: Tuple[str, ...]
     visible_before: Tuple[str, ...]
+    created: Tuple[str, ...] = ()
     rationale_facts: Tuple[str, ...] = ()
 
 
@@ -175,25 +180,85 @@ def replace_join_relation(raw: str, relation: str) -> str:
     return f"{target} = JOIN('{relation}', {source})"
 
 
+def _join_source(raw: str) -> str:
+    match = _ASSIGNMENT.match(raw)
+    if not match:
+        raise ValueError(f"invalid JOIN statement: {raw}")
+    join = _JOIN.match(match.group(2))
+    if not join:
+        raise ValueError(f"not a JOIN statement: {raw}")
+    return join.group(2).strip("'")
+
+
+def _action_source(state_before: Sequence[str], raw: str) -> str:
+    source = _join_source(raw)
+    if not source.startswith("expression"):
+        return source
+    for statement in reversed(state_before):
+        match = _ASSIGNMENT.match(statement)
+        if not match or match.group(1) != source:
+            continue
+        start = _START.match(match.group(2))
+        if start:
+            return start.group(1)
+        break
+    return source
+
+
+def relation_hint(relation: str) -> str:
+    """Render the same semantic relation request used by the student policy."""
+    value = str(relation).strip()
+    reverse = value.startswith("(R ") and value.endswith(")")
+    if reverse:
+        value = value[3:-1]
+    phrase = value.rsplit(".", 1)[-1].replace("_", " ")
+    return f"reverse {phrase}" if reverse else phrase
+
+
+def _is_immediate_linear_terminal(
+    plan: GoldPlan,
+    current: ProgramStatement,
+    following: Optional[ProgramStatement],
+) -> bool:
+    """Return whether one more JOIN completes this linear gold branch."""
+    return bool(
+        following is not None
+        and following.index == current.index + 1
+        and following.sources == (current.target,)
+        and following.target == plan.target_expression
+        and following.raw == plan.executable_functions[-1]
+    )
+
+
 def _digest(*parts: Any) -> str:
     payload = json.dumps(parts, sort_keys=True, ensure_ascii=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 class DemonstrationBuilder:
-    """Construct verified decision demonstrations from gold programs."""
+    """Construct replay-verified frontier trajectories from gold programs.
+
+    Candidate relations always come from the normal retriever ranking. Gold is
+    used only to verify trajectories and choose teacher actions; it is never
+    inserted into a proposal set that failed to retrieve it.
+    """
 
     def __init__(
         self,
         executor: ProgramExecutor,
         candidate_provider: CandidateProvider,
-        max_active: int = 3,
+        max_active: int = 6,
+        frontier_width: int = 3,
     ):
-        if max_active < 2:
-            raise ValueError("max_active must permit at least two hypotheses")
+        if frontier_width < 2:
+            raise ValueError("frontier_width must permit alternatives")
+        if max_active < frontier_width * 2 - 1:
+            raise ValueError("max_active must hold a frontier while another is explored")
         self.executor = executor
         self.candidate_provider = candidate_provider
         self.max_active = int(max_active)
+        self.frontier_width = int(frontier_width)
+        self.stats: Counter = Counter()
 
     def build(self, row: Mapping[str, Any]) -> List[HyperDemonstration]:
         question = str(row.get("question") or row.get("original_question") or "").strip()
@@ -213,8 +278,12 @@ class DemonstrationBuilder:
         if gold_answers and executed_gold != gold_answers:
             return []
         demos: List[HyperDemonstration] = []
-        for join in plan.joins:
-            demo = self._build_relation_demo(question_id, question, plan, join, gold_answers)
+        joins = list(plan.joins)
+        for position, join in enumerate(joins):
+            next_join = joins[position + 1] if position + 1 < len(joins) else None
+            demo = self._build_relation_demo(
+                question_id, question, plan, join, next_join, gold_answers
+            )
             if demo is not None:
                 demos.append(demo)
         for combine in plan.intersections:
@@ -229,80 +298,180 @@ class DemonstrationBuilder:
         question: str,
         plan: GoldPlan,
         join: ProgramStatement,
+        next_join: Optional[ProgramStatement],
         gold_answers: Tuple[str, ...],
     ) -> Optional[HyperDemonstration]:
         state_before = list(plan.executable_functions[: join.index])
-        options = list(self.candidate_provider(question, state_before, join))
+        # A standalone SFT conversation cannot begin from a hidden gold prefix.
+        # Longer paths are learned by repeating the verified two-step protocol
+        # during RL rather than fabricating an unseen initial state.
+        if any(_JOIN.match(_ASSIGNMENT.match(raw).group(2)) for raw in state_before):
+            return None
+        self.stats["relation_decisions"] += 1
+        query = relation_hint(str(join.relation))
+        options = list(self.candidate_provider(query, state_before, join))[
+            : self.frontier_width
+        ]
         gold_option = next((option for option in options if option.relation == join.relation), None)
         if gold_option is None:
+            self.stats["proposal_miss"] += 1
             return None
+        self.stats["proposal_hit"] += 1
 
-        gold_prefix = state_before + [join.raw]
-        gold_prefix_values = normalize_values(self.executor(gold_prefix, join.target))
-        if not gold_prefix_values:
-            return None
-
-        accepted: List[Tuple[RelationOption, List[str], Tuple[str, ...], Tuple[str, ...]]] = []
+        candidates: List[Tuple[RelationOption, ExecutedHypothesis, Tuple[str, ...]]] = []
+        seen_denotations = set()
         for option in options:
-            if option.relation == join.relation:
+            statement = replace_join_relation(join.raw, option.relation)
+            prefix = state_before + [statement]
+            prefix_values = normalize_values(self.executor(prefix, join.target))
+            if not prefix_values:
                 continue
-            alternative_statement = replace_join_relation(join.raw, option.relation)
-            alternative_prefix = state_before + [alternative_statement]
-            prefix_values = normalize_values(self.executor(alternative_prefix, join.target))
-            if not prefix_values or prefix_values == gold_prefix_values:
+            if prefix_values in seen_denotations:
                 continue
-            full_alternative = list(plan.executable_functions)
-            full_alternative[join.index] = alternative_statement
-            terminal_values = normalize_values(
-                self.executor(full_alternative, plan.target_expression)
+            seen_denotations.add(prefix_values)
+            full_program = list(plan.executable_functions)
+            full_program[join.index] = statement
+            terminal = normalize_values(self.executor(full_program, plan.target_expression))
+            node = ExecutedHypothesis(
+                f"H{len(candidates)}",
+                tuple(prefix),
+                join.target,
+                prefix_values,
+                relation=option.relation,
+                role="gold" if option.relation == join.relation else "alternative",
             )
-            if not terminal_values or terminal_values == gold_answers:
-                continue
-            accepted.append((option, alternative_prefix, prefix_values, terminal_values))
-
-        terminal_gold = (
-            join.target == plan.target_expression and gold_prefix_values == gold_answers
+            candidates.append((option, node, terminal))
+        gold_entry = next(
+            (item for item in candidates if item[0].relation == join.relation), None
         )
-        recovery = [item for item in accepted if item[0].rank < gold_option.rank]
-        direct_success = [
-            item
-            for item in accepted
-            if gold_option.rank == 1 and item[0].rank > gold_option.rank and terminal_gold
-        ]
-        if recovery:
-            family = "wrong_sibling_recovery"
-            pool = recovery
-        elif direct_success:
-            family = "correct_top1_commit"
-            pool = direct_success
-        else:
+        if gold_entry is None or len(candidates) < 2:
             return None
-        pool.sort(key=lambda item: (-item[0].score, item[0].rank, item[0].relation))
-        option, alternative_prefix, prefix_values, terminal_values = pool[0]
-        wrong_id = "H0" if family == "wrong_sibling_recovery" else "H1"
-        gold_id = "H1" if family == "wrong_sibling_recovery" else "H0"
-        wrong = ExecutedHypothesis(
-            wrong_id, tuple(alternative_prefix), join.target, prefix_values,
-            relation=option.relation, role="distractor",
-        )
-        gold = ExecutedHypothesis(
-            gold_id, tuple(gold_prefix), join.target, gold_prefix_values,
-            relation=join.relation, role="gold",
-        )
-        hypotheses = {wrong.hypothesis_id: wrong, gold.hypothesis_id: gold}
+
+        hypotheses = {item[1].hypothesis_id: item[1] for item in candidates}
+        created = tuple(hypotheses)
+        source = _action_source(state_before, join.raw)
         steps = [
-            DemonstrationStep("Prune", (wrong.hypothesis_id,), tuple(hypotheses), ("fails_full_intent",)),
-            DemonstrationStep("Select", (gold.hypothesis_id,), (gold.hypothesis_id,), ("matches_full_intent",)),
+            DemonstrationStep(
+                "Find_relation", (source, query), (), created,
+                ("open_ranked_frontier",),
+            )
         ]
+        gold = gold_entry[1]
+
+        terminal_gold = join.target == plan.target_expression and gold.denotation == gold_answers
         if terminal_gold:
+            steps.extend(
+                [
+                    DemonstrationStep(
+                        "Select", (gold.hypothesis_id,), created, (),
+                        ("investigate_without_erasing_alternatives",),
+                    ),
+                    DemonstrationStep(
+                        "Commit", (gold.hypothesis_id,), created, (),
+                        ("complete", "executable"),
+                    ),
+                ]
+            )
+            family = "frontier_commit"
+            probe_relation = None
+        else:
+            # A genuine delayed-recovery trace requires exactly one remaining
+            # linear JOIN. This keeps every action replayable by the runtime.
+            if not _is_immediate_linear_terminal(plan, join, next_join):
+                return None
+            wrong_entries = [
+                item
+                for item in candidates
+                if item[0].relation != join.relation
+                and item[2]
+                and item[2] != gold_answers
+            ]
+            if not wrong_entries:
+                return None
+            wrong_entries.sort(key=lambda item: (item[0].rank, -item[0].score))
+            wrong = wrong_entries[0][1]
+            next_relation = relation_hint(str(next_join.relation))
+
             steps.append(
                 DemonstrationStep(
-                    "Commit", (gold.hypothesis_id,), (gold.hypothesis_id,),
-                    ("complete", "executable"),
+                    "Select", (wrong.hypothesis_id,), created, (),
+                    ("plausible_branch_requires_more_evidence",),
                 )
             )
+            active = list(created)
+            wrong_children = self._expand_terminal_frontier(
+                wrong, next_join, hypotheses
+            )
+            if not wrong_children or any(
+                hypotheses[node_id].denotation == gold_answers for node_id in wrong_children
+            ):
+                return None
+            active.remove(wrong.hypothesis_id)
+            active.extend(wrong_children)
+            steps.append(
+                DemonstrationStep(
+                    "Find_relation", (wrong.target_expression, next_relation), created,
+                    tuple(wrong_children), ("test_plausible_alternative",),
+                )
+            )
+            for child_id in wrong_children:
+                before = tuple(active)
+                active.remove(child_id)
+                steps.append(
+                    DemonstrationStep(
+                        "Prune", (child_id,), before, (),
+                        ("continuation_fails_full_intent",),
+                    )
+                )
+            steps.append(
+                DemonstrationStep(
+                    "Select", (gold.hypothesis_id,), tuple(active), (),
+                    ("return_to_preserved_alternative",),
+                )
+            )
+            gold_children = self._expand_terminal_frontier(
+                gold, next_join, hypotheses
+            )
+            final_gold = next(
+                (
+                    hypotheses[node_id]
+                    for node_id in gold_children
+                    if hypotheses[node_id].relation == next_join.relation
+                    and hypotheses[node_id].denotation == gold_answers
+                ),
+                None,
+            )
+            if final_gold is None:
+                return None
+            before_gold_expansion = tuple(active)
+            active.remove(gold.hypothesis_id)
+            active.extend(gold_children)
+            if len(active) > self.max_active:
+                return None
+            steps.extend(
+                [
+                    DemonstrationStep(
+                        "Find_relation",
+                        (gold.target_expression, next_relation),
+                        before_gold_expansion,
+                        tuple(gold_children),
+                        ("continue_preserved_alternative",),
+                    ),
+                    DemonstrationStep(
+                        "Select", (final_gold.hypothesis_id,), tuple(active), (),
+                        ("full_intent_supported",),
+                    ),
+                    DemonstrationStep(
+                        "Commit", (final_gold.hypothesis_id,), tuple(active), (),
+                        ("complete", "executable"),
+                    ),
+                ]
+            )
+            family = "delayed_frontier_recovery"
+            probe_relation = next_relation
+
         return HyperDemonstration(
-            demo_id=f"{question_id}:join:{join.index}:{_digest(option.relation)}",
+            demo_id=f"{question_id}:join:{join.index}:{_digest(tuple(option.relation for option, _, _ in candidates))}",
             question_id=question_id,
             question=question,
             family=family,
@@ -312,13 +481,50 @@ class DemonstrationBuilder:
             private_metadata={
                 "gold_relation": join.relation,
                 "gold_rank": gold_option.rank,
-                "distractor_relation": option.relation,
-                "distractor_rank": option.rank,
-                "distractor_score": option.score,
-                "distractor_terminal": list(terminal_values),
+                "proposal_relations": [option.relation for option, _, _ in candidates],
+                "proposal_recall_at_frontier": True,
+                "probe_relation": probe_relation,
                 "decision_index": join.index,
             },
         )
+
+    def _expand_terminal_frontier(
+        self,
+        parent: ExecutedHypothesis,
+        join: ProgramStatement,
+        hypotheses: Dict[str, ExecutedHypothesis],
+    ) -> List[str]:
+        options = list(
+            self.candidate_provider(
+                relation_hint(str(join.relation)), parent.function_state, join
+            )
+        )[
+            : self.frontier_width
+        ]
+        if not any(option.relation == join.relation for option in options):
+            return []
+        children: List[str] = []
+        seen_denotations = set()
+        for option in options:
+            statement = replace_join_relation(join.raw, option.relation)
+            state = list(parent.function_state) + [statement]
+            values = normalize_values(self.executor(state, join.target))
+            if not values:
+                continue
+            if values in seen_denotations:
+                continue
+            seen_denotations.add(values)
+            node_id = f"H{len(hypotheses)}"
+            hypotheses[node_id] = ExecutedHypothesis(
+                node_id,
+                tuple(state),
+                join.target,
+                values,
+                relation=option.relation,
+                role="continuation",
+            )
+            children.append(node_id)
+        return children
 
     def _build_intersection_demo(
         self,
@@ -328,39 +534,122 @@ class DemonstrationBuilder:
         combine: ProgramStatement,
         gold_answers: Tuple[str, ...],
     ) -> Optional[HyperDemonstration]:
-        prefix = list(plan.executable_functions[: combine.index])
+        self.stats["conjunction_decisions"] += 1
         left_target, right_target = combine.sources
-        left_values = normalize_values(self.executor(prefix, left_target))
-        right_values = normalize_values(self.executor(prefix, right_target))
-        combined_prefix = prefix + [combine.raw]
-        combined_values = normalize_values(self.executor(combined_prefix, combine.target))
-        if not left_values or not right_values or not combined_values:
+        definitions = {statement.target: statement for statement in plan.statements}
+        left_join = definitions.get(left_target)
+        right_join = definitions.get(right_target)
+        if (
+            left_join is None
+            or right_join is None
+            or left_join.kind != "join"
+            or right_join.kind != "join"
+            or left_join.sources != right_join.sources
+            or not left_join.sources
+        ):
             return None
-        if combined_values != normalize_values(set(left_values) & set(right_values)):
+        shared_source = left_join.sources[0]
+        base_state = self._dependency_state(plan, shared_source)
+        action_source = _action_source(base_state, left_join.raw)
+        query = (
+            relation_hint(str(left_join.relation))
+            + " and "
+            + relation_hint(str(right_join.relation))
+        )
+        options = list(self.candidate_provider(query, base_state, left_join))[
+            : self.frontier_width
+        ]
+        required_relations = {left_join.relation, right_join.relation}
+        if not required_relations.issubset({option.relation for option in options}):
+            self.stats["conjunction_proposal_miss"] += 1
             return None
-        if combined_values == left_values or combined_values == right_values:
-            return None
-        # The first corpus contains complete, replayable conjunction decisions.
-        # A downstream suffix needs additional continuation-state supervision
-        # and is deliberately deferred instead of being represented falsely.
-        if combine.target != plan.target_expression or combined_values != gold_answers:
+        self.stats["conjunction_proposal_hit"] += 1
+
+        hypotheses: Dict[str, ExecutedHypothesis] = {}
+        relation_nodes: Dict[str, ExecutedHypothesis] = {}
+        seen_denotations = set()
+        for option in options:
+            statement = replace_join_relation(left_join.raw, option.relation)
+            state = base_state + [statement]
+            values = normalize_values(self.executor(state, left_join.target))
+            if not values:
+                continue
+            if values in seen_denotations:
+                continue
+            seen_denotations.add(values)
+            node = ExecutedHypothesis(
+                f"H{len(hypotheses)}", tuple(state), left_join.target, values,
+                relation=option.relation,
+                role=(
+                    "required_branch"
+                    if option.relation in required_relations
+                    else "alternative"
+                ),
+            )
+            hypotheses[node.hypothesis_id] = node
+            relation_nodes[option.relation] = node
+        if not required_relations.issubset(relation_nodes):
             return None
 
-        left = ExecutedHypothesis("H0", tuple(prefix), left_target, left_values, role="required_branch")
-        right = ExecutedHypothesis("H1", tuple(prefix), right_target, right_values, role="required_branch")
-        combined = ExecutedHypothesis(
-            "H2", tuple(combined_prefix), combine.target, combined_values, role="combined"
+        left = relation_nodes[left_join.relation]
+        right = relation_nodes[right_join.relation]
+        combined_state, combined_target = combine_function_states(
+            left.function_state, left.target_expression,
+            right.function_state, right.target_expression,
         )
-        hypotheses = {node.hypothesis_id: node for node in (left, right, combined)}
+        combined_values = normalize_values(self.executor(combined_state, combined_target))
+        if (
+            combine.target != plan.target_expression
+            or combined_values != gold_answers
+            or combined_values != normalize_values(set(left.denotation) & set(right.denotation))
+            or combined_values in {left.denotation, right.denotation}
+        ):
+            return None
+        combined = ExecutedHypothesis(
+            f"H{len(hypotheses)}", tuple(combined_state), combined_target,
+            combined_values, role="combined",
+        )
+        hypotheses[combined.hypothesis_id] = combined
+        created = tuple(node_id for node_id in hypotheses if node_id != combined.hypothesis_id)
         steps = [
-            DemonstrationStep("Select", (left.hypothesis_id,), (left.hypothesis_id, right.hypothesis_id), ("required_branch",)),
-            DemonstrationStep("Select", (right.hypothesis_id,), (left.hypothesis_id, right.hypothesis_id), ("required_branch",)),
-            DemonstrationStep("Combine", (left.hypothesis_id, right.hypothesis_id), (left.hypothesis_id, right.hypothesis_id), ("both_branches_necessary",)),
+            DemonstrationStep(
+                "Find_relation", (action_source, query), (), created,
+                ("open_shared_conjunction_frontier",),
+            )
         ]
+        active = list(created)
+        for node_id in created:
+            if node_id in {left.hypothesis_id, right.hypothesis_id}:
+                continue
+            before = tuple(active)
+            active.remove(node_id)
+            steps.append(
+                DemonstrationStep(
+                    "Prune", (node_id,), before, (),
+                    ("not_a_required_conjunct",),
+                )
+            )
+        steps.extend(
+            [
+                DemonstrationStep(
+                    "Select", (left.hypothesis_id,), tuple(active), (),
+                    ("required_branch",),
+                ),
+                DemonstrationStep(
+                    "Select", (right.hypothesis_id,), tuple(active), (),
+                    ("required_branch",),
+                ),
+                DemonstrationStep(
+                    "Combine", (left.hypothesis_id, right.hypothesis_id),
+                    tuple(active), created=(combined.hypothesis_id,),
+                    rationale_facts=("both_branches_necessary",),
+                ),
+            ]
+        )
         steps.append(
             DemonstrationStep(
                 "Commit", (combined.hypothesis_id,), (combined.hypothesis_id,),
-                ("complete", "executable"),
+                rationale_facts=("complete", "executable"),
             )
         )
         return HyperDemonstration(
@@ -374,10 +663,29 @@ class DemonstrationBuilder:
             private_metadata={"decision_index": combine.index},
         )
 
+    def _dependency_state(self, plan: GoldPlan, target: str) -> List[str]:
+        definitions = {statement.target: statement for statement in plan.statements}
+        ordered: List[ProgramStatement] = []
+        seen = set()
+
+        def visit(expression: str) -> None:
+            if expression in seen:
+                return
+            statement = definitions.get(expression)
+            if statement is None or statement.kind == "stop":
+                return
+            for source in statement.sources:
+                visit(source)
+            seen.add(expression)
+            ordered.append(statement)
+
+        visit(target)
+        return [statement.raw for statement in ordered]
+
 class DemonstrationValidator:
     """Replay private executable states and verify graph-action consistency."""
 
-    def __init__(self, executor: ProgramExecutor, max_active: int = 3):
+    def __init__(self, executor: ProgramExecutor, max_active: int = 6):
         self.executor = executor
         self.max_active = int(max_active)
 
@@ -390,10 +698,23 @@ class DemonstrationValidator:
 
         active = set(demo.steps[0].visible_before if demo.steps else ())
         committed = None
+        selected = None
         for step in demo.steps:
-            unknown = [argument for argument in step.arguments if argument not in demo.hypotheses]
+            hypothesis_arguments = (
+                step.arguments if step.action in {"Prune", "Select", "Combine", "Commit"} else ()
+            )
+            unknown = [
+                argument for argument in hypothesis_arguments
+                if argument not in demo.hypotheses
+            ]
             if unknown:
                 errors.append(f"{step.action}: unknown hypotheses {unknown}")
+                continue
+            unknown_created = [
+                node_id for node_id in step.created if node_id not in demo.hypotheses
+            ]
+            if unknown_created:
+                errors.append(f"{step.action}: unknown created hypotheses {unknown_created}")
                 continue
             if set(step.visible_before) != active:
                 errors.append(
@@ -407,6 +728,14 @@ class DemonstrationValidator:
             elif step.action == "Select":
                 if step.arguments[0] not in active:
                     errors.append(f"Select targets inactive {step.arguments[0]}")
+                selected = step.arguments[0]
+            elif step.action == "Find_relation":
+                if selected is not None:
+                    if selected not in active:
+                        errors.append(f"Find_relation expands inactive {selected}")
+                    active.discard(selected)
+                active.update(step.created)
+                selected = None
             elif step.action == "Combine":
                 left, right = step.arguments
                 if left == right:
@@ -424,12 +753,10 @@ class DemonstrationValidator:
                 if left not in active or right not in active:
                     errors.append("Combine requires two active parents")
                 active.difference_update((left, right))
-                combined = next(
-                    (node.hypothesis_id for node in demo.hypotheses.values() if node.role == "combined"),
-                    None,
-                )
-                if combined:
-                    active.add(combined)
+                if len(step.created) != 1:
+                    errors.append("Combine must create exactly one hypothesis")
+                else:
+                    active.add(step.created[0])
             elif step.action == "Commit":
                 node = demo.hypotheses[step.arguments[0]]
                 if node.denotation != demo.gold_answers:
@@ -471,6 +798,7 @@ def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
                     # These are ordinary executor observations available at
                     # inference.  The private role (gold/distractor) is omitted.
                     "answer_examples": list(node.denotation[:3]),
+                    "function_state": list(node.function_state),
                 }
             )
         records.append(
@@ -483,3 +811,113 @@ def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
             }
         )
     return records
+
+
+def _public_graph(demo: HyperDemonstration, active: Sequence[str]) -> str:
+    lines = ["<hypothesis_graph>", f"active={len(active)}"]
+    for node_id in active:
+        node = demo.hypotheses[node_id]
+        answers = ", ".join(node.denotation[:3]) or "empty"
+        lines.append(
+            f"{node_id} [active] via={node.relation or 'derived'} "
+            f"answers={len(node.denotation)}: {answers}"
+        )
+    lines.append("</hypothesis_graph>")
+    return "\n".join(lines)
+
+
+def _action_text(step: DemonstrationStep) -> str:
+    if step.action == "Find_relation":
+        body = f"Find_relation [ {step.arguments[0]} | {step.arguments[1]} ]"
+        thought = "I will execute a bounded relation frontier and retain its alternatives."
+    elif step.action == "Combine":
+        body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
+        thought = "Both active branches express required parts of the question."
+    else:
+        body = f"{step.action} [ {step.arguments[0]} ]"
+        thoughts = {
+            "Select": "I will investigate this hypothesis without discarding the others.",
+            "Prune": "Execution has made this continuation unsupported.",
+            "Commit": "This executable hypothesis covers the full question.",
+        }
+        thought = thoughts[step.action]
+    return f"<think>{thought}</think>\n<action>{body}</action>"
+
+
+def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
+    """Export one complete policy trajectory in the runtime's multi-turn format."""
+    messages: List[Dict[str, str]] = [
+        {
+            "role": "user",
+            "content": append_hyper_instructions(
+                f"Question: {demo.question}\nUse executable KG reasoning to answer it."
+            ),
+        }
+    ]
+    active: List[str] = list(demo.steps[0].visible_before if demo.steps else ())
+    if active:
+        messages.append(
+            {
+                "role": "tool",
+                "content": "<information>Executable branches are available.\n"
+                + _public_graph(demo, active)
+                + "\n</information>",
+            }
+        )
+    selected: Optional[str] = None
+    for step in demo.steps:
+        if tuple(active) != step.visible_before:
+            raise ValueError(
+                f"trajectory {demo.demo_id} has inconsistent visible state before {step.action}"
+            )
+        messages.append({"role": "assistant", "content": _action_text(step)})
+        if step.action == "Find_relation":
+            if selected is not None and selected in active:
+                active.remove(selected)
+            active.extend(step.created)
+            selected = None
+            event = "Executed the requested relation frontier."
+        elif step.action == "Select":
+            selected = step.arguments[0]
+            event = f"Selected {selected}; other active hypotheses remain available."
+        elif step.action == "Prune":
+            active.remove(step.arguments[0])
+            event = f"Pruned {step.arguments[0]}."
+        elif step.action == "Combine":
+            active.remove(step.arguments[0])
+            active.remove(step.arguments[1])
+            active.extend(step.created)
+            selected = None
+            event = f"Combined {step.arguments[0]} and {step.arguments[1]}."
+        elif step.action == "Commit":
+            active = [step.arguments[0]]
+            selected = step.arguments[0]
+            event = f"Committed {selected}."
+        else:
+            raise ValueError(f"unsupported action {step.action}")
+        messages.append(
+            {
+                "role": "tool",
+                "content": f"<information>{event}\n{_public_graph(demo, active)}\n</information>",
+            }
+        )
+    committed = demo.hypotheses[selected] if selected else None
+    if committed is None or committed.denotation != demo.gold_answers:
+        raise ValueError(f"trajectory {demo.demo_id} did not finish on verified answers")
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "<answer>" + ", ".join(committed.denotation) + "</answer>",
+        }
+    )
+    return {
+        "messages": messages,
+        "data_source": "hyper_r1_verified_frontier",
+        "extra_info": {
+            "demo_id": demo.demo_id,
+            "question_id": demo.question_id,
+            "family": demo.family,
+            "replay_verified": True,
+            "gold_injected_into_proposals": False,
+        },
+    }

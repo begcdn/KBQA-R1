@@ -28,13 +28,41 @@ class ForkDecision:
     entity_argument: str
     relation_prompt: str
     chosen_relation: str
-    alternative_relation: str
+    ranked_relations: tuple[RelationCandidate, ...]
     resolver_margin: float
     state_before: tuple[str, ...]
     expression_counter: int
     entities: tuple[tuple[str, str], ...]
     prompt: str
     raw_action: str
+
+    @property
+    def alternative_relation(self) -> str:
+        """Legacy single-sibling view used by old Fork-R1 callers."""
+        for candidate in self.ranked_relations:
+            if candidate.relation != self.chosen_relation:
+                return candidate.relation
+        return ""
+
+    def frontier(self, width: int) -> tuple[RelationCandidate, ...]:
+        """Return the chosen relation plus the best distinct proposals."""
+        if width < 1:
+            raise ValueError("frontier width must be positive")
+        chosen = next(
+            (
+                candidate
+                for candidate in self.ranked_relations
+                if candidate.relation == self.chosen_relation
+            ),
+            RelationCandidate(self.chosen_relation, 0.0),
+        )
+        result = [chosen]
+        result.extend(
+            candidate
+            for candidate in self.ranked_relations
+            if candidate.relation != self.chosen_relation
+        )
+        return tuple(result[:width])
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -120,7 +148,7 @@ def build_fork_decision(
         entity_argument=entity_argument,
         relation_prompt=relation_prompt,
         chosen_relation=chosen,
-        alternative_relation=sibling.relation,
+        ranked_relations=tuple(ranked),
         resolver_margin=chosen_score - sibling.score,
         state_before=tuple(state_before),
         expression_counter=int(expression_counter),
@@ -137,7 +165,9 @@ def select_intervention(decisions: Sequence[ForkDecision]) -> Optional[ForkDecis
     return min(decisions, key=lambda decision: (abs(decision.resolver_margin), decision.turn))
 
 
-def append_intervened_join(decision: ForkDecision) -> List[str]:
+def append_intervened_join(
+    decision: ForkDecision, relation: Optional[str] = None
+) -> List[str]:
     """Build the alternative executable state from the exact pre-action state."""
     state = list(decision.state_before)
     entity = decision.entity_argument.strip()
@@ -152,7 +182,7 @@ def append_intervened_join(decision: ForkDecision) -> List[str]:
         expression = f"expression{max(ids, default=0) + 1}"
         state.append(f"{expression} = START('{entity}')")
     state.append(
-        f"{expression} = JOIN('{decision.alternative_relation}', {expression})"
+        f"{expression} = JOIN('{relation or decision.alternative_relation}', {expression})"
     )
     return state
 

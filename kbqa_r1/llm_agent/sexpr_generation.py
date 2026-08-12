@@ -73,6 +73,13 @@ class SExprLLMGenerationManager:
             max_active=int(getattr(config, "hyper_r1_max_active", 6)),
             max_nodes=int(getattr(config, "hyper_r1_max_nodes", 24)),
         )
+        self.hyper_frontier_width = int(
+            getattr(config, "hyper_r1_frontier_width", 3)
+        )
+        if self.hyper_frontier_width < 2:
+            raise ValueError("HyPER-R1 frontier width must be at least two")
+        if self.hyper_frontier_width > self.hyper_graph.max_active:
+            raise ValueError("HyPER-R1 frontier width cannot exceed max_active")
         self._hyper_selected: Dict[int, str] = {}
         self._hyper_action_records: Dict[int, List[dict]] = {}
 
@@ -321,6 +328,12 @@ class SExprLLMGenerationManager:
                 if not execution.is_successful:
                     raise ValueError(execution.error_message)
                 mids = self.result_processor.extract_mid_list(execution.results)
+                if not self.hyper_graph.has_capacity(sample_id):
+                    raise RuntimeError("HyPER-R1 node budget exhausted before Combine")
+                # Combining consumes both leaves, so free their active slots
+                # before registering the executed intersection.
+                self.hyper_graph.mark_expanded(sample_id, left.node_id)
+                self.hyper_graph.mark_expanded(sample_id, right.node_id)
                 node = self.hyper_graph.add_executed(
                     sample_id=sample_id,
                     function_state=state,
@@ -361,7 +374,7 @@ class SExprLLMGenerationManager:
         execution_result,
         mid_list: List[str],
     ) -> None:
-        """Record the factual program and one hard executable sibling."""
+        """Replace the selected leaf with a bounded executable relation frontier."""
         if not self.hyper_r1_enable:
             return
         from ..sexpr.action_parser import ActionType
@@ -382,6 +395,25 @@ class SExprLLMGenerationManager:
         )
         if decision is not None and decision.turn != self.action_processor._fork_r1_current_turn:
             decision = None
+        # An empty execution is negative evidence, not an active hypothesis.
+        # Roll the selected parent back to active so another preserved branch
+        # can still be investigated.
+        if not mid_list:
+            if parent_id is not None:
+                parent = self.hyper_graph.require_active(sample_id, parent_id)
+                current = self.state_manager.snapshot_sample_state(sample_id)
+                self.state_manager.restore_sample_state(
+                    sample_id,
+                    {
+                        "function_state": list(parent.function_state),
+                        "expression_counter": self._expression_counter(
+                            list(parent.function_state)
+                        ),
+                        "entities": current["entities"],
+                        "prompt": current["prompt"],
+                    },
+                )
+            return
 
         operation = (
             "expand"
@@ -399,6 +431,10 @@ class SExprLLMGenerationManager:
             relation_id = decision.chosen_relation
             relation_prompt = decision.relation_prompt
             score = max(0.0, min(1.0, 0.5 + decision.resolver_margin / 2.0))
+
+        # Exploring a leaf replaces it in the active frontier. Its historical
+        # node remains in the graph for provenance and credit assignment.
+        self.hyper_graph.mark_expanded(sample_id, parent_id)
 
         factual = self.hyper_graph.add_executed(
             sample_id=sample_id,
@@ -425,43 +461,69 @@ class SExprLLMGenerationManager:
 
         if not has_relation or decision is None:
             return
-        if not self.hyper_graph.has_capacity(sample_id):
-            return
-        try:
-            alternative_state = append_intervened_join(decision)
-            alternative_target = self._target_expression(alternative_state)
-            alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
-                alternative_state, alternative_target
-            )
-            if not alternative_sexpr.is_valid:
-                return
-            alternative_execution = self.sexpr_executor.execute_sexpr(
-                alternative_sexpr.sexpr, function_state=alternative_state
-            )
-            if not alternative_execution.is_successful:
-                return
-            alternative_mids = self.result_processor.extract_mid_list(
-                alternative_execution.results
-            )
-            self.hyper_graph.add_executed(
-                sample_id=sample_id,
-                function_state=alternative_state,
-                target_expression=alternative_target,
-                sexpr=alternative_sexpr.sexpr,
-                denotation=alternative_mids,
-                parent_id=parent_id,
-                operation="expand",
-                relation_id=decision.alternative_relation,
-                relation_prompt=decision.relation_prompt,
-                resolver_score=max(0.0, min(1.0, score - decision.resolver_margin)),
-                contrast_group=contrast_group,
-                provenance=["hard_sibling"],
-            )
-        except (KeyError, ValueError, RuntimeError):
-            logger.exception("[HyPER-R1] Failed to execute hard sibling for sample %s", sample_id)
+        frontier = decision.frontier(self.hyper_frontier_width)
+        for candidate in frontier:
+            if candidate.relation == decision.chosen_relation:
+                continue
+            if not self.hyper_graph.has_capacity(sample_id):
+                break
+            if self.hyper_graph.available_active_slots(sample_id) <= 0:
+                logger.info(
+                    "[HyPER-R1] Active frontier full for sample %s; policy must prune before broadening",
+                    sample_id,
+                )
+                break
+            try:
+                alternative_state = append_intervened_join(
+                    decision, relation=candidate.relation
+                )
+                alternative_target = self._target_expression(alternative_state)
+                alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
+                    alternative_state, alternative_target
+                )
+                if not alternative_sexpr.is_valid:
+                    continue
+                alternative_execution = self.sexpr_executor.execute_sexpr(
+                    alternative_sexpr.sexpr, function_state=alternative_state
+                )
+                if not alternative_execution.is_successful:
+                    continue
+                alternative_mids = self.result_processor.extract_mid_list(
+                    alternative_execution.results
+                )
+                if not alternative_mids:
+                    continue
+                self.hyper_graph.add_executed(
+                    sample_id=sample_id,
+                    function_state=alternative_state,
+                    target_expression=alternative_target,
+                    sexpr=alternative_sexpr.sexpr,
+                    denotation=alternative_mids,
+                    parent_id=parent_id,
+                    operation="expand",
+                    relation_id=candidate.relation,
+                    relation_prompt=decision.relation_prompt,
+                    resolver_score=float(candidate.score),
+                    contrast_group=contrast_group,
+                    provenance=["ranked_alternative"],
+                )
+            except (KeyError, ValueError, RuntimeError):
+                logger.exception(
+                    "[HyPER-R1] Failed to execute frontier relation %s for sample %s",
+                    candidate.relation,
+                    sample_id,
+                )
+        # Opening a frontier does not select its top-1 member. The next
+        # expansion must be preceded by an explicit policy Select action.
+        self._hyper_selected.pop(sample_id, None)
 
     def _attach_hyper_training_fields(self, output: DataProto, batch_size: int) -> DataProto:
-        """Build token-local masks after the final committed lineage is known."""
+        """Build token-local masks for all deliberate graph-control actions.
+
+        Useful exploration can occur off the final lineage. Outcome credit is
+        therefore concentrated on every valid Select/Prune/Combine/Commit
+        decision, while the execution-budget reward discourages wandering.
+        """
         if not self.hyper_r1_enable:
             return output
         responses = output.batch["responses"]
@@ -470,11 +532,7 @@ class SExprLLMGenerationManager:
         for sample_id in range(batch_size):
             graph = self.hyper_graph.state(sample_id)
             execution_counts[sample_id] = float(graph.execution_calls)
-            target = graph.committed_id or self._hyper_selected.get(sample_id)
-            lineage = set(self.hyper_graph.lineage(sample_id, target)) if target else set()
             for record in self._hyper_action_records.get(sample_id, []):
-                if record.get("node_id") not in lineage:
-                    continue
                 raw_action = record.get("raw_action") or ""
                 if not raw_action:
                     continue
@@ -617,6 +675,19 @@ class SExprLLMGenerationManager:
 
             answer_match = re.search(r'<answer>(.*?)</answer>', pred, re.DOTALL)
             if answer_match:
+                if self.hyper_r1_enable:
+                    graph = self.hyper_graph.state(i)
+                    if graph.committed_id is None:
+                        return (
+                            i,
+                            self._hyper_info(
+                                i,
+                                "Commit one complete executable hypothesis before returning <answer>.",
+                                turn == self.config.max_turns - 1,
+                            ),
+                            False,
+                            False,
+                        )
                 logger.info(f"[SEXPR] Sample {i}: Completed (found answer)")
                 logger.info(f"[SEXPR] Sample {i}: prediction: {pred}")
                 if self.hyper_r1_enable and i in self._hyper_selected:
@@ -748,6 +819,16 @@ class SExprLLMGenerationManager:
                 return self._hyper_info(
                     index,
                     "HyPER-R1 executes one relation decision per turn so its alternatives share an exact pre-action state.",
+                    is_final_turn,
+                )
+            if (
+                relation_actions
+                and self.hyper_graph.active_nodes(index)
+                and index not in self._hyper_selected
+            ):
+                return self._hyper_info(
+                    index,
+                    "Select an active hypothesis before expanding another relation frontier.",
                     is_final_turn,
                 )
         

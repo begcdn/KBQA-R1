@@ -398,6 +398,9 @@ hyper_r1:
   # Maximum number of alternatives visible to the policy.
   max_active: 6
 
+  # Natural ranked relations executed for each exploration decision.
+  frontier_width: 3
+
   # Hard cap on exact executions per question.
   max_nodes: 24
 

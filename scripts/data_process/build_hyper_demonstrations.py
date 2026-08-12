@@ -22,6 +22,7 @@ from kbqa_r1.hyper_data import (
     ProgramStatement,
     RelationOption,
     step_sft_records,
+    trajectory_sft_record,
 )
 
 
@@ -47,6 +48,19 @@ def _flatten_results(results: Iterable[Any]) -> List[str]:
         else:
             values.append(str(item))
     return values
+
+
+def _balanced_take(demos, limit: int):
+    """Round-robin families, then use every remaining verified example."""
+    families = {}
+    for demo in demos:
+        families.setdefault(demo.family, []).append(demo)
+    selected = []
+    while len(selected) < limit and any(families.values()):
+        for family in sorted(families):
+            if families[family] and len(selected) < limit:
+                selected.append(families[family].pop(0))
+    return selected
 
 
 class LiveProgramExecutor:
@@ -96,8 +110,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Processed GrailQA JSON or parquet")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--max-demonstrations", type=int, default=500)
+    parser.add_argument("--max-demonstrations", type=int, default=3000)
+    parser.add_argument("--max-input-rows", type=int, default=20000)
     parser.add_argument("--relation-topk", type=int, default=20)
+    parser.add_argument("--frontier-width", type=int, default=3)
+    parser.add_argument("--max-active", type=int, default=6)
     args = parser.parse_args()
 
     from kbqa_r1.sexpr.relation_retrieval import RelationRetrieval
@@ -121,14 +138,17 @@ def main() -> None:
         dataset="grailqa",
     )
     builder = DemonstrationBuilder(
-        executor, LiveCandidateProvider(retrieval, args.relation_topk)
+        executor,
+        LiveCandidateProvider(retrieval, args.relation_topk),
+        max_active=args.max_active,
+        frontier_width=args.frontier_width,
     )
-    validator = DemonstrationValidator(executor)
+    validator = DemonstrationValidator(executor, max_active=args.max_active)
 
-    demonstrations = []
+    qualified = []
     skipped = Counter()
     for row_number, row in enumerate(_read_rows(Path(args.input)), 1):
-        if len(demonstrations) >= args.max_demonstrations:
+        if row_number > args.max_input_rows:
             break
         try:
             candidates = builder.build(row)
@@ -146,14 +166,13 @@ def main() -> None:
             if errors:
                 skipped["replay_validation_failed"] += 1
                 continue
-            demonstrations.append(demo)
-            if len(demonstrations) >= args.max_demonstrations:
-                break
+            qualified.append(demo)
         if row_number % 100 == 0:
-            print(f"processed={row_number} accepted={len(demonstrations)}")
+            print(f"processed={row_number} qualified={len(qualified)}")
 
-    if not demonstrations:
+    if not qualified:
         raise RuntimeError("no demonstrations passed construction and replay validation")
+    demonstrations = _balanced_take(qualified, args.max_demonstrations)
 
     with (output / "demonstrations.jsonl").open("w", encoding="utf-8") as handle:
         for demo in demonstrations:
@@ -162,15 +181,49 @@ def main() -> None:
         for demo in demonstrations:
             for record in step_sft_records(demo):
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    trajectory_rows = [trajectory_sft_record(demo) for demo in demonstrations]
+    with (output / "trajectory_sft.jsonl").open("w", encoding="utf-8") as handle:
+        for record in trajectory_rows:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    try:
+        from datasets import Dataset
+
+        Dataset.from_list(trajectory_rows).to_parquet(str(output / "train.parquet"))
+        parquet_written = True
+    except ImportError:
+        parquet_written = False
 
     families = Counter(demo.family for demo in demonstrations)
+    proposal_stats = dict(sorted(builder.stats.items()))
+    relation_total = proposal_stats.get("relation_decisions", 0)
+    conjunction_total = proposal_stats.get("conjunction_decisions", 0)
     report = {
         "input": args.input,
         "accepted_demonstrations": len(demonstrations),
+        "qualified_before_balancing": len(qualified),
         "families": dict(sorted(families.items())),
+        "frontier_width": args.frontier_width,
+        "max_active": args.max_active,
+        "sft_rows": len(trajectory_rows),
+        "train_parquet_written": parquet_written,
         "skipped": dict(sorted(skipped.items())),
+        "proposal_statistics": proposal_stats,
+        "proposal_recall": {
+            "relation_at_frontier": (
+                proposal_stats.get("proposal_hit", 0) / relation_total
+                if relation_total else None
+            ),
+            "both_conjuncts_at_frontier": (
+                proposal_stats.get("conjunction_proposal_hit", 0) / conjunction_total
+                if conjunction_total else None
+            ),
+        },
+        "actions": dict(
+            sorted(Counter(step.action for demo in demonstrations for step in demo.steps).items())
+        ),
         "teacher_rationales_added": False,
         "explicit_gold_labels_exposed_to_student": False,
+        "gold_injected_into_proposals": False,
     }
     (output / "report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

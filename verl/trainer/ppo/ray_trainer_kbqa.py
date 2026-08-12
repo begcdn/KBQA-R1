@@ -233,19 +233,6 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
 
-        hyper_enabled = bool(config.get("hyper_r1_enable", False))
-        if hyper_enabled:
-            if "hyper_r1_action_mask" not in data.batch:
-                raise RuntimeError(
-                    "HyPER-R1 is enabled but hyper_r1_action_mask is missing"
-                )
-            from kbqa_r1.hyper_r1 import concentrate_graph_credit
-
-            data.batch["advantages"] = concentrate_graph_credit(
-                data.batch["advantages"],
-                data.batch["hyper_r1_action_mask"],
-                weight=float(config.get("hyper_r1_credit_weight", 1.0)),
-            )
         if config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
@@ -308,6 +295,20 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+    hyper_enabled = bool(config.get("hyper_r1_enable", False))
+    if hyper_enabled:
+        if "hyper_r1_action_mask" not in data.batch:
+            raise RuntimeError(
+                "HyPER-R1 is enabled but hyper_r1_action_mask is missing"
+            )
+        from kbqa_r1.hyper_r1 import concentrate_graph_credit
+
+        data.batch["advantages"] = concentrate_graph_credit(
+            data.batch["advantages"],
+            data.batch["hyper_r1_action_mask"],
+            weight=float(config.get("hyper_r1_credit_weight", 1.0)),
+        )
     return data
 
 
@@ -617,6 +618,7 @@ class RayPPOTrainer:
             hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
             hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
             hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+            hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
             sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
             use_odbc=self.config.get('use_odbc', False),
             use_aioodbc=self.config.get('use_aioodbc', True),
@@ -823,6 +825,7 @@ class RayPPOTrainer:
                     hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
                     hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
                     hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+                    hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
                     sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                     use_odbc=self.config.get('use_odbc', False),
                     use_aioodbc=self.config.get('use_aioodbc', True),
@@ -1440,6 +1443,7 @@ class RayPPOTrainer:
                                 hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
                                 hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
                                 hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+                                hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
                                 sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                                 use_odbc=self.config.get('use_odbc', False),
                                 use_aioodbc=self.config.get('use_aioodbc', True),

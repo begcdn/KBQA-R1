@@ -60,10 +60,11 @@ def test_environment_enforces_hard_active_budget():
     graph = HypothesisGraph(max_active=2)
     low = add(graph, "r.low", ["m.low"], score=0.1)
     middle = add(graph, "r.middle", ["m.middle"], score=0.5)
-    high = add(graph, "r.high", ["m.high"], score=0.9)
+    with pytest.raises(RuntimeError, match="prune before exploring"):
+        add(graph, "r.high", ["m.high"], score=0.9)
 
-    assert low.status == HypothesisStatus.PRUNED
-    assert {node.node_id for node in graph.active_nodes(0)} == {middle.node_id, high.node_id}
+    assert low.status == HypothesisStatus.ACTIVE
+    assert {node.node_id for node in graph.active_nodes(0)} == {low.node_id, middle.node_id}
 
 
 def test_commit_requires_nonempty_active_hypothesis():
@@ -88,7 +89,19 @@ def test_serialization_exposes_compact_executable_state():
     assert node.node_id in text
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
-    assert "Actions: Explore/Expand, Combine, Prune, or Commit" in text
+    assert "Actions: Select, Explore/Expand, Combine, Prune, or Commit" in text
+
+
+def test_expanding_parent_frees_one_frontier_slot_but_keeps_history():
+    graph = HypothesisGraph(max_active=3)
+    parent = add(graph, "r.parent", ["m.parent"])
+    sibling = add(graph, "r.sibling", ["m.sibling"])
+
+    graph.mark_expanded(0, parent.node_id)
+    child = add(graph, "r.child", ["m.child"], parent=parent.node_id)
+
+    assert parent.status == HypothesisStatus.EXPANDED
+    assert {node.node_id for node in graph.active_nodes(0)} == {sibling.node_id, child.node_id}
 
 
 def test_graph_action_mask_marks_all_occurrences():

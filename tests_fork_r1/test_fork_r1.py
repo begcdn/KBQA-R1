@@ -23,7 +23,11 @@ def decision(**overrides):
         "entity_argument": "expression1",
         "relation_prompt": "place where the person died",
         "chosen_relation": "people.deceased_person.place_of_death",
-        "alternative_relation": "people.person.place_of_birth",
+        "ranked_relations": (
+            RelationCandidate("people.deceased_person.place_of_death", 0.9),
+            RelationCandidate("people.person.place_of_birth", 0.8),
+            RelationCandidate("people.person.nationality", 0.7),
+        ),
         "resolver_margin": 0.1,
         "state_before": (
             "expression1 = START('m.01')",
@@ -60,6 +64,17 @@ class ForkR1Test(unittest.TestCase):
         self.assertEqual(
             state[-1],
             "expression1 = JOIN('people.person.place_of_birth', expression1)",
+        )
+
+    def test_frontier_keeps_ranked_distinct_relations(self):
+        frontier = decision().frontier(3)
+        self.assertEqual(
+            [candidate.relation for candidate in frontier],
+            [
+                "people.deceased_person.place_of_death",
+                "people.person.place_of_birth",
+                "people.person.nationality",
+            ],
         )
 
     def test_entity_fork_adds_start_before_join(self):

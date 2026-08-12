@@ -1,96 +1,73 @@
-# HyPER-R1: Hypothesis-Preserving Executable Reasoning
+# HyPER-R1
 
-## Problem
+HyPER-R1 is a KG reasoning policy that delays irreversible commitment. A normal
+relation request opens a bounded frontier of naturally ranked, executable
+hypotheses. The policy can investigate one hypothesis while the others remain
+available, prune hypotheses after execution supplies contrary evidence,
+combine two necessary branches, and commit only an executable hypothesis that
+covers the complete question.
 
-Agentic KGQA systems usually commit to one relation at each turn. Exact KG
-execution can reveal that a choice is weak, but by then the competing relation
-has been discarded. Backtracking methods recover an old state after failure;
-beam retrievers keep several paths outside the language policy. Neither gives a
-trainable agent a persistent, executable representation of its alternatives.
+## Fixed protocol
 
-## Method
+1. `Find_relation [ source | relation intent ]` executes the normal top-3
+   relation proposals from one exact graph state. Gold relations are never
+   inserted into this frontier.
+2. `Select [ Hn ]` chooses the next hypothesis to investigate without deleting
+   its siblings.
+3. A subsequent `Find_relation` replaces that selected leaf with its executable
+   children. Historical nodes remain in the graph.
+4. `Prune [ Hn ]` removes an unsupported active hypothesis. The environment
+   never silently prunes a low-scoring hypothesis for the policy.
+5. `Combine [ Hn | Hm ]` executes the intersection of two retained branches.
+6. `Commit [ Hn ]` is valid only for a nonempty active executable hypothesis.
 
-HyPER-R1 replaces the agent's linear reasoning state with an **executable
-hypothesis graph**.
+The default frontier has three proposals, at most six active hypotheses, and
+at most twenty-four executed nodes.
 
-- A hypothesis node contains a partial S-expression, its exact denotation, its
-  parent operation, and its status.
-- A contrast edge joins hypotheses produced by different relations from the
-  same pre-action state.
-- A composition edge records a logical operation such as intersection, count,
-  comparison, or ordering.
-- An equivalence edge merges hypotheses with the same executable denotation
-  without erasing their different relation histories.
+## Training data
 
-The language policy receives a compact serialization of the active graph and
-uses the existing relation operation plus four graph actions:
+The behavior-cloning corpus is built only from training-set gold programs.
+Candidate sets come from the same relation retriever used at inference, and all
+hypotheses and final answers are replayed through Freebase. Examples are
+rejected when the natural frontier misses a required relation; this miss is
+reported rather than repaired with gold injection.
 
-1. `Find_relation [source | relation description]` executes the resolved
-   relation and one hard sibling from the same pre-action state.
-2. `Select [hypothesis]` restores the exact state of one active hypothesis so
-   subsequent reasoning expands it.
-3. `Combine [left | right]` constructs and executes an intersection.
-4. `Prune [hypothesis]` rejects a hypothesis while retaining its provenance.
-5. `Commit [hypothesis]` returns one executable hypothesis as the answer.
+The retained trajectory families teach distinct policy behavior:
 
-The environment, not the LLM, owns node identities, execution, deduplication,
-and the active-set budget. This prevents malformed graph edits and keeps every
-reported answer executable.
+- `frontier_commit`: open alternatives, select the complete executable branch,
+  then commit;
+- `delayed_frontier_recovery`: investigate a plausible wrong branch, execute
+  its continuation, prune it after negative evidence, return to a preserved
+  alternative, and finish correctly;
+- `conjunction`: retrieve two necessary branches in one natural frontier,
+  remove unrelated candidates, combine the branches, and commit the executed
+  intersection.
 
-## Training
+The builder round-robins these families before filling the remaining corpus so
+easy one-hop commits cannot erase the method-specific behavior.
 
-Training has two stages.
+```bash
+export PROCESSED_GRAILQA=/path/to/processed/GrailQA_train.json
+bash scripts/data_process/collect_hyper_r1_sft.sh
 
-### Structured warm start
+export BASE_MODEL=/path/to/base/model
+bash scripts/train/train_hyper_r1_sft.sh
+```
 
-The released strong KBQA-R1 policy performs referenced rejection sampling in
-the HyPER-R1 environment. Each successful trajectory therefore contains real
-executions of the policy branch and a hard sibling from the same state. A
-deterministic converter inserts `Select` and `Commit` demonstrations using only
-the hypothesis identifiers returned by the environment. SFT on these traces
-teaches the graph protocol without fabricating relations or denotations. It
-does not teach that the policy branch is always best: GRPO remains responsible
-for learning when a retained sibling should replace it.
+## Reinforcement learning
 
-### Reinforcement learning
+After SFT, the existing executable GRPO environment optimizes answer outcome.
+Outcome advantage is concentrated on valid graph-control actions for every
+advantage estimator, including GRPO. Credit includes useful exploration away
+from the final lineage because such exploration is part of the policy. A
+normalized execution penalty discourages indiscriminate search.
 
-The policy is optimized with the existing group-relative objective and exact
-answer F1. Two graph-native signals are added:
+```bash
+bash scripts/train/train_hyper_r1_grpo.sh
+```
 
-- **decision credit:** group-relative terminal advantage is concentrated on
-  actions in the committed hypothesis lineage;
-- **budget reward:** a small cost is charged per executed expansion, so keeping
-  alternatives is useful only when it improves the final answer.
-
-No gold logical form, relation, or answer is exposed at inference time.
-
-## Relation to Prior Methods
-
-- Graph-R1 and KBQA-R1 use one mutable trajectory. HyPER-R1 exposes several
-  executable alternatives to the policy at once.
-- BoG reverts a linear trajectory after a dead end. HyPER-R1 preserves
-  alternatives before failure and can compose them.
-- CPR maintains a calibrated retrieval active set. Its LLM does not manipulate
-  a persistent executable reasoning graph and it is not trained end to end as
-  the graph controller.
-- Ordinary beam search expands and prunes with an external scalar score.
-  HyPER-R1's policy chooses which hypothesis to inspect, expand, combine, or
-  commit using the full question and graph feedback.
-
-## Primary Experiment
-
-Train the same backbone and data under an identical execution budget:
-
-1. released KBQA-R1;
-2. KBQA-R1 plus ordinary relation beam search;
-3. BoG-style retrospective recovery;
-4. HyPER-R1.
-
-The primary benchmark is full GrailQA, reporting overall F1 and
-i.i.d./compositional/zero-shot slices. WebQSP is the simpler control. Report
-answer F1, exact match, execution calls, tokens, latency, and recovery from an
-initial wrong top-1 relation.
-
-The method is falsified if it does not beat both the linear agent and the
-matched-budget beam baseline on full GrailQA, or if its gain disappears when
-execution calls are matched.
+The scientific comparison is the complete method against the released
+single-state KBQA-R1 policy under the same model, data, graph backend, and
+execution budget. Required diagnostics are candidate recall, answer F1/EM,
+successful recovery after a non-gold first choice, conjunction accuracy,
+execution calls, frontier size, and invalid/premature commits.

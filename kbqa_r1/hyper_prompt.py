@@ -9,13 +9,14 @@ from typing import Any, Dict
 HYPER_R1_INSTRUCTIONS = """
 
 HyPER-R1 executable hypothesis graph:
-- A Find_relation action executes your selected relation and one hard alternative from the exact same state. The environment returns both as H-numbered hypotheses.
+- A Find_relation action proposes and executes a small ranked frontier of relations from the exact same state. The environment returns the successful alternatives as H-numbered hypotheses.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
 - Use `Prune [ Hn ]` to reject an active hypothesis.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
-Preserve plausible alternatives until execution gives you a reason to select or prune them.
+- The active frontier is bounded. Prune unsupported hypotheses before exploring when it is full.
+Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others.
 """.rstrip()
 
 
@@ -44,4 +45,3 @@ def augment_dataset_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 message["content"] = append_hyper_instructions(message.get("content", ""))
                 break
     return result
-

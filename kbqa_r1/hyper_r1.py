@@ -18,6 +18,7 @@ import torch
 
 class HypothesisStatus(str, Enum):
     ACTIVE = "active"
+    EXPANDED = "expanded"
     PRUNED = "pruned"
     MERGED = "merged"
     COMMITTED = "committed"
@@ -184,6 +185,11 @@ class HypothesisGraph:
             )
         if parent_id is not None and parent_id not in graph.nodes:
             raise KeyError(f"unknown parent hypothesis: {parent_id}")
+        if len(self.active_nodes(sample_id)) >= self.max_active:
+            raise RuntimeError(
+                f"HyPER-R1 active frontier is full for sample {sample_id}: "
+                f"{len(self.active_nodes(sample_id))}/{self.max_active}; prune before exploring"
+            )
 
         node_id = f"H{graph.next_node_index}"
         graph.next_node_index += 1
@@ -251,7 +257,6 @@ class HypothesisGraph:
                 )
             )
 
-        self._enforce_active_budget(graph)
         return node
 
     def _find_equivalent(
@@ -266,16 +271,16 @@ class HypothesisGraph:
                 return node
         return None
 
-    def _enforce_active_budget(self, graph: HypothesisGraphState) -> None:
-        active = [node for node in graph.nodes.values() if node.is_active]
-        if len(active) <= self.max_active:
+    def mark_expanded(self, sample_id: int, node_id: Optional[str]) -> None:
+        """Replace an explored leaf with its children without deleting history."""
+        if node_id is None:
             return
-        # The environment applies only the hard memory bound.  The language
-        # policy is expected to prune deliberately before reaching it.
-        active.sort(key=lambda node: (node.resolver_score, -node.depth, node.node_id))
-        for node in active[: len(active) - self.max_active]:
-            node.status = HypothesisStatus.PRUNED
-            node.provenance.append("environment_budget")
+        node = self.require_active(sample_id, node_id)
+        node.status = HypothesisStatus.EXPANDED
+        node.provenance.append("expanded")
+
+    def available_active_slots(self, sample_id: int) -> int:
+        return self.max_active - len(self.active_nodes(sample_id))
 
     def prune(self, sample_id: int, node_id: str, reason: str = "policy") -> None:
         node = self.require_active(sample_id, node_id)
@@ -327,7 +332,8 @@ class HypothesisGraph:
         lines = [
             "<hypothesis_graph>",
             f"active={len(self.active_nodes(sample_id))} "
-            f"nodes={len(graph.nodes)} executions={graph.execution_calls}",
+            f"capacity={self.max_active} nodes={len(graph.nodes)} "
+            f"executions={graph.execution_calls}",
         ]
         for node in graph.nodes.values():
             if node.status not in {HypothesisStatus.ACTIVE, HypothesisStatus.COMMITTED}:
@@ -340,8 +346,8 @@ class HypothesisGraph:
             source = (
                 "policy"
                 if "policy_choice" in node.provenance
-                else "sibling"
-                if "hard_sibling" in node.provenance
+                else "alternative"
+                if "ranked_alternative" in node.provenance or "hard_sibling" in node.provenance
                 else "derived"
             )
             lines.append(
@@ -350,7 +356,8 @@ class HypothesisGraph:
                 f"answers={len(node.denotation)}: {answers}"
             )
         lines.append(
-            "Actions: Explore/Expand, Combine, Prune, or Commit one active hypothesis."
+            "Actions: Select, Explore/Expand, Combine, Prune, or Commit. "
+            "Prune before exploration when the active frontier is full."
         )
         lines.append("</hypothesis_graph>")
         return "\n".join(lines)
@@ -401,7 +408,7 @@ def concentrate_graph_credit(
     action_mask: torch.Tensor,
     weight: float,
 ) -> torch.Tensor:
-    """Increase outcome-credit magnitude only on committed graph decisions."""
+    """Increase outcome-credit magnitude on deliberate graph-control actions."""
     if advantages.shape != action_mask.shape:
         raise ValueError("advantages and action_mask must have the same shape")
     return advantages * (1.0 + float(weight) * action_mask.to(advantages.dtype))
