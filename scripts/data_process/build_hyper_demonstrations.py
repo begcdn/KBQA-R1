@@ -111,6 +111,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="Processed GrailQA JSON or parquet")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--relation-model",
+        required=True,
+        help="Explicit SimCSE checkpoint used to rank frontier relations",
+    )
     parser.add_argument("--max-demonstrations", type=int, default=3000)
     parser.add_argument("--max-input-rows", type=int, default=20000)
     parser.add_argument("--relation-topk", type=int, default=20)
@@ -138,6 +143,7 @@ def main() -> None:
         },
         sparql_config=config,
         dataset="grailqa",
+        similarity_model_path=args.relation_model,
     )
     builder = DemonstrationBuilder(
         executor,
@@ -220,6 +226,7 @@ def main() -> None:
     conjunction_total = proposal_stats.get("conjunction_decisions", 0)
     report = {
         "input": args.input,
+        "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
         "qualified_before_balancing": len(qualified),
         "families": dict(sorted(families.items())),

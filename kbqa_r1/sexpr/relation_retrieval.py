@@ -35,8 +35,9 @@ class RelationRetrieval:
     Combines dynamic relation querying with similarity-based selection
     """
     
-    def __init__(self, similarity_model=None, relation_config: dict = None, 
-                 sparql_config: SPARQLConfig = None, dataset: str = "WebQSP"):
+    def __init__(self, similarity_model=None, relation_config: dict = None,
+                 sparql_config: SPARQLConfig = None, dataset: str = "WebQSP",
+                 similarity_model_path: str = None):
         """Initialize relation retrieval and all SimCSE backends.
 
         We intentionally allocate **separate** SimCSE instances for each index to
@@ -57,11 +58,17 @@ class RelationRetrieval:
 
         if SIMCSE_AVAILABLE:
             if similarity_model is None:
-                # No external model provided: load four independent default instances
-                self.simcse_rel = get_default_simcse_model()
-                self.simcse_lit = get_default_simcse_model()
-                self.simcse_name = get_default_simcse_model()
-                self.simcse_literal_plain = get_default_simcse_model()
+                # Keep independent instances because every SimCSE object owns one
+                # mutable index. An explicit path bypasses the legacy fallback.
+                loader = (
+                    (lambda: SimCSE(similarity_model_path))
+                    if similarity_model_path
+                    else get_default_simcse_model
+                )
+                self.simcse_rel = loader()
+                self.simcse_lit = loader()
+                self.simcse_name = loader()
+                self.simcse_literal_plain = loader()
                 logger.info("Successfully loaded default SimCSE models for relations, literals, name and literal_plain")
 
         #     else:
