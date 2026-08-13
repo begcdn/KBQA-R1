@@ -13,6 +13,8 @@ OUTPUT=${OUTPUT:-"${REPO_ROOT}/data/grailqa_hyper_r1_demonstrations"}
 # for an explicit smoke test.
 MAX_DEMONSTRATIONS=${MAX_DEMONSTRATIONS:-0}
 MAX_INPUT_ROWS=${MAX_INPUT_ROWS:-0}
+HYPER_BUILD_WORKERS=${HYPER_BUILD_WORKERS:-8}
+export VERL_LOGGING_LEVEL=${VERL_LOGGING_LEVEL:-WARNING}
 
 exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --input "${PROCESSED_GRAILQA}" \
@@ -20,6 +22,7 @@ exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --relation-model "${HYPER_RELATION_MODEL}" \
   --max-demonstrations "${MAX_DEMONSTRATIONS}" \
   --max-input-rows "${MAX_INPUT_ROWS}" \
+  --workers "${HYPER_BUILD_WORKERS}" \
   --relation-topk 20 \
   --frontier-width 3 \
   --max-active 6 \

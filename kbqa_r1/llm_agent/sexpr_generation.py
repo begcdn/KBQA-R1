@@ -15,6 +15,7 @@ import torch
 from verl import DataProto
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
+                              dependency_function_state,
                               required_hyper_relation_model)
 from kbqa_r1.hyper_prompt import extract_hyper_question
 
@@ -499,6 +500,7 @@ class SExprLLMGenerationManager:
             )
             return
         target = self._target_expression(function_state)
+        branch_state = list(dependency_function_state(function_state, target))
         graph_state = self.hyper_graph.state(sample_id)
         if graph_state.committed_id is not None:
             raise ValueError("cannot execute after Commit")
@@ -561,7 +563,7 @@ class SExprLLMGenerationManager:
 
         factual = self.hyper_graph.add_executed(
             sample_id=sample_id,
-            function_state=function_state,
+            function_state=branch_state,
             target_expression=target,
             sexpr=sexpr_result.sexpr,
             denotation=mid_list,
@@ -604,6 +606,9 @@ class SExprLLMGenerationManager:
                     decision, relation=candidate.relation
                 )
                 alternative_target = self._target_expression(alternative_state)
+                alternative_branch_state = list(
+                    dependency_function_state(alternative_state, alternative_target)
+                )
                 alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
                     alternative_state, alternative_target
                 )
@@ -619,7 +624,7 @@ class SExprLLMGenerationManager:
                 )
                 self.hyper_graph.add_executed(
                     sample_id=sample_id,
-                    function_state=alternative_state,
+                    function_state=alternative_branch_state,
                     target_expression=alternative_target,
                     sexpr=alternative_sexpr.sexpr,
                     denotation=alternative_mids,
@@ -1010,6 +1015,16 @@ class SExprLLMGenerationManager:
                 index,
                 opens_frontier=bool(relation_actions),
                 frontier_width=self.hyper_frontier_width,
+                opens_new_root=bool(
+                    relation_actions
+                    and graph_state.selected_id is None
+                    and relation_actions[0].arguments[0]
+                    in {
+                        entity[-1]
+                        for entity in self.state_manager.get_sample_entities(index)
+                        if entity
+                    }
+                ),
             )
             if execution_error:
                 return self._hyper_info(index, execution_error, is_final_turn)

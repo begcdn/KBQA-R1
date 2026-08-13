@@ -218,6 +218,32 @@ def test_recovery_is_not_manufactured_when_gold_is_already_top1():
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demos[0]) == []
 
 
+def test_two_hop_progress_survives_routine_answer_type_tail():
+    row = {
+        "ID": "typed-two-hop",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression = START('m.topic')",
+            "expression = JOIN('r.gold1', expression)",
+            "expression = JOIN('r.gold2', expression)",
+            "expression1 = START('answer.type')",
+            "expression = AND(expression1, expression)",
+            "expression = STOP(expression)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def typed_executor(functions, target):
+        text = "\n".join(functions)
+        if "r.gold2" in text:
+            return ["m.answer"] if "r.gold1" in text else []
+        return fake_executor(functions, target)
+
+    demos = DemonstrationBuilder(typed_executor, candidates).build(row)
+
+    assert [demo.family for demo in demos] == ["direct_frontier_progress"]
+
+
 def test_recovery_is_not_manufactured_from_a_nonempty_wrong_terminal_answer():
     row = {
         "ID": "wrong-answer",
@@ -259,6 +285,20 @@ def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget()
 
     assert builder.build(row) == []
     assert builder.stats["trajectory_turn_budget_miss"] == 2
+
+
+def test_builder_requires_room_for_two_complete_relation_frontiers():
+    try:
+        DemonstrationBuilder(
+            fake_executor,
+            candidates,
+            frontier_width=3,
+            max_active=5,
+        )
+    except ValueError as exc:
+        assert "two complete relation frontiers" in str(exc)
+    else:
+        raise AssertionError("multi-root curriculum must fit both full frontiers")
 
 
 def test_gold_is_never_injected_when_proposal_frontier_misses_it():
@@ -383,6 +423,109 @@ def test_conjunction_requires_both_branches():
         "do not match required branches" in error
         for error in DemonstrationValidator(fake_executor, max_active=6).validate(malformed)
     )
+
+
+def test_answer_type_and_is_not_used_as_a_conjunction_lesson():
+    row = {
+        "ID": "answer-type",
+        "question": "Which routed drug contains the formulation?",
+        "function_list": [
+            "expression = START('m.formulation')",
+            "expression = JOIN('r.gold1', expression)",
+            "expression1 = START('medicine.routed_drug')",
+            "expression = AND(expression1, expression)",
+            "expression = STOP(expression)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+
+    demos = DemonstrationBuilder(fake_executor, one_hop_candidates).build(row)
+
+    assert all(demo.family != "conjunction" for demo in demos)
+
+
+def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
+    row = {
+        "ID": "two-root",
+        "question": "What category includes both School A and School B?",
+        "function_list": [
+            "expression = START('m.school_a')",
+            "expression = JOIN('r.left', expression)",
+            "expression1 = START('m.school_b')",
+            "expression1 = JOIN('r.right', expression1)",
+            "expression = AND(expression, expression1)",
+            "expression1 = START('education.school_category')",
+            "expression = AND(expression1, expression)",
+            "expression = STOP(expression)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def two_root_candidates(query, state, join):
+        if join.relation == "r.left":
+            return [
+                RelationOption("r.left", 0.9, 1),
+                RelationOption("r.alt1", 0.8, 2),
+            ]
+        return [
+            RelationOption("r.right", 0.9, 1),
+            RelationOption("r.alt2", 0.8, 2),
+        ]
+
+    def two_root_executor(functions, target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.shared"]
+        if "r.left" in text:
+            return ["m.left", "m.shared"]
+        if "r.right" in text:
+            return ["m.right", "m.shared"]
+        return []
+
+    builder = DemonstrationBuilder(two_root_executor, two_root_candidates)
+    demos = builder.build(row)
+    conjunctions = [demo for demo in demos if demo.family == "conjunction"]
+
+    assert len(conjunctions) == 1
+    conjunction = conjunctions[0]
+    assert conjunction.private_metadata["conjunction_roots"] == 2
+    assert [step.action for step in conjunction.steps] == [
+        "Find_relation",
+        "Find_relation",
+        "Combine",
+        "Commit",
+    ]
+    assert conjunction.steps[0].arguments == ("m.school_a",)
+    assert conjunction.steps[1].arguments == ("m.school_b",)
+    assert DemonstrationValidator(two_root_executor, max_active=6).validate(conjunction) == []
+
+
+def test_builder_and_validator_share_execution_cache():
+    row = {
+        "ID": "cached",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+    calls = []
+
+    def recording_executor(functions, target):
+        calls.append((tuple(functions), target))
+        return fake_executor(functions, target)
+
+    builder = DemonstrationBuilder(recording_executor, one_hop_candidates)
+    demo = builder.build(row)[0]
+    calls_after_build = len(calls)
+    validator = DemonstrationValidator(
+        recording_executor,
+        execution_cache=builder._execution_cache,
+    )
+
+    assert validator.validate(demo) == []
+    assert len(calls) == calls_after_build
 
 
 def test_reverse_relation_rewrite_is_preserved():

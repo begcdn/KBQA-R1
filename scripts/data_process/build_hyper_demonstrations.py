@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Iterable, List, Sequence
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -22,6 +24,7 @@ from kbqa_r1.hyper_data import (
     ProgramExecutionError,
     ProgramStatement,
     RelationOption,
+    compile_gold_plan,
     step_sft_records,
     trajectory_sft_record,
 )
@@ -51,18 +54,39 @@ def _flatten_results(results: Iterable[Any]) -> List[str]:
     return values
 
 
-def _balanced_take(demos, limit: int):
-    """Round-robin families, then use every remaining verified example."""
-    if limit <= 0:
-        limit = len(demos)
+def _curriculum_take(demos, limit: int):
+    """Keep the frontier-management signal from being buried by one-hop rows.
+
+    Every verified recovery, multi-hop progression, and conjunction trajectory
+    is retained. Direct one-hop commits are necessary positive controls, but
+    they are capped at the number of those informative trajectories. This is a
+    data-dependent balance rather than an arbitrary corpus-size target.
+    """
     families = {}
     for demo in demos:
         families.setdefault(demo.family, []).append(demo)
+
+    informative = [
+        demo
+        for family, family_demos in families.items()
+        if family != "frontier_commit"
+        for demo in family_demos
+    ]
+    commits = list(families.get("frontier_commit", ()))
+    if informative:
+        commits = commits[: len(informative)]
+
+    selected_families = {}
+    for demo in [*informative, *commits]:
+        selected_families.setdefault(demo.family, []).append(demo)
+    if limit <= 0:
+        limit = sum(len(items) for items in selected_families.values())
+
     selected = []
-    while len(selected) < limit and any(families.values()):
-        for family in sorted(families):
-            if families[family] and len(selected) < limit:
-                selected.append(families[family].pop(0))
+    while len(selected) < limit and any(selected_families.values()):
+        for family in sorted(selected_families):
+            if selected_families[family] and len(selected) < limit:
+                selected.append(selected_families[family].pop(0))
     return selected
 
 
@@ -90,6 +114,7 @@ class LiveCandidateProvider:
     def __init__(self, retrieval: Any, topk: int = 20):
         self.retrieval = retrieval
         self.topk = int(topk)
+        self._rank_lock = threading.Lock()
 
     def __call__(
         self,
@@ -100,9 +125,12 @@ class LiveCandidateProvider:
         if not state_before:
             return []
         candidates = self.retrieval.get_candidate_relations(list(state_before))
-        ranked = self.retrieval.rank_relations_no_threshold(
-            question, candidates, topk=self.topk
-        )
+        # Graph adjacency is fetched concurrently. A single model instance
+        # ranks the returned vocabularies, so serialize only this short GPU call.
+        with self._rank_lock:
+            ranked = self.retrieval.rank_relations_no_threshold(
+                question, candidates, topk=self.topk
+            )
         return [
             RelationOption(candidate.relation_id, float(candidate.score), rank)
             for rank, candidate in enumerate(ranked, 1)
@@ -130,7 +158,15 @@ def main() -> None:
     parser.add_argument("--frontier-width", type=int, default=3)
     parser.add_argument("--max-active", type=int, default=6)
     parser.add_argument("--max-turns", type=int, default=10)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrent graph-query workers; relation ranking remains serialized",
+    )
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     from kbqa_r1.sexpr.relation_retrieval import RelationRetrieval
     from kbqa_r1.sparql.odbc_config import ODBCConfig
@@ -153,57 +189,96 @@ def main() -> None:
         dataset="grailqa",
         similarity_model_path=args.relation_model,
     )
-    builder = DemonstrationBuilder(
-        executor,
-        LiveCandidateProvider(retrieval, args.relation_topk),
-        max_active=args.max_active,
-        frontier_width=args.frontier_width,
-        max_turns=args.max_turns,
-    )
-    validator = DemonstrationValidator(executor, max_active=args.max_active)
+    provider = LiveCandidateProvider(retrieval, args.relation_topk)
 
-    qualified = []
-    skipped = Counter()
-    rows_by_hop = Counter()
-    accepted_rows_by_hop = Counter()
-    for row_number, row in enumerate(_read_rows(Path(args.input)), 1):
-        if args.max_input_rows > 0 and row_number > args.max_input_rows:
-            break
-        hop_count = sum("JOIN(" in str(item) for item in row.get("function_list", ()))
-        rows_by_hop[str(hop_count)] += 1
-        try:
-            candidates = builder.build(row)
-        except IneligibleProgram as exc:
-            skipped[f"ineligible:{str(exc).split()[0]}"] += 1
-            continue
-        except Exception as exc:
-            skipped[f"builder_error:{type(exc).__name__}"] += 1
-            continue
-        if not candidates:
-            skipped["no_qualified_demonstration"] += 1
-            continue
-        accepted_this_row = False
-        for demo in candidates:
+    def build_row(row):
+        builder = DemonstrationBuilder(
+            executor,
+            provider,
+            max_active=args.max_active,
+            frontier_width=args.frontier_width,
+            max_turns=args.max_turns,
+        )
+        demonstrations = builder.build(row)
+        validator = DemonstrationValidator(
+            executor,
+            max_active=args.max_active,
+            execution_cache=builder._execution_cache,
+        )
+        for demo in demonstrations:
             errors = validator.validate(demo)
             if errors:
                 raise RuntimeError(
                     f"replay validation failed for {demo.demo_id}: "
                     + "; ".join(errors)
                 )
+        return demonstrations, builder.stats
+
+    qualified = []
+    skipped = Counter()
+    proposal_stats = Counter()
+    rows_by_hop = Counter()
+    accepted_rows_by_hop = Counter()
+    rows = _read_rows(Path(args.input))
+    if args.max_input_rows > 0:
+        rows = rows[: args.max_input_rows]
+
+    def prepared_rows():
+        for row in rows:
+            try:
+                compile_gold_plan(row.get("function_list") or ())
+            except IneligibleProgram as exc:
+                yield row, None, f"ineligible:{str(exc).split()[0]}"
+            else:
+                yield row, row, None
+
+    prepared = list(prepared_rows())
+    eligible = [row for _, row, error in prepared if row is not None and error is None]
+    result_iterator = iter(())
+    pool = None
+    if eligible:
+        if args.workers > 1:
+            pool = ThreadPoolExecutor(max_workers=args.workers)
+            result_iterator = pool.map(build_row, eligible)
+        else:
+            result_iterator = map(build_row, eligible)
+    result_iterator = iter(result_iterator)
+
+    for row_number, (original, eligible_row, prefilter_error) in enumerate(prepared, 1):
+        row = original
+        hop_count = sum("JOIN(" in str(item) for item in row.get("function_list", ()))
+        rows_by_hop[str(hop_count)] += 1
+        if prefilter_error is not None:
+            skipped[prefilter_error] += 1
+            continue
+        try:
+            candidates, row_stats = next(result_iterator)
+        except Exception as exc:
+            question_id = row.get("ID") or row.get("id") or row_number
+            raise RuntimeError(
+                f"demonstration construction failed for row {question_id}"
+            ) from exc
+        proposal_stats.update(row_stats)
+        if not candidates:
+            skipped["no_qualified_demonstration"] += 1
+            continue
+        accepted_this_row = False
+        for demo in candidates:
             qualified.append(demo)
             accepted_this_row = True
         if accepted_this_row:
             accepted_rows_by_hop[str(hop_count)] += 1
         if row_number % 100 == 0:
             print(f"processed={row_number} qualified={len(qualified)}")
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     if not qualified:
         raise RuntimeError("no demonstrations passed construction and replay validation")
-    demonstrations = _balanced_take(qualified, args.max_demonstrations)
-    unique_demonstrations = []
+    unique_qualified = []
     seen_trajectories = set()
     duplicates_removed = 0
-    for demo in demonstrations:
+    for demo in qualified:
         serialized = json.dumps(
             trajectory_sft_record(demo)["messages"],
             sort_keys=True,
@@ -213,8 +288,10 @@ def main() -> None:
             duplicates_removed += 1
             continue
         seen_trajectories.add(serialized)
-        unique_demonstrations.append(demo)
-    demonstrations = unique_demonstrations
+        unique_qualified.append(demo)
+    demonstrations = _curriculum_take(
+        unique_qualified, args.max_demonstrations
+    )
 
     with (output / "demonstrations.jsonl").open("w", encoding="utf-8") as handle:
         for demo in demonstrations:
@@ -236,7 +313,7 @@ def main() -> None:
         parquet_written = False
 
     families = Counter(demo.family for demo in demonstrations)
-    qualified_families = Counter(demo.family for demo in qualified)
+    qualified_families = Counter(demo.family for demo in unique_qualified)
     gold_ranks = Counter(
         str(demo.private_metadata["gold_rank"])
         for demo in demonstrations
@@ -254,7 +331,7 @@ def main() -> None:
                 source_types["mid"] += 1
             else:
                 source_types["literal_or_name"] += 1
-    proposal_stats = dict(sorted(builder.stats.items()))
+    proposal_stats = dict(sorted(proposal_stats.items()))
     relation_total = proposal_stats.get("relation_decisions", 0)
     continuation_total = proposal_stats.get("continuation_decisions", 0)
     recovery_probe_total = proposal_stats.get("recovery_probe_decisions", 0)
@@ -299,6 +376,11 @@ def main() -> None:
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
         "qualified_before_balancing": len(qualified),
+        "qualified_after_exact_deduplication": len(unique_qualified),
+        "curriculum_selection": (
+            "retain every verified recovery, multi-hop progression, and conjunction; "
+            "cap repetitive one-hop commits at the informative-trajectory count"
+        ),
         "families": dict(sorted(families.items())),
         "qualified_families_before_balancing": dict(sorted(qualified_families.items())),
         "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
@@ -306,6 +388,7 @@ def main() -> None:
         "frontier_width": args.frontier_width,
         "max_active": args.max_active,
         "max_turns": args.max_turns,
+        "graph_query_workers": args.workers,
         "maximum_selected_trajectory_turns": max(
             (len(demo.steps) + 1 for demo in demonstrations), default=0
         ),

@@ -10,6 +10,7 @@ from kbqa_r1.hyper_r1 import (
     combine_function_states,
     charge_execution_budget,
     enforce_commit_reward,
+    dependency_function_state,
     graph_action_token_mask,
     required_hyper_relation_model,
 )
@@ -144,6 +145,24 @@ def test_relation_source_is_bound_to_candidates_and_selected_state():
     )
 
 
+def test_new_candidate_root_can_open_while_other_hypotheses_stay_active():
+    graph = HypothesisGraph(max_active=6, max_nodes=12)
+    add(graph, "r.first", ["m.first"])
+
+    assert graph.execution_error(
+        0,
+        opens_frontier=True,
+        frontier_width=3,
+        opens_new_root=True,
+    ) is None
+    assert graph.relation_source_error(
+        0, "m.second_topic", ["m.first_topic", "m.second_topic"]
+    ) is None
+    assert "supplied candidate" in graph.relation_source_error(
+        0, "m.invented", ["m.first_topic", "m.second_topic"]
+    )
+
+
 def test_non_frontier_execution_cannot_escape_exhausted_node_budget():
     graph = HypothesisGraph(max_active=2, max_nodes=2)
     first = add(graph, "r.first", ["m.first"])
@@ -233,6 +252,20 @@ def test_combine_function_states_preserves_both_fork_branches():
         "expression3 = AND(expression1, expression2)",
     ]
     assert target == "expression3"
+
+
+def test_dependency_state_drops_unrelated_retained_root():
+    state = [
+        "expression1 = START('m.left')",
+        "expression1 = JOIN('r.left', expression1)",
+        "expression2 = START('m.right')",
+        "expression2 = JOIN('r.right', expression2)",
+    ]
+
+    assert dependency_function_state(state, "expression2") == (
+        "expression2 = START('m.right')",
+        "expression2 = JOIN('r.right', expression2)",
+    )
 
 
 def test_graph_credit_compares_different_actions_from_same_state():

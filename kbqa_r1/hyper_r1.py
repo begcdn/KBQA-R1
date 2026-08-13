@@ -171,7 +171,55 @@ def serialize_frontier(
     return "\n".join(lines)
 
 
-_EXPRESSION_RE = re.compile(r"\bexpression\d+\b")
+_EXPRESSION_RE = re.compile(r"\bexpression\d*\b")
+
+
+def _expression_number(name: str) -> int:
+    suffix = str(name)[len("expression") :]
+    return int(suffix) if suffix else 0
+
+
+def dependency_function_state(
+    function_state: Sequence[str], target: str
+) -> Tuple[str, ...]:
+    """Keep only assignments that determine ``target``.
+
+    The live executor may retain definitions from an earlier root while it
+    opens another branch. Those definitions are harmless to SPARQL execution,
+    but storing them in the new hypothesis would make two independent branches
+    look like one path. Resolve overwritten expression variables by assignment
+    position and retain the exact dependency closure of the requested target.
+    """
+    assignments = []
+    for index, raw_value in enumerate(function_state):
+        raw = str(raw_value).strip()
+        if "=" not in raw:
+            continue
+        lhs, rhs = (part.strip() for part in raw.split("=", 1))
+        if not _EXPRESSION_RE.fullmatch(lhs):
+            continue
+        assignments.append((index, lhs, rhs, raw))
+
+    retained = set()
+
+    def visit(expression: str, before: int) -> None:
+        match = next(
+            (
+                item
+                for item in reversed(assignments)
+                if item[0] < before and item[1] == expression
+            ),
+            None,
+        )
+        if match is None or match[0] in retained:
+            return
+        index, _, rhs, _ = match
+        for source in _EXPRESSION_RE.findall(rhs):
+            visit(source, index)
+        retained.add(index)
+
+    visit(str(target), len(function_state) + 1)
+    return tuple(raw for index, _, _, raw in assignments if index in retained)
 
 
 def combine_function_states(
@@ -194,7 +242,7 @@ def combine_function_states(
 
     merged = list(left_state)
     existing_ids = [
-        int(name[len("expression") :])
+        _expression_number(name)
         for statement in merged
         for name in _EXPRESSION_RE.findall(statement)
     ]
@@ -207,7 +255,7 @@ def combine_function_states(
         if "=" not in statement:
             raise ValueError(f"invalid function statement: {statement}")
         lhs, rhs = (part.strip() for part in statement.split("=", 1))
-        if not re.fullmatch(r"expression\d+", lhs):
+        if not _EXPRESSION_RE.fullmatch(lhs):
             raise ValueError(f"invalid expression assignment: {statement}")
         rewritten_rhs = _EXPRESSION_RE.sub(lambda match: mapping.get(match.group(0), match.group(0)), rhs)
         fresh_lhs = f"expression{next_id}"
@@ -390,13 +438,14 @@ class HypothesisGraph:
         *,
         opens_frontier: bool,
         frontier_width: int,
+        opens_new_root: bool = False,
     ) -> Optional[str]:
         """Return why an executable policy action is illegal in this state."""
         graph = self.state(sample_id)
         if graph.committed_id is not None:
             return "The graph is committed. Return the committed values in <answer>."
         active = self.active_nodes(sample_id)
-        if active and graph.selected_id is None:
+        if active and graph.selected_id is None and not opens_new_root:
             return "Select an active hypothesis before any executable continuation."
         if not active and graph.nodes and graph.selected_id is None:
             return "No active hypothesis can be continued."
@@ -424,6 +473,7 @@ class HypothesisGraph:
     ) -> Optional[str]:
         """Require relation retrieval to continue from a public valid source."""
         graph = self.state(sample_id)
+        candidate_sources = {str(value) for value in candidate_sources}
         if graph.selected_id is not None:
             selected = self.require_active(sample_id, graph.selected_id)
             if str(source) != selected.target_expression:
@@ -432,7 +482,7 @@ class HypothesisGraph:
                     f"{selected.target_expression}."
                 )
             return None
-        if not graph.nodes and str(source) not in {str(value) for value in candidate_sources}:
+        if str(source) not in candidate_sources:
             return "The initial Find_relation source must be a supplied candidate entity."
         return None
 

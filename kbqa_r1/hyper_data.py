@@ -221,12 +221,18 @@ def _is_immediate_linear_terminal(
     following: Optional[ProgramStatement],
 ) -> bool:
     """Return whether one more JOIN completes this linear gold branch."""
-    return bool(
-        following is not None
-        and following.index == current.index + 1
-        and following.sources == (current.target,)
-        and following.target == plan.target_expression
-        and following.raw == plan.executable_functions[-1]
+    if (
+        following is None
+        or following.index != current.index + 1
+        or following.sources != (current.target,)
+    ):
+        return False
+    # GrailQA commonly appends START(answer_type) + AND after the semantic
+    # path. The child execution still has to equal the annotated answers, so
+    # allowing that non-relational tail does not weaken trajectory validation.
+    return not any(
+        statement.kind == "join" and statement.index > following.index
+        for statement in plan.statements
     )
 
 
@@ -253,8 +259,8 @@ class DemonstrationBuilder:
     ):
         if frontier_width < 2:
             raise ValueError("frontier_width must permit alternatives")
-        if max_active < frontier_width * 2 - 1:
-            raise ValueError("max_active must hold a frontier while another is explored")
+        if max_active < frontier_width * 2:
+            raise ValueError("max_active must hold two complete relation frontiers")
         self.executor = executor
         self.candidate_provider = candidate_provider
         self.max_active = int(max_active)
@@ -263,16 +269,26 @@ class DemonstrationBuilder:
         if self.max_turns < 2:
             raise ValueError("max_turns must include at least one action and the answer")
         self.stats: Counter = Counter()
+        self._execution_cache: Dict[
+            Tuple[Tuple[str, ...], str], Optional[Tuple[str, ...]]
+        ] = {}
 
     def _execute(
         self, functions: Sequence[str], target: str
     ) -> Optional[Tuple[str, ...]]:
         """Distinguish a valid empty answer set from execution failure."""
+        key = (tuple(str(item) for item in functions), str(target))
+        if key in self._execution_cache:
+            self.stats["execution_cache_hit"] += 1
+            return self._execution_cache[key]
         try:
-            return normalize_values(self.executor(functions, target))
+            result = normalize_values(self.executor(functions, target))
         except ProgramExecutionError:
             self.stats["execution_failure"] += 1
-            return None
+            result = None
+        self._execution_cache[key] = result
+        self.stats["execution_cache_miss"] += 1
+        return result
 
     def build(self, row: Mapping[str, Any]) -> List[HyperDemonstration]:
         question = str(row.get("question") or row.get("original_question") or "").strip()
@@ -291,9 +307,25 @@ class DemonstrationBuilder:
             return []
         if gold_answers and executed_gold != gold_answers:
             return []
+        intersection_demos: List[HyperDemonstration] = []
+        semantic_branch_indexes = set()
+        for combine in plan.intersections:
+            demo = self._build_intersection_demo(
+                question_id, question, plan, combine, gold_answers
+            )
+            if demo is None:
+                continue
+            intersection_demos.append(demo)
+            semantic_branch_indexes.update(
+                statement.index
+                for statement in self._immediate_intersection_branches(plan, combine)
+            )
+
         demos: List[HyperDemonstration] = []
         joins = list(plan.joins)
         for position, join in enumerate(joins):
+            if join.index in semantic_branch_indexes:
+                continue
             next_join = joins[position + 1] if position + 1 < len(joins) else None
             demo = self._build_relation_demo(
                 question_id, question, plan, join, next_join, gold_answers
@@ -305,10 +337,7 @@ class DemonstrationBuilder:
                     if direct is not None:
                         self.stats["direct_progress_built"] += 1
                         demos.append(direct)
-        for combine in plan.intersections:
-            demo = self._build_intersection_demo(question_id, question, plan, combine, gold_answers)
-            if demo is not None:
-                demos.append(demo)
+        demos.extend(intersection_demos)
         within_budget = []
         for demo in demos:
             # Every graph action occupies one model turn and the committed
@@ -433,7 +462,8 @@ class DemonstrationBuilder:
         next_join: Optional[ProgramStatement],
         gold_answers: Tuple[str, ...],
     ) -> Optional[HyperDemonstration]:
-        state_before = list(plan.executable_functions[: join.index])
+        source = join.sources[0] if join.sources else _join_source(join.raw)
+        state_before = self._dependency_state(plan, source, before=join.index)
         # A standalone SFT conversation cannot begin from a hidden gold prefix.
         # Longer paths are learned by repeating the verified two-step protocol
         # during RL rather than fabricating an unseen initial state.
@@ -455,9 +485,7 @@ class DemonstrationBuilder:
         if gold_option.rank == 1:
             self.stats["proposal_top1_hit"] += 1
 
-        candidates: List[
-            Tuple[RelationOption, ExecutedHypothesis, Optional[Tuple[str, ...]]]
-        ] = []
+        candidates: List[Tuple[RelationOption, ExecutedHypothesis]] = []
         for option in options:
             statement = replace_join_relation(join.raw, option.relation)
             prefix = state_before + [statement]
@@ -468,9 +496,6 @@ class DemonstrationBuilder:
             self.stats[
                 "candidate_nonempty" if prefix_values else "candidate_empty"
             ] += 1
-            full_program = list(plan.executable_functions)
-            full_program[join.index] = statement
-            terminal = self._execute(full_program, plan.target_expression)
             node = ExecutedHypothesis(
                 f"H{len(candidates)}",
                 tuple(prefix),
@@ -482,7 +507,7 @@ class DemonstrationBuilder:
                     "policy_choice" if option.rank == 1 else "ranked_alternative",
                 ),
             )
-            candidates.append((option, node, terminal))
+            candidates.append((option, node))
         gold_entry = next(
             (item for item in candidates if item[0].relation == join.relation), None
         )
@@ -502,7 +527,7 @@ class DemonstrationBuilder:
         best_alternative_score = max(
             (
                 option.score
-                for option, _, _ in candidates
+                for option, _ in candidates
                 if option.relation != join.relation
             ),
             default=None,
@@ -525,14 +550,20 @@ class DemonstrationBuilder:
             # linear JOIN. This keeps every action replayable by the runtime.
             if not _is_immediate_linear_terminal(plan, join, next_join):
                 return None
-            wrong_entries = [
-                item
-                for item in candidates
-                if item[0].relation != join.relation
-                and item[0].rank < gold_option.rank
-                and item[1].denotation
-                and item[2] == ()
-            ]
+            wrong_entries = []
+            for option, node in candidates:
+                if (
+                    option.relation == join.relation
+                    or option.rank >= gold_option.rank
+                    or not node.denotation
+                ):
+                    continue
+                full_program = list(plan.executable_functions)
+                full_program[join.index] = replace_join_relation(
+                    join.raw, option.relation
+                )
+                if self._execute(full_program, plan.target_expression) == ():
+                    wrong_entries.append((option, node))
             if not wrong_entries:
                 return self._build_direct_progress_demo(
                     question_id,
@@ -665,7 +696,7 @@ class DemonstrationBuilder:
             self.stats["recovery_built"] += 1
 
         return HyperDemonstration(
-            demo_id=f"{question_id}:join:{join.index}:{_digest(tuple(option.relation for option, _, _ in candidates))}",
+            demo_id=f"{question_id}:join:{join.index}:{_digest(tuple(option.relation for option, _ in candidates))}",
             question_id=question_id,
             question=question,
             family=family,
@@ -680,7 +711,7 @@ class DemonstrationBuilder:
                     gold_option.score - best_alternative_score
                     if best_alternative_score is not None else None
                 ),
-                "proposal_relations": [option.relation for option, _, _ in candidates],
+                "proposal_relations": [option.relation for option, _ in candidates],
                 "proposal_recall_at_frontier": True,
                 "retrieval_intent_source": "question",
                 "probe_relation": probe_relation,
@@ -695,7 +726,7 @@ class DemonstrationBuilder:
         join: ProgramStatement,
         next_join: ProgramStatement,
         candidates: Sequence[
-            Tuple[RelationOption, ExecutedHypothesis, Optional[Tuple[str, ...]]]
+            Tuple[RelationOption, ExecutedHypothesis]
         ],
         gold_answers: Tuple[str, ...],
         gold_option: RelationOption,
@@ -736,7 +767,7 @@ class DemonstrationBuilder:
         return HyperDemonstration(
             demo_id=(
                 f"{question_id}:join:{join.index}:"
-                f"{_digest(tuple(option.relation for option, _, _ in candidates))}:direct"
+                f"{_digest(tuple(option.relation for option, _ in candidates))}:direct"
             ),
             question_id=question_id,
             question=question,
@@ -780,7 +811,7 @@ class DemonstrationBuilder:
                     if best_alternative_score is not None else None
                 ),
                 "proposal_relations": [
-                    option.relation for option, _, _ in candidates
+                    option.relation for option, _ in candidates
                 ],
                 "proposal_recall_at_frontier": True,
                 "retrieval_intent_source": "question",
@@ -845,66 +876,123 @@ class DemonstrationBuilder:
         combine: ProgramStatement,
         gold_answers: Tuple[str, ...],
     ) -> Optional[HyperDemonstration]:
-        self.stats["conjunction_decisions"] += 1
-        left_target, right_target = combine.sources
-        definitions = {statement.target: statement for statement in plan.statements}
-        left_join = definitions.get(left_target)
-        right_join = definitions.get(right_target)
-        if (
-            left_join is None
-            or right_join is None
-            or left_join.kind != "join"
-            or right_join.kind != "join"
-            or left_join.sources != right_join.sources
-            or not left_join.sources
-        ):
+        branches = self._immediate_intersection_branches(plan, combine)
+        if len(branches) != 2:
             return None
-        shared_source = left_join.sources[0]
-        base_state = self._dependency_state(plan, shared_source)
-        action_source = _action_source(base_state, left_join.raw)
+        left_join, right_join = branches
+        left_source = left_join.sources[0]
+        right_source = right_join.sources[0]
+        left_state = self._dependency_state(plan, left_source, before=left_join.index)
+        right_state = self._dependency_state(plan, right_source, before=right_join.index)
+        # The SFT trajectory must start from public candidate entities rather
+        # than from a hidden multi-hop gold prefix.
+        if any("JOIN(" in raw for raw in (*left_state, *right_state)):
+            self.stats["conjunction_hidden_prefix"] += 1
+            return None
+        left_action_source = _action_source(left_state, left_join.raw)
+        right_action_source = _action_source(right_state, right_join.raw)
+        same_frontier = left_state == right_state and left_action_source == right_action_source
+        if same_frontier and left_join.relation == right_join.relation:
+            return None
+
+        self.stats["conjunction_decisions"] += 1
         query = question.strip()
-        options = list(self.candidate_provider(query, base_state, left_join))[
-            : self.frontier_width
-        ]
-        required_relations = {left_join.relation, right_join.relation}
-        if not required_relations.issubset({option.relation for option in options}):
-            self.stats["conjunction_proposal_miss"] += 1
+        hypotheses: Dict[str, ExecutedHypothesis] = {}
+        frontiers = []
+        if same_frontier:
+            options = list(self.candidate_provider(query, left_state, left_join))[
+                : self.frontier_width
+            ]
+            relation_set = {option.relation for option in options}
+            if not {left_join.relation, right_join.relation}.issubset(relation_set):
+                self.stats["conjunction_proposal_miss"] += 1
+                return None
+            relation_nodes = {}
+            created = []
+            for option in options:
+                statement = replace_join_relation(left_join.raw, option.relation)
+                state = left_state + [statement]
+                values = self._execute(state, left_join.target)
+                if values is None:
+                    continue
+                node = ExecutedHypothesis(
+                    f"H{len(hypotheses)}",
+                    tuple(state),
+                    left_join.target,
+                    values,
+                    relation=option.relation,
+                    role=(
+                        "required_branch"
+                        if option.relation in {left_join.relation, right_join.relation}
+                        else "alternative"
+                    ),
+                    provenance=(
+                        "policy_choice" if option.rank == 1 else "ranked_alternative",
+                    ),
+                )
+                hypotheses[node.hypothesis_id] = node
+                relation_nodes[option.relation] = node
+                created.append(node.hypothesis_id)
+            left = relation_nodes.get(left_join.relation)
+            right = relation_nodes.get(right_join.relation)
+            ranks = {
+                "left": next(option.rank for option in options if option.relation == left_join.relation),
+                "right": next(option.rank for option in options if option.relation == right_join.relation),
+            }
+            frontiers.append((left_action_source, tuple(created)))
+        else:
+            required_nodes = []
+            ranks = {}
+            for label, state_before, action_source, join in (
+                ("left", left_state, left_action_source, left_join),
+                ("right", right_state, right_action_source, right_join),
+            ):
+                options = list(self.candidate_provider(query, state_before, join))[
+                    : self.frontier_width
+                ]
+                required = next(
+                    (option for option in options if option.relation == join.relation), None
+                )
+                if required is None:
+                    self.stats["conjunction_proposal_miss"] += 1
+                    return None
+                ranks[label] = required.rank
+                created = []
+                required_node = None
+                for option in options:
+                    statement = replace_join_relation(join.raw, option.relation)
+                    state = state_before + [statement]
+                    values = self._execute(state, join.target)
+                    if values is None:
+                        continue
+                    node = ExecutedHypothesis(
+                        f"H{len(hypotheses)}",
+                        tuple(state),
+                        join.target,
+                        values,
+                        relation=option.relation,
+                        role=(
+                            "required_branch"
+                            if option.relation == join.relation else "alternative"
+                        ),
+                        provenance=(
+                            "policy_choice" if option.rank == 1 else "ranked_alternative",
+                        ),
+                    )
+                    hypotheses[node.hypothesis_id] = node
+                    created.append(node.hypothesis_id)
+                    if option.relation == join.relation:
+                        required_node = node
+                if required_node is None:
+                    return None
+                required_nodes.append(required_node)
+                frontiers.append((action_source, tuple(created)))
+            left, right = required_nodes
+
+        if left is None or right is None:
             return None
         self.stats["conjunction_proposal_hit"] += 1
-        ranks = {
-            option.relation: option.rank
-            for option in options
-            if option.relation in required_relations
-        }
         self.stats[f"conjunction_worst_required_rank_{max(ranks.values())}"] += 1
-
-        hypotheses: Dict[str, ExecutedHypothesis] = {}
-        relation_nodes: Dict[str, ExecutedHypothesis] = {}
-        for option in options:
-            statement = replace_join_relation(left_join.raw, option.relation)
-            state = base_state + [statement]
-            values = self._execute(state, left_join.target)
-            if values is None:
-                continue
-            node = ExecutedHypothesis(
-                f"H{len(hypotheses)}", tuple(state), left_join.target, values,
-                relation=option.relation,
-                role=(
-                    "required_branch"
-                    if option.relation in required_relations
-                    else "alternative"
-                ),
-                provenance=(
-                    "policy_choice" if option.rank == 1 else "ranked_alternative",
-                ),
-            )
-            hypotheses[node.hypothesis_id] = node
-            relation_nodes[option.relation] = node
-        if not required_relations.issubset(relation_nodes):
-            return None
-
-        left = relation_nodes[left_join.relation]
-        right = relation_nodes[right_join.relation]
         combined_state, combined_target = combine_function_states(
             left.function_state, left.target_expression,
             right.function_state, right.target_expression,
@@ -912,8 +1000,12 @@ class DemonstrationBuilder:
         combined_values = self._execute(combined_state, combined_target)
         if combined_values is None:
             return None
+        reference_state = self._dependency_state(
+            plan, combine.target, before=combine.index + 1
+        )
+        reference_values = self._execute(reference_state, combine.target)
         if (
-            combine.target != plan.target_expression
+            reference_values != gold_answers
             or combined_values != gold_answers
             or combined_values != normalize_values(set(left.denotation) & set(right.denotation))
             or combined_values in {left.denotation, right.denotation}
@@ -927,14 +1019,23 @@ class DemonstrationBuilder:
             provenance=(f"combined_with:{right.hypothesis_id}",),
         )
         hypotheses[combined.hypothesis_id] = combined
-        created = tuple(node_id for node_id in hypotheses if node_id != combined.hypothesis_id)
-        steps = [
-            DemonstrationStep(
-                "Find_relation", (action_source,), (), created,
-                ("open_shared_conjunction_frontier",),
+        steps = []
+        active = []
+        for index, (action_source, created) in enumerate(frontiers):
+            steps.append(
+                DemonstrationStep(
+                    "Find_relation",
+                    (action_source,),
+                    tuple(active),
+                    created,
+                    (
+                        "open_shared_conjunction_frontier"
+                        if len(frontiers) == 1
+                        else f"open_conjunction_branch_{index + 1}"
+                    ,),
+                )
             )
-        ]
-        active = list(created)
+            active.extend(created)
         steps.extend(
             [
                 DemonstrationStep(
@@ -967,12 +1068,40 @@ class DemonstrationBuilder:
                 "decision_index": combine.index,
                 "retrieval_intent_source": "question",
                 "required_relation_ranks": {
-                    option.relation: option.rank
-                    for option in options
-                    if option.relation in required_relations
+                    "left": ranks["left"],
+                    "right": ranks["right"],
                 },
+                "conjunction_roots": len(frontiers),
             },
         )
+
+    def _definition_before(
+        self, plan: GoldPlan, target: str, before: int
+    ) -> Optional[ProgramStatement]:
+        return next(
+            (
+                statement
+                for statement in reversed(plan.statements)
+                if statement.index < before
+                and statement.target == target
+                and statement.kind != "stop"
+            ),
+            None,
+        )
+
+    def _immediate_intersection_branches(
+        self, plan: GoldPlan, combine: ProgramStatement
+    ) -> Tuple[ProgramStatement, ...]:
+        branches = tuple(
+            self._definition_before(plan, source, combine.index)
+            for source in combine.sources
+        )
+        if len(branches) != 2 or any(
+            branch is None or branch.kind != "join" or not branch.sources
+            for branch in branches
+        ):
+            return ()
+        return branches
 
     @staticmethod
     def _row_candidate_entities(
@@ -1005,40 +1134,57 @@ class DemonstrationBuilder:
                     return str(message.get("content", ""))
         return ""
 
-    def _dependency_state(self, plan: GoldPlan, target: str) -> List[str]:
-        definitions = {statement.target: statement for statement in plan.statements}
+    def _dependency_state(
+        self, plan: GoldPlan, target: str, before: Optional[int] = None
+    ) -> List[str]:
         ordered: List[ProgramStatement] = []
         seen = set()
 
-        def visit(expression: str) -> None:
-            if expression in seen:
-                return
-            statement = definitions.get(expression)
-            if statement is None or statement.kind == "stop":
+        def visit(expression: str, limit: int) -> None:
+            statement = self._definition_before(plan, expression, limit)
+            if statement is None or statement.index in seen:
                 return
             for source in statement.sources:
-                visit(source)
-            seen.add(expression)
+                visit(source, statement.index)
+            seen.add(statement.index)
             ordered.append(statement)
 
-        visit(target)
+        visit(target, len(plan.statements) + 1 if before is None else before)
         return [statement.raw for statement in ordered]
 
 class DemonstrationValidator:
     """Replay private executable states and verify graph-action consistency."""
 
-    def __init__(self, executor: ProgramExecutor, max_active: int = 6):
+    def __init__(
+        self,
+        executor: ProgramExecutor,
+        max_active: int = 6,
+        execution_cache: Optional[
+            Dict[Tuple[Tuple[str, ...], str], Optional[Tuple[str, ...]]]
+        ] = None,
+    ):
         self.executor = executor
         self.max_active = int(max_active)
+        self.execution_cache = execution_cache if execution_cache is not None else {}
+
+    def _replay(
+        self, functions: Sequence[str], target: str
+    ) -> Optional[Tuple[str, ...]]:
+        key = (tuple(str(item) for item in functions), str(target))
+        if key in self.execution_cache:
+            return self.execution_cache[key]
+        try:
+            result = normalize_values(self.executor(functions, target))
+        except ProgramExecutionError:
+            result = None
+        self.execution_cache[key] = result
+        return result
 
     def validate(self, demo: HyperDemonstration) -> List[str]:
         errors: List[str] = []
         for node in demo.hypotheses.values():
-            try:
-                replayed = normalize_values(
-                    self.executor(node.function_state, node.target_expression)
-                )
-            except ProgramExecutionError:
+            replayed = self._replay(node.function_state, node.target_expression)
+            if replayed is None:
                 errors.append(f"{node.hypothesis_id}: replay execution failed")
                 continue
             if replayed != node.denotation:
@@ -1090,7 +1236,17 @@ class DemonstrationValidator:
                     errors.append(
                         "Find_relation must expose only its source; relation ranking is environment-owned"
                     )
-                if active and selected is None:
+                candidate_sources = {
+                    str(entity[-1])
+                    for entity in demo.private_metadata.get("candidate_entities", ())
+                    if entity
+                }
+                opens_new_root = (
+                    bool(active)
+                    and selected is None
+                    and step.arguments[0] in candidate_sources
+                )
+                if active and selected is None and not opens_new_root:
                     errors.append("Find_relation requires a selected active hypothesis")
                 if selected is not None:
                     if selected not in active:

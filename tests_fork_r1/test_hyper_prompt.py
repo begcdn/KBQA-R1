@@ -8,6 +8,7 @@ def test_augment_rl_prompt_once():
     content = second["prompt"][0]["content"]
     assert content.count("HyPER-R1 executable hypothesis graph:") == 1
     assert "Commit [ Hn ]" in content
+    assert "second root" in content
 
 
 def test_augment_sft_messages_without_mutating_source():
