@@ -74,6 +74,27 @@ def test_compile_rejects_unsupported_operator():
         raise AssertionError("COUNT should not silently enter the first corpus")
 
 
+def test_compile_accepts_unnumbered_grailqa_expression_variable():
+    plan = compile_gold_plan(
+        [
+            "expression = START('m.0hqs1x_')",
+            "expression = JOIN('medicine.routed_drug.marketed_formulations', expression)",
+            "expression1 = START('medicine.routed_drug')",
+            "expression = AND(expression1, expression)",
+            "expression = STOP(expression)",
+        ]
+    )
+
+    assert plan.target_expression == "expression"
+    assert [statement.kind for statement in plan.statements] == [
+        "start",
+        "join",
+        "start",
+        "and",
+        "stop",
+    ]
+
+
 def test_compile_requires_stop_to_be_terminal():
     functions = [
         "expression1 = START('m.topic')",

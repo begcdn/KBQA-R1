@@ -18,11 +18,12 @@ from .hyper_prompt import build_hyper_prompt
 from .hyper_r1 import combine_function_states, serialize_frontier
 
 
-_ASSIGNMENT = re.compile(r"^\s*(expression\d+)\s*=\s*(.+?)\s*$")
+_EXPRESSION = r"expression\d*"
+_ASSIGNMENT = re.compile(rf"^\s*({_EXPRESSION})\s*=\s*(.+?)\s*$")
 _START = re.compile(r"^START\('(.+)'\)$")
-_JOIN = re.compile(r"^JOIN\('(.+)'\s*,\s*(expression\d+|'[^']+')\)$")
-_AND = re.compile(r"^AND\((expression\d+)\s*,\s*(expression\d+)\)$")
-_STOP = re.compile(r"^STOP\((expression\d+)\)$")
+_JOIN = re.compile(rf"^JOIN\('(.+)'\s*,\s*({_EXPRESSION}|'[^']+')\)$")
+_AND = re.compile(rf"^AND\(({_EXPRESSION})\s*,\s*({_EXPRESSION})\)$")
+_STOP = re.compile(rf"^STOP\(({_EXPRESSION})\)$")
 
 
 def normalize_values(values: Iterable[Any]) -> Tuple[str, ...]:
