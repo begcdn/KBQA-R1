@@ -7,7 +7,6 @@ from kbqa_r1.hyper_data import (
     ProgramExecutionError,
     RelationOption,
     compile_gold_plan,
-    relation_hint,
     step_sft_records,
     trajectory_sft_record,
 )
@@ -41,7 +40,7 @@ def fake_executor(functions, target):
 
 
 def candidates(query, state, join):
-    if "left and right" in query:
+    if join.relation == "r.left":
         return [
             RelationOption("r.left", 0.93, 1),
             RelationOption("r.unrelated", 0.88, 2),
@@ -100,7 +99,8 @@ def test_builds_replayable_delayed_frontier_recovery():
         ],
         "answer": ["m.answer"],
     }
-    demo = DemonstrationBuilder(fake_executor, candidates).build(row)[0]
+    builder = DemonstrationBuilder(fake_executor, candidates)
+    demo = builder.build(row)[0]
     assert demo.family == "delayed_frontier_recovery"
     actions = [step.action for step in demo.steps]
     assert actions[:3] == ["Find_relation", "Select", "Find_relation"]
@@ -109,6 +109,11 @@ def test_builds_replayable_delayed_frontier_recovery():
     assert demo.private_metadata["proposal_relations"] == [
         "r.alt1", "r.gold1", "r.other1"
     ]
+    assert all(
+        len(step.arguments) == 1
+        for step in demo.steps
+        if step.action == "Find_relation"
+    )
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
 
     public = step_sft_records(demo)
@@ -140,6 +145,8 @@ def test_builds_replayable_delayed_frontier_recovery():
         "Find_relation", "Select", "Find_relation", "Commit"
     ]
     assert DemonstrationValidator(fake_executor, max_active=6).validate(direct) == []
+    assert builder.stats["recovery_probe_proposal_hit"] == 1
+    assert builder.stats["continuation_proposal_hit"] == 1
 
 
 def test_one_hop_frontier_commits_without_ceremonial_select():
@@ -156,6 +163,64 @@ def test_one_hop_frontier_commits_without_ceremonial_select():
     assert demo.family == "frontier_commit"
     assert [step.action for step in demo.steps] == ["Find_relation", "Commit"]
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+
+
+def test_recovery_is_not_manufactured_when_gold_is_already_top1():
+    row = {
+        "ID": "gold-first",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def gold_first(query, state, join):
+        if join.relation == "r.gold1":
+            return [
+                RelationOption("r.gold1", 0.95, 1),
+                RelationOption("r.alt1", 0.90, 2),
+            ]
+        return [
+            RelationOption("r.gold2", 0.95, 1),
+            RelationOption("r.alt2", 0.90, 2),
+        ]
+
+    demos = DemonstrationBuilder(fake_executor, gold_first).build(row)
+    assert [demo.family for demo in demos] == ["direct_frontier_progress"]
+    assert [step.action for step in demos[0].steps] == [
+        "Find_relation", "Select", "Find_relation", "Commit"
+    ]
+    assert all(step.action != "Prune" for step in demos[0].steps)
+    assert DemonstrationValidator(fake_executor, max_active=6).validate(demos[0]) == []
+
+
+def test_recovery_is_not_manufactured_from_a_nonempty_wrong_terminal_answer():
+    row = {
+        "ID": "wrong-answer",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def nonempty_wrong_executor(functions, target):
+        text = "\n".join(functions)
+        if "r.gold2" in text:
+            return ["m.answer"] if "r.gold1" in text else ["m.wrong"]
+        return fake_executor(functions, target)
+
+    demos = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)
+    assert [demo.family for demo in demos] == ["direct_frontier_progress"]
+    assert all(step.action != "Prune" for step in demos[0].steps)
+    assert DemonstrationValidator(
+        nonempty_wrong_executor, max_active=6
+    ).validate(demos[0]) == []
 
 
 def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget():
@@ -190,6 +255,43 @@ def test_gold_is_never_injected_when_proposal_frontier_misses_it():
         return [RelationOption("r.alt1", 0.9, 1), RelationOption("r.other1", 0.8, 2)]
 
     assert DemonstrationBuilder(fake_executor, misses_gold).build(row) == []
+
+
+def test_candidate_queries_use_only_question_visible_intent():
+    row = {
+        "ID": "no-hint",
+        "question": "Who is connected to the topic?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.secret_gold_relation', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+    seen = []
+
+    def provider(query, state, join):
+        seen.append(query)
+        return [
+            RelationOption("r.secret_gold_relation", 0.9, 1),
+            RelationOption("r.alt1", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(fake_executor, provider).build(row)[0]
+    assert seen == [row["question"]]
+    assert demo.steps[0].arguments == ("m.topic",)
+    assert "secret gold relation" not in str(trajectory_sft_record(demo))
+
+    leaked = replace(
+        demo,
+        steps=[
+            replace(demo.steps[0], arguments=("m.topic", "secret gold relation")),
+            *demo.steps[1:],
+        ],
+    )
+    assert any(
+        "environment-owned" in error
+        for error in DemonstrationValidator(fake_executor).validate(leaked)
+    )
 
 
 def test_failed_candidate_is_not_misrepresented_as_empty_evidence():
@@ -262,11 +364,10 @@ def test_conjunction_requires_both_branches():
     )
 
 
-def test_reverse_relation_hint_and_rewrite_are_preserved():
+def test_reverse_relation_rewrite_is_preserved():
     from kbqa_r1.hyper_data import replace_join_relation
 
     raw = "expression1 = JOIN('(R people.person.parents)', expression1)"
-    assert relation_hint("(R people.person.children)") == "reverse children"
     assert replace_join_relation(raw, "(R people.person.children)") == (
         "expression1 = JOIN('(R people.person.children)', expression1)"
     )

@@ -51,8 +51,8 @@ class ActionParser:
             #     "description": "Extract topic entity from question"
             # },
             ActionType.FIND_RELATION: {
-                "pattern": r"(?:Action(\d+):\s*|^)Find_relation\s*\[\s*([^|]+)\s*\|\s*([^\]]+)\s*\]",
-                "description": "Find entities connected to the given entity through the specified relation"
+                "pattern": r"(?:Action(\d+):\s*|^)Find_relation\s*\[\s*([^|\]]+?)(?:\s*\|\s*([^\]]+))?\s*\]",
+                "description": "Open a ranked relation frontier from the given source"
             },
             ActionType.MERGE: {
                 "pattern": r"(?:Action(\d+):\s*|^)Merge\s*\[\s*([^|]+)\s*\|\s*([^\]]+)\s*\]",
@@ -131,10 +131,15 @@ class ActionParser:
                         arg2 = match.group(3).strip()  # relation
                         arg3 = match.group(4).strip()  # number
                         arguments = [arg1, arg2, arg3]
+                    elif action_type == ActionType.FIND_RELATION:
+                        arg1 = match.group(2).strip()
+                        arg2 = match.group(3)
+                        arguments = [arg1]
+                        if arg2 is not None:
+                            arguments.append(arg2.strip())
                     elif action_type in [
                         ActionType.MERGE,
                         ActionType.TIME_CONSTRAINT,
-                        ActionType.FIND_RELATION,
                         ActionType.COMBINE_HYPOTHESES,
                     ]:
                         # Two-argument actions
@@ -260,4 +265,3 @@ class ActionParser:
         else:
             args_str = action.arguments[0] if action.arguments else ""
         return f"Action{action.step_number}: {action.action_type.value} [ {args_str} ]"
-

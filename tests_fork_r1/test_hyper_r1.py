@@ -1,5 +1,6 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from kbqa_r1.hyper_r1 import (
     HypothesisEdgeKind,
@@ -10,7 +11,21 @@ from kbqa_r1.hyper_r1 import (
     charge_execution_budget,
     enforce_commit_reward,
     graph_action_token_mask,
+    required_hyper_relation_model,
 )
+
+
+def test_hyper_runtime_requires_explicit_relation_ranker():
+    with pytest.raises(ValueError, match="requires hyper_r1_relation_model"):
+        required_hyper_relation_model(
+            SimpleNamespace(hyper_r1_enable=True, hyper_r1_relation_model=None)
+        )
+    assert required_hyper_relation_model(
+        SimpleNamespace(hyper_r1_enable=True, hyper_r1_relation_model="/models/simcse")
+    ) == "/models/simcse"
+    assert required_hyper_relation_model(
+        SimpleNamespace(hyper_r1_enable=False, hyper_r1_relation_model=None)
+    ) is None
 
 
 def add(graph, relation, answers, parent=None, score=0.5, group=None):
@@ -112,6 +127,23 @@ def test_executable_continuation_requires_select_and_full_frontier_capacity():
     )
 
 
+def test_relation_source_is_bound_to_candidates_and_selected_state():
+    graph = HypothesisGraph(max_active=4, max_nodes=8)
+    assert graph.relation_source_error(0, "m.topic", ["m.topic"]) is None
+    assert "supplied candidate" in graph.relation_source_error(
+        0, "m.invented", ["m.topic"]
+    )
+
+    selected = add(graph, "r.first", ["m.first"])
+    graph.select(0, selected.node_id)
+    assert graph.relation_source_error(
+        0, selected.target_expression, ["m.topic"]
+    ) is None
+    assert "selected hypothesis target" in graph.relation_source_error(
+        0, "expression999", ["m.topic"]
+    )
+
+
 def test_non_frontier_execution_cannot_escape_exhausted_node_budget():
     graph = HypothesisGraph(max_active=2, max_nodes=2)
     first = add(graph, "r.first", ["m.first"])
@@ -168,7 +200,7 @@ def test_serialization_exposes_compact_executable_state():
     assert node.node_id in text
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
-    assert "Actions: Select, Find_relation, Combine, Prune, or Commit" in text
+    assert "Actions: Select, Find_relation [ source ], Combine, Prune, or Commit" in text
 
 
 def test_expanding_parent_frees_one_frontier_slot_but_keeps_history():

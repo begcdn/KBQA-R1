@@ -404,6 +404,9 @@ hyper_r1:
   # Natural ranked relations executed for each exploration decision.
   frontier_width: 3
 
+  # Explicit ranker shared by demonstration building and runtime retrieval.
+  relation_model: null
+
   # Hard cap on exact executions per question.
   max_nodes: 24
 

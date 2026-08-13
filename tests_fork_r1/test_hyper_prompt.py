@@ -1,4 +1,4 @@
-from kbqa_r1.hyper_prompt import augment_dataset_row
+from kbqa_r1.hyper_prompt import augment_dataset_row, extract_hyper_question
 
 
 def test_augment_rl_prompt_once():
@@ -15,3 +15,11 @@ def test_augment_sft_messages_without_mutating_source():
     result = augment_dataset_row(row)
     assert "HyPER-R1" not in row["messages"][0]["content"]
     assert "HyPER-R1" in result["messages"][0]["content"]
+
+
+def test_extracts_immutable_question_before_protocol_instructions():
+    content = augment_dataset_row(
+        {"prompt": [{"role": "user", "content": "Context\nQuestion: Who founded Apple?"}]}
+    )["prompt"][0]["content"]
+    assert extract_hyper_question(content) == "Who founded Apple?"
+    assert "Find_relation [ source ]" in content

@@ -30,9 +30,12 @@ class SExprActionProcessor:
         "common.topic.notable_for",
     }
     
-    def __init__(self, relation_retrieval, state_manager):
+    def __init__(self, relation_retrieval, state_manager, hyper_frontier_width=None):
         self.relation_retrieval = relation_retrieval
         self.state_manager = state_manager
+        self.hyper_frontier_width = (
+            int(hyper_frontier_width) if hyper_frontier_width is not None else None
+        )
 
         dataset_attr = getattr(self.relation_retrieval, 'dataset', None)
         if hasattr(dataset_attr, 'value'):
@@ -1380,11 +1383,26 @@ class SExprActionProcessor:
             if entity_type in ['literal', 'int', 'name']:
                 source_hint = 'name'
 
-            selected_relations = self.relation_retrieval.select_best_relations(
-                relation_description,
-                candidate_relations,
-                source=source_hint,
-            )
+            if self.hyper_frontier_width is not None:
+                # This is the exact frontier builder used by offline HyPER data.
+                selected_relations = self.relation_retrieval.rank_relations_no_threshold(
+                    relation_description,
+                    candidate_relations,
+                    topk=max(20, self.hyper_frontier_width),
+                )
+                self.relation_retrieval.last_similarity_scores = [
+                    float(candidate.score) for candidate in selected_relations
+                ]
+                candidate_relations = [
+                    (candidate.relation_name, candidate.relation_id)
+                    for candidate in selected_relations
+                ]
+            else:
+                selected_relations = self.relation_retrieval.select_best_relations(
+                    relation_description,
+                    candidate_relations,
+                    source=source_hint,
+                )
             
             # Reuse similarity scores from select_best_relations to get top-6 for UI
             try:

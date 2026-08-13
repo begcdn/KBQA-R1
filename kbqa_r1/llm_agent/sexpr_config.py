@@ -33,6 +33,7 @@ class SExprGenerationConfig:
     hyper_r1_max_active: int = 6
     hyper_r1_max_nodes: int = 24
     hyper_r1_frontier_width: int = 3
+    hyper_r1_relation_model: Optional[str] = None
     
     # GPU utilization management
     gpu_utilization_config: Optional[GPUUtilizationConfig] = None  # GPU utilization manager configuration

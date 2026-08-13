@@ -164,7 +164,7 @@ def serialize_frontier(
             f"path={path} answers={len(denotation)}: {answers}"
         )
     lines.append(
-        "Actions: Select, Find_relation, Combine, Prune, or Commit. "
+        "Actions: Select, Find_relation [ source ], Combine, Prune, or Commit. "
         "Prune only when visible path or execution evidence contradicts the question."
     )
     lines.append("</hypothesis_graph>")
@@ -414,6 +414,26 @@ class HypothesisGraph:
                 )
         elif not self.has_capacity(sample_id):
             return "The executed-node budget is exhausted; Commit an active hypothesis."
+        return None
+
+    def relation_source_error(
+        self,
+        sample_id: int,
+        source: str,
+        candidate_sources: Sequence[str],
+    ) -> Optional[str]:
+        """Require relation retrieval to continue from a public valid source."""
+        graph = self.state(sample_id)
+        if graph.selected_id is not None:
+            selected = self.require_active(sample_id, graph.selected_id)
+            if str(source) != selected.target_expression:
+                return (
+                    f"Find_relation source must be the selected hypothesis target "
+                    f"{selected.target_expression}."
+                )
+            return None
+        if not graph.nodes and str(source) not in {str(value) for value in candidate_sources}:
+            return "The initial Find_relation source must be a supplied candidate entity."
         return None
 
     def mark_expanded(self, sample_id: int, node_id: Optional[str]) -> None:
@@ -704,3 +724,16 @@ def charge_execution_budget(
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows, lengths] -= penalties
     return result
+
+
+def required_hyper_relation_model(config: Any) -> Optional[str]:
+    """Return HyPER's explicit ranker path or fail before a rollout starts."""
+    if not bool(getattr(config, "hyper_r1_enable", False)):
+        return None
+    path = getattr(config, "hyper_r1_relation_model", None)
+    if not path:
+        raise ValueError(
+            "HyPER-R1 requires hyper_r1_relation_model; "
+            "silent relation-ranker fallback is disabled"
+        )
+    return str(path)

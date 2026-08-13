@@ -53,6 +53,8 @@ def _flatten_results(results: Iterable[Any]) -> List[str]:
 
 def _balanced_take(demos, limit: int):
     """Round-robin families, then use every remaining verified example."""
+    if limit <= 0:
+        limit = len(demos)
     families = {}
     for demo in demos:
         families.setdefault(demo.family, []).append(demo)
@@ -116,8 +118,14 @@ def main() -> None:
         required=True,
         help="Explicit SimCSE checkpoint used to rank frontier relations",
     )
-    parser.add_argument("--max-demonstrations", type=int, default=3000)
-    parser.add_argument("--max-input-rows", type=int, default=20000)
+    parser.add_argument(
+        "--max-demonstrations", type=int, default=0,
+        help="Maximum saved trajectories; 0 uses every verified trajectory",
+    )
+    parser.add_argument(
+        "--max-input-rows", type=int, default=0,
+        help="Maximum input questions; 0 processes the complete training split",
+    )
     parser.add_argument("--relation-topk", type=int, default=20)
     parser.add_argument("--frontier-width", type=int, default=3)
     parser.add_argument("--max-active", type=int, default=6)
@@ -156,9 +164,13 @@ def main() -> None:
 
     qualified = []
     skipped = Counter()
+    rows_by_hop = Counter()
+    accepted_rows_by_hop = Counter()
     for row_number, row in enumerate(_read_rows(Path(args.input)), 1):
-        if row_number > args.max_input_rows:
+        if args.max_input_rows > 0 and row_number > args.max_input_rows:
             break
+        hop_count = sum("JOIN(" in str(item) for item in row.get("function_list", ()))
+        rows_by_hop[str(hop_count)] += 1
         try:
             candidates = builder.build(row)
         except IneligibleProgram as exc:
@@ -170,18 +182,39 @@ def main() -> None:
         if not candidates:
             skipped["no_qualified_demonstration"] += 1
             continue
+        accepted_this_row = False
         for demo in candidates:
             errors = validator.validate(demo)
             if errors:
-                skipped["replay_validation_failed"] += 1
-                continue
+                raise RuntimeError(
+                    f"replay validation failed for {demo.demo_id}: "
+                    + "; ".join(errors)
+                )
             qualified.append(demo)
+            accepted_this_row = True
+        if accepted_this_row:
+            accepted_rows_by_hop[str(hop_count)] += 1
         if row_number % 100 == 0:
             print(f"processed={row_number} qualified={len(qualified)}")
 
     if not qualified:
         raise RuntimeError("no demonstrations passed construction and replay validation")
     demonstrations = _balanced_take(qualified, args.max_demonstrations)
+    unique_demonstrations = []
+    seen_trajectories = set()
+    duplicates_removed = 0
+    for demo in demonstrations:
+        serialized = json.dumps(
+            trajectory_sft_record(demo)["messages"],
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        if serialized in seen_trajectories:
+            duplicates_removed += 1
+            continue
+        seen_trajectories.add(serialized)
+        unique_demonstrations.append(demo)
+    demonstrations = unique_demonstrations
 
     with (output / "demonstrations.jsonl").open("w", encoding="utf-8") as handle:
         for demo in demonstrations:
@@ -223,7 +256,44 @@ def main() -> None:
                 source_types["literal_or_name"] += 1
     proposal_stats = dict(sorted(builder.stats.items()))
     relation_total = proposal_stats.get("relation_decisions", 0)
+    continuation_total = proposal_stats.get("continuation_decisions", 0)
+    recovery_probe_total = proposal_stats.get("recovery_probe_decisions", 0)
     conjunction_total = proposal_stats.get("conjunction_decisions", 0)
+    relation_recall = (
+        proposal_stats.get("proposal_hit", 0) / relation_total
+        if relation_total else None
+    )
+    relation_top1 = (
+        proposal_stats.get("proposal_top1_hit", 0) / relation_total
+        if relation_total else None
+    )
+    margins = [
+        float(demo.private_metadata["gold_vs_best_alternative_margin"])
+        for demo in demonstrations
+        if demo.private_metadata.get("gold_vs_best_alternative_margin") is not None
+    ]
+    hypothesis_nodes = [node for demo in demonstrations for node in demo.hypotheses.values()]
+    serialized_trajectories = [
+        json.dumps(row["messages"], sort_keys=True, ensure_ascii=True)
+        for row in trajectory_rows
+    ]
+    duplicate_rate = (
+        1 - len(set(serialized_trajectories)) / len(serialized_trajectories)
+        if serialized_trajectories else None
+    )
+    quality_checks = {
+        "all_saved_trajectories_replay": True,
+        "contains_direct_progress": bool(
+            families.get("frontier_commit", 0)
+            or families.get("direct_frontier_progress", 0)
+        ),
+        "contains_real_recovery": families.get("delayed_frontier_recovery", 0) > 0,
+        "contains_required_conjunction": families.get("conjunction", 0) > 0,
+        "natural_frontier_has_non_top1_gold": any(
+            int(rank) > 1 and count > 0 for rank, count in gold_ranks.items()
+        ),
+        "no_exact_duplicate_trajectories": duplicate_rate == 0.0,
+    }
     report = {
         "input": args.input,
         "relation_model": args.relation_model,
@@ -245,25 +315,79 @@ def main() -> None:
         "proposal_statistics": proposal_stats,
         "proposal_recall": {
             "measurement": (
-                "teacher-forced semantic relation hints; measures whether the normal "
-                "retriever contains the gold action, not inference-time relation recall"
+                "question-derived intent with the runtime relation ranker; gold is used "
+                "only to measure whether the natural frontier contains the required action"
             ),
             "relation_at_frontier": (
-                proposal_stats.get("proposal_hit", 0) / relation_total
-                if relation_total else None
+                relation_recall
+            ),
+            "relation_top1": relation_top1,
+            "topk_opportunity_over_top1": (
+                relation_recall - relation_top1
+                if relation_recall is not None and relation_top1 is not None else None
             ),
             "both_conjuncts_at_frontier": (
                 proposal_stats.get("conjunction_proposal_hit", 0) / conjunction_total
                 if conjunction_total else None
             ),
+            "continuation_at_frontier": (
+                proposal_stats.get("continuation_proposal_hit", 0)
+                / continuation_total
+                if continuation_total else None
+            ),
+            "continuation_top1": (
+                proposal_stats.get("continuation_top1_hit", 0)
+                / continuation_total
+                if continuation_total else None
+            ),
+            "recovery_probe_at_frontier": (
+                proposal_stats.get("recovery_probe_proposal_hit", 0)
+                / recovery_probe_total
+                if recovery_probe_total else None
+            ),
         },
+        "acceptance_by_hop_count": {
+            hop: {
+                "rows": count,
+                "accepted_rows": accepted_rows_by_hop.get(hop, 0),
+                "rate": accepted_rows_by_hop.get(hop, 0) / count,
+            }
+            for hop, count in sorted(rows_by_hop.items(), key=lambda item: int(item[0]))
+        },
+        "frontier_difficulty": {
+            "gold_vs_best_alternative_margin_mean": (
+                sum(margins) / len(margins) if margins else None
+            ),
+            "non_top1_gold_rate": (
+                sum(count for rank, count in gold_ranks.items() if int(rank) > 1)
+                / sum(gold_ranks.values()) if gold_ranks else None
+            ),
+        },
+        "empty_hypothesis_rate": (
+            sum(not node.denotation for node in hypothesis_nodes) / len(hypothesis_nodes)
+            if hypothesis_nodes else None
+        ),
+        "exact_duplicate_trajectory_rate": (
+            duplicate_rate
+        ),
+        "exact_duplicate_trajectories_removed": duplicates_removed,
         "actions": dict(
             sorted(Counter(step.action for demo in demonstrations for step in demo.steps).items())
         ),
         "teacher_action_selection_uses_gold_program": True,
+        "retrieval_intent_source": "question_and_visible_state_only",
         "teacher_rationales": "deterministic templates grounded in verified public steps",
         "explicit_gold_labels_exposed_to_student": False,
         "gold_injected_into_proposals": False,
+        "quality_assessment": {
+            "structurally_ready_for_sft": all(quality_checks.values()),
+            "checks": quality_checks,
+            "note": (
+                "Validity failures block export. Structural readiness does not impose "
+                "an arbitrary sample-size threshold; inspect the reported family counts "
+                "and natural-frontier recall before starting expensive SFT."
+            ),
+        },
     }
     (output / "report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"

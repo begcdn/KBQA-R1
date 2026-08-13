@@ -9,6 +9,7 @@ DATASET_TYPE=${DATASET_TYPE:-grailqa}
 DATA_DIR=${DATA_DIR:-"${REPO_ROOT}/data/${DATASET_TYPE}_rl_dataset"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 : "${HYPER_SFT_MODEL:?Set HYPER_SFT_MODEL to the verified HyPER-R1 SFT checkpoint}"
+: "${HYPER_RELATION_MODEL:?Set HYPER_RELATION_MODEL to the explicit relation-ranker checkpoint}"
 
 RAW_TRAIN_FILE=${RAW_TRAIN_FILE:-"${DATA_DIR}/train.parquet"}
 RAW_VAL_FILE=${RAW_VAL_FILE:-"${DATA_DIR}/test.parquet"}
@@ -31,6 +32,7 @@ export hyper_r1_enable=true
 export hyper_r1_max_active=${hyper_r1_max_active:-6}
 export hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
 export hyper_r1_frontier_width=${hyper_r1_frontier_width:-3}
+export hyper_r1_relation_model=${hyper_r1_relation_model:-"${HYPER_RELATION_MODEL}"}
 export hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 export hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 export hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}

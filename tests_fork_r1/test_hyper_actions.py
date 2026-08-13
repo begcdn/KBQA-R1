@@ -27,3 +27,14 @@ Action4: Commit [ H5 ]
         ActionType.COMMIT_HYPOTHESIS,
     ]
     assert actions[2].arguments == ["H2", "H4"]
+
+
+def test_find_relation_supports_hyper_source_only_and_legacy_intent():
+    parser = ActionParser()
+    hyper = parser.parse_action("Find_relation [ expression2 ]")
+    legacy = parser.parse_action(
+        "Find_relation [ expression2 | place where the person died ]"
+    )
+    assert hyper.action_type == ActionType.FIND_RELATION
+    assert hyper.arguments == ["expression2"]
+    assert legacy.arguments == ["expression2", "place where the person died"]

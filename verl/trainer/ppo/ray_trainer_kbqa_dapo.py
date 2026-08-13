@@ -158,6 +158,7 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
                                     hyper_r1_max_active=self.config.get("hyper_r1", {}).get("max_active", 6),
                                     hyper_r1_max_nodes=self.config.get("hyper_r1", {}).get("max_nodes", 24),
                                     hyper_r1_frontier_width=self.config.get("hyper_r1", {}).get("frontier_width", 3),
+                                    hyper_r1_relation_model=self.config.get("hyper_r1", {}).get("relation_model"),
                                     sparql_url=self.config.get("sparql", {}).get(
                                         "url", "http://localhost:8000/execute"
                                     ),

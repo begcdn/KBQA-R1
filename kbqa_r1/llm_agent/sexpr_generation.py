@@ -14,7 +14,9 @@ import torch
 
 from verl import DataProto
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
-from kbqa_r1.hyper_r1 import HypothesisGraph, combine_function_states
+from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
+                              required_hyper_relation_model)
+from kbqa_r1.hyper_prompt import extract_hyper_question
 
 # Import S-Expression components
 from ..sexpr import (ActionParser, FunctionBuilder, SExprExecutor,
@@ -70,6 +72,7 @@ class SExprLLMGenerationManager:
         self.config = config
         self.is_validation = is_validation
         self.hyper_r1_enable = bool(getattr(config, "hyper_r1_enable", False))
+        self.hyper_relation_model = required_hyper_relation_model(config)
         self.hyper_graph = HypothesisGraph(
             max_active=int(getattr(config, "hyper_r1_max_active", 6)),
             max_nodes=int(getattr(config, "hyper_r1_max_nodes", 24)),
@@ -129,10 +132,19 @@ class SExprLLMGenerationManager:
                 sparql_config=sparql_config_obj,
                 dataset=dataset,
                 relation_config=relation_config,
+                similarity_model_path=(
+                    self.hyper_relation_model if self.hyper_r1_enable else None
+                ),
             )
             
             # Initialize action processor
-            self.action_processor = SExprActionProcessor(self.relation_retrieval, self.state_manager)
+            self.action_processor = SExprActionProcessor(
+                self.relation_retrieval,
+                self.state_manager,
+                hyper_frontier_width=(
+                    self.hyper_frontier_width if self.hyper_r1_enable else None
+                ),
+            )
             
             # Initialize result processor with relation_retrieval and tokenizer/model name for prompt formatting
             model_name = getattr(tokenizer, 'name_or_path', None)
@@ -977,6 +989,23 @@ class SExprLLMGenerationManager:
                 return self._process_hyper_control(graph_actions[0], index, turn)
 
             relation_actions = [a for a in actions if a.action_type == ActionType.FIND_RELATION]
+            if relation_actions:
+                relation_action = relation_actions[0]
+                if len(relation_action.arguments) != 1:
+                    return self._hyper_info(
+                        index,
+                        "HyPER-R1 relation retrieval is environment-owned; use Find_relation [ source ].",
+                        is_final_turn,
+                    )
+                try:
+                    question = extract_hyper_question(
+                        self.state_manager.get_sample_prompt(index)
+                    )
+                except ValueError as exc:
+                    return self._hyper_info(index, str(exc), is_final_turn)
+                # Preserve raw_action for policy credit while supplying the
+                # immutable question to the legacy retrieval implementation.
+                relation_action.arguments = [relation_action.arguments[0], question]
             execution_error = self.hyper_graph.execution_error(
                 index,
                 opens_frontier=bool(relation_actions),
@@ -984,6 +1013,18 @@ class SExprLLMGenerationManager:
             )
             if execution_error:
                 return self._hyper_info(index, execution_error, is_final_turn)
+            if relation_actions:
+                source_error = self.hyper_graph.relation_source_error(
+                    index,
+                    relation_actions[0].arguments[0],
+                    [
+                        entity[-1]
+                        for entity in self.state_manager.get_sample_entities(index)
+                        if entity
+                    ],
+                )
+                if source_error:
+                    return self._hyper_info(index, source_error, is_final_turn)
         
         # Update action attempts for special actions present in this prediction
         present_special = set()

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 from typing import Any, Dict, Sequence
+import re
 
 
 HYPER_R1_INSTRUCTIONS = """
 
 HyPER-R1 executable hypothesis graph:
-- A Find_relation action proposes and executes a small ranked frontier of relations from the exact same state. The environment returns the successful alternatives as H-numbered hypotheses.
+- These instructions replace the legacy two-argument Find_relation format. Never write a relation name or free-text relation intent; relation proposals belong to the environment.
+- `Find_relation [ source ]` asks the environment to rank relations from the immutable question and that exact executable state. The environment executes a small frontier and returns H-numbered alternatives.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
 - Use `Prune [ Hn ]` only when its visible path or execution result contradicts the question. An empty result is direct negative evidence; a merely different nonempty answer is not.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
@@ -24,6 +26,18 @@ def append_hyper_instructions(text: str) -> str:
     if "HyPER-R1 executable hypothesis graph:" in text:
         return text
     return str(text).rstrip() + HYPER_R1_INSTRUCTIONS
+
+
+def extract_hyper_question(prompt: str) -> str:
+    """Recover the immutable benchmark question from a HyPER prompt."""
+    matches = list(re.finditer(r"(?:^|\n)Question:\s*", str(prompt)))
+    if not matches:
+        raise ValueError("HyPER-R1 prompt is missing its Question field")
+    remainder = str(prompt)[matches[-1].end():]
+    question = remainder.split("\n\nHyPER-R1 executable hypothesis graph:", 1)[0].strip()
+    if not question:
+        raise ValueError("HyPER-R1 Question field is empty")
+    return question
 
 
 def build_hyper_prompt(
@@ -44,7 +58,7 @@ def build_hyper_prompt(
     entity_text = ", ".join(entities) or "none"
     prompt = (
         "You are an expert assistant for querying Freebase with executable actions.\n"
-        "Find_relation [ source | relation intent ] opens a relation frontier; "
+        "Find_relation [ source ] opens a question-conditioned relation frontier; "
         "source must be one of the candidate entity IDs or a selected expression.\n"
         f"Candidate Entities: [{entity_text}]\n"
         f"Question: {question}"
