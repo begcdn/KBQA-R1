@@ -109,6 +109,10 @@ def result_display_labels(results: Any) -> Dict[str, str]:
         label = row.get("name") or row.get("label")
         if identity is not None and label is not None:
             labels[str(identity).strip()] = str(label).strip()
+        elif identity is not None:
+            value = str(identity).strip()
+            if not re.fullmatch(r"[mg]\.[A-Za-z0-9_]+", value) and "." in value:
+                labels[value] = value.rsplit(".", 1)[-1].replace("_", " ")
     return normalize_display_labels(labels)
 
 

@@ -1,7 +1,11 @@
 import importlib.util
 from pathlib import Path
 
-from kbqa_r1.hyper_data import HyperDemonstration
+from kbqa_r1.hyper_data import (
+    DemonstrationStep,
+    ExecutedHypothesis,
+    HyperDemonstration,
+)
 
 
 SCRIPT = (
@@ -61,3 +65,48 @@ def test_question_split_keeps_all_trajectories_for_a_question_together():
     assert {
         MODULE._question_split(f"question-{index}") for index in range(100)
     } == {"train", "validation"}
+
+
+def test_decision_consistency_detects_conflicting_actions_for_same_state():
+    shared = [{"role": "user", "content": "same state"}]
+    rows = [
+        {"messages": [*shared, {"role": "assistant", "content": "<action>Select [ H0 ]</action>"}]},
+        {"messages": [*shared, {"role": "assistant", "content": "<action>Select [ H1 ]</action>"}]},
+    ]
+
+    result = MODULE._decision_contradictions(rows)
+
+    assert result["decision_states"] == 1
+    assert result["contradictory_states"] == 1
+
+
+def test_frontier_diagnostics_inspect_continuation_frontiers():
+    nodes = {
+        "H0": ExecutedHypothesis("H0", (), "expression1", ("m.prefix",)),
+        "H1": ExecutedHypothesis(
+            "H1", (), "expression2", ("m.answer",), parent_id="H0", depth=1
+        ),
+        "H2": ExecutedHypothesis(
+            "H2", (), "expression2", ("m.answer",), parent_id="H0", depth=1,
+            role="alternative",
+        ),
+    }
+    demonstration = HyperDemonstration(
+        "continuation",
+        "question",
+        "question",
+        "direct_frontier_progress",
+        nodes,
+        [
+            DemonstrationStep("Find_relation", ("m.topic",), (), ("H0",)),
+            DemonstrationStep("Select", ("H0",), ("H0",)),
+            DemonstrationStep("Find_relation", ("expression1",), ("H0",), ("H1", "H2")),
+            DemonstrationStep("Commit", ("H1",), ("H1", "H2")),
+        ],
+        ("m.answer",),
+    )
+
+    result = MODULE._frontier_diagnostics([demonstration])
+
+    assert result["frontiers_with_multiple_gold_answer_sets"] == 1
+    assert result["commits_with_answer_equivalent_sibling"] == 1

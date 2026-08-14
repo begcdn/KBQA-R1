@@ -8,7 +8,7 @@ actions, denotations, or the committed answer.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import re
@@ -360,11 +360,6 @@ class DemonstrationBuilder:
             )
             if demo is not None:
                 demos.append(demo)
-                if demo.family == "delayed_frontier_recovery":
-                    direct = self._direct_progress_from_recovery(demo)
-                    if direct is not None:
-                        self.stats["direct_progress_built"] += 1
-                        demos.append(direct)
         demos.extend(intersection_demos)
         within_budget = []
         for demo in demos:
@@ -384,103 +379,6 @@ class DemonstrationBuilder:
             demo.private_metadata["max_active"] = self.max_active
             demo.private_metadata["max_turns"] = self.max_turns
         return demos
-
-    @staticmethod
-    def _direct_progress_from_recovery(
-        recovery: HyperDemonstration,
-    ) -> Optional[HyperDemonstration]:
-        """Pair recovery with ordinary correct progress from the same frontier."""
-        initial = tuple(
-            node_id
-            for node_id, node in recovery.hypotheses.items()
-            if node.parent_id is None and node.operation == "expand"
-        )
-        gold = next(
-            (
-                node
-                for node in recovery.hypotheses.values()
-                if node.role == "gold" and node.hypothesis_id in initial
-            ),
-            None,
-        )
-        if gold is None:
-            return None
-        original_children = tuple(
-            node.hypothesis_id
-            for node in recovery.hypotheses.values()
-            if node.parent_id == gold.hypothesis_id
-        )
-        final = next(
-            (
-                recovery.hypotheses[node_id]
-                for node_id in original_children
-                if recovery.hypotheses[node_id].denotation == recovery.gold_answers
-            ),
-            None,
-        )
-        if final is None:
-            return None
-        find_first = recovery.steps[0]
-        continuation = next(
-            (
-                step
-                for step in recovery.steps
-                if step.action == "Find_relation"
-                and step.arguments[0] == gold.target_expression
-            ),
-            None,
-        )
-        if continuation is None:
-            return None
-        hypotheses = {
-            node_id: node
-            for node_id, node in recovery.hypotheses.items()
-            if node_id in set(initial)
-        }
-        child_ids = {
-            node_id: f"H{len(initial) + index}"
-            for index, node_id in enumerate(original_children)
-        }
-        for old_id, new_id in child_ids.items():
-            child = recovery.hypotheses[old_id]
-            hypotheses[new_id] = replace(child, hypothesis_id=new_id)
-        children = tuple(child_ids[node_id] for node_id in original_children)
-        final_id = child_ids[final.hypothesis_id]
-        active_after = tuple(
-            node_id for node_id in initial if node_id != gold.hypothesis_id
-        ) + children
-        steps = [
-            find_first,
-            DemonstrationStep(
-                "Select",
-                (gold.hypothesis_id,),
-                initial,
-                rationale_facts=("question_supported_branch",),
-            ),
-            DemonstrationStep(
-                "Find_relation",
-                continuation.arguments,
-                initial,
-                children,
-                ("continue_supported_branch",),
-            ),
-            DemonstrationStep(
-                "Commit",
-                (final_id,),
-                active_after,
-                rationale_facts=("complete", "executable"),
-            ),
-        ]
-        return HyperDemonstration(
-            demo_id=recovery.demo_id + ":direct",
-            question_id=recovery.question_id,
-            question=recovery.question,
-            family="direct_frontier_progress",
-            hypotheses=hypotheses,
-            steps=steps,
-            gold_answers=recovery.gold_answers,
-            private_metadata=dict(recovery.private_metadata),
-        )
 
     def _build_relation_demo(
         self,
@@ -819,7 +717,7 @@ class DemonstrationBuilder:
                     "Select",
                     (gold.hypothesis_id,),
                     created,
-                    rationale_facts=("question_supported_branch",),
+                    rationale_facts=(f"question_relation_match:{gold.relation}",),
                 ),
                 DemonstrationStep(
                     "Find_relation",
@@ -1462,7 +1360,15 @@ def _action_text(step: DemonstrationStep) -> str:
                 "The probe supplied negative evidence, so I will return to a preserved "
                 "alternative."
                 if "return_after_top_probe_failed" in step.rationale_facts
-                else "I will investigate this hypothesis without discarding the others."
+                else next(
+                    (
+                        "This relation best matches the question, so I will test it while "
+                        "preserving the other hypotheses: " + fact.split(":", 1)[1]
+                        for fact in step.rationale_facts
+                        if fact.startswith("question_relation_match:")
+                    ),
+                    "I will investigate this hypothesis without discarding the others.",
+                )
             ),
             "Prune": "This hypothesis has an empty execution result, so it cannot answer the question.",
             "Commit": "This executable hypothesis covers the full question.",

@@ -99,6 +99,101 @@ def _question_split(question_id: str) -> str:
     return "validation" if bucket == 0 else "train"
 
 
+def _decision_contradictions(trajectory_rows):
+    """Count identical student observations assigned different graph actions."""
+    state_actions = {}
+    for row in trajectory_rows:
+        history = []
+        for message in row.get("messages", ()):
+            content = str(message.get("content", ""))
+            if message.get("role") == "assistant" and "<action>" in content:
+                state = json.dumps(history, sort_keys=True, ensure_ascii=True)
+                action = content.split("<action>", 1)[1].split("</action>", 1)[0].strip()
+                state_actions.setdefault(state, set()).add(action)
+            history.append(message)
+    conflicts = [actions for actions in state_actions.values() if len(actions) > 1]
+    return {
+        "decision_states": len(state_actions),
+        "contradictory_states": len(conflicts),
+        "contradiction_rate": (
+            len(conflicts) / len(state_actions) if state_actions else 0.0
+        ),
+    }
+
+
+def _frontier_diagnostics(demonstrations):
+    """Measure answer-equivalent alternatives at every executed frontier."""
+    frontiers = 0
+    multiple_gold = 0
+    committed_with_equivalent_sibling = 0
+    commits = 0
+    for demo in demonstrations:
+        node_frontier = {}
+        for step in demo.steps:
+            if len(step.created) > 1:
+                frontiers += 1
+                denotations = [demo.hypotheses[node_id].denotation for node_id in step.created]
+                multiple_gold += int(sum(value == demo.gold_answers for value in denotations) > 1)
+                for node_id in step.created:
+                    node_frontier[node_id] = step.created
+            if step.action != "Commit":
+                continue
+            commits += 1
+            target = step.arguments[0]
+            siblings = node_frontier.get(target, ())
+            denotation = demo.hypotheses[target].denotation
+            committed_with_equivalent_sibling += int(
+                any(
+                    sibling != target
+                    and demo.hypotheses[sibling].denotation == denotation
+                    for sibling in siblings
+                )
+            )
+    return {
+        "executed_frontiers": frontiers,
+        "frontiers_with_multiple_gold_answer_sets": multiple_gold,
+        "multiple_gold_frontier_rate": multiple_gold / frontiers if frontiers else 0.0,
+        "commits": commits,
+        "commits_with_answer_equivalent_sibling": committed_with_equivalent_sibling,
+        "answer_equivalent_commit_rate": (
+            committed_with_equivalent_sibling / commits if commits else 0.0
+        ),
+    }
+
+
+def _frontier_difficulty_by_family(demonstrations):
+    report = {}
+    for demo in demonstrations:
+        rank = demo.private_metadata.get("gold_rank")
+        if rank is None:
+            continue
+        family = report.setdefault(
+            demo.family,
+            {"examples": 0, "non_top1_gold": 0, "non_top1_with_nonempty_higher_sibling": 0},
+        )
+        family["examples"] += 1
+        family["non_top1_gold"] += int(int(rank) > 1)
+        initial = demo.steps[0].created if demo.steps else ()
+        gold_position = next(
+            (
+                index
+                for index, node_id in enumerate(initial)
+                if demo.hypotheses[node_id].role == "gold"
+            ),
+            None,
+        )
+        if gold_position is not None and gold_position > 0:
+            family["non_top1_with_nonempty_higher_sibling"] += int(
+                any(demo.hypotheses[node_id].denotation for node_id in initial[:gold_position])
+            )
+    for values in report.values():
+        values["non_top1_gold_rate"] = values["non_top1_gold"] / values["examples"]
+        values["non_top1_with_nonempty_higher_sibling_rate"] = (
+            values["non_top1_with_nonempty_higher_sibling"] / values["examples"]
+        )
+    return dict(sorted(report.items()))
+
+
 class LiveEntityDisplayProvider:
     """Cache readable labels while preserving MIDs as executable identities."""
 
@@ -459,7 +554,6 @@ def main() -> None:
     candidate_mid_count = 0
     candidate_labeled_count = 0
     conjunction_source_positions = Counter()
-    ambiguous_frontiers = 0
     for demo in train_demonstrations:
         candidates = list(demo.private_metadata.get("candidate_entities", ()))
         candidate_ids = [str(entity[-1]) for entity in candidates if entity]
@@ -482,12 +576,6 @@ def main() -> None:
             )
             if positions:
                 conjunction_source_positions[str(positions)] += 1
-        initial = demo.steps[0].created if demo.steps else ()
-        if sum(
-            demo.hypotheses[node_id].denotation == demo.gold_answers
-            for node_id in initial
-        ) > 1:
-            ambiguous_frontiers += 1
     serialized_trajectories = [
         json.dumps(row["messages"], sort_keys=True, ensure_ascii=True)
         for row in train_rows
@@ -496,8 +584,15 @@ def main() -> None:
         1 - len(set(serialized_trajectories)) / len(serialized_trajectories)
         if serialized_trajectories else None
     )
+    decision_consistency = _decision_contradictions(train_rows)
+    frontier_diagnostics = _frontier_diagnostics(train_demonstrations)
+    family_difficulty = _frontier_difficulty_by_family(train_demonstrations)
     recovery_count = families.get("delayed_frontier_recovery", 0)
-    minimum_recoveries = max(100, math.ceil(0.01 * len(train_demonstrations)))
+    multi_hop_count = sum(
+        any(node.depth > 0 for node in demo.hypotheses.values())
+        for demo in train_demonstrations
+    )
+    minimum_recoveries = max(100, math.ceil(0.01 * multi_hop_count))
     entity_display_total = visible_mid_count + candidate_mid_count
     entity_display_labeled = labeled_mid_count + candidate_labeled_count
     entity_display_rate = (
@@ -522,6 +617,9 @@ def main() -> None:
         "no_exact_duplicate_trajectories": duplicate_rate == 0.0,
         "readable_entity_evidence": entity_display_rate >= 0.95,
         "conjunction_roots_are_not_position_fixed": varied_conjunction_order,
+        "no_conflicting_teacher_actions_for_same_observation": (
+            decision_consistency["contradictory_states"] == 0
+        ),
     }
     report = {
         "input": args.input,
@@ -538,6 +636,7 @@ def main() -> None:
         "validation_families": dict(sorted(validation_families.items())),
         "qualified_families_before_balancing": dict(sorted(qualified_families.items())),
         "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
+        "gold_rank_by_family": family_difficulty,
         "find_relation_source_types": dict(sorted(source_types.items())),
         "frontier_width": args.frontier_width,
         "max_active": args.max_active,
@@ -606,6 +705,7 @@ def main() -> None:
                 sum(count for rank, count in gold_ranks.items() if int(rank) > 1)
                 / sum(gold_ranks.values()) if gold_ranks else None
             ),
+            "by_family": family_difficulty,
         },
         "empty_hypothesis_rate": (
             sum(not node.denotation for node in hypothesis_nodes) / len(hypothesis_nodes)
@@ -627,16 +727,13 @@ def main() -> None:
             ),
         },
         "denotational_ambiguity": {
-            "frontiers_with_multiple_gold_answer_sets": ambiguous_frontiers,
-            "rate": (
-                ambiguous_frontiers / len(train_demonstrations)
-                if train_demonstrations else None
-            ),
+            **frontier_diagnostics,
             "interpretation": (
                 "Answer equality is diagnostic only; it does not turn a different "
                 "relation path into an additional semantic positive."
             ),
         },
+        "teacher_decision_consistency": decision_consistency,
         "exact_duplicate_trajectory_rate": (
             duplicate_rate
         ),
@@ -659,6 +756,7 @@ def main() -> None:
             "structurally_ready_for_sft": all(quality_checks.values()),
             "checks": quality_checks,
             "minimum_recovery_trajectories": minimum_recoveries,
+            "multi_hop_training_trajectories": multi_hop_count,
             "note": (
                 "Validity failures block export. Expensive SFT additionally requires "
                 "readable entity evidence, non-positional conjunction roots, and enough "

@@ -83,22 +83,40 @@ def build_hyper_prompt(
     return append_hyper_instructions(prompt)
 
 
+def dataset_candidate_entities(row: Dict[str, Any]) -> Sequence[Sequence[str]]:
+    """Read candidate entity label/identity pairs from supported dataset schemas."""
+    extra = row.get("extra_info") if isinstance(row.get("extra_info"), dict) else {}
+    entities = extra.get("extracted_entities") or extra.get("candidate_entities") or ()
+    if entities:
+        return entities
+    reward = row.get("reward_model")
+    ground_truth = reward.get("ground_truth", {}) if isinstance(reward, dict) else {}
+    return ground_truth.get("candidate_entities") or ()
+
+
 def augment_dataset_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Add the protocol to common KBQA-R1 RL and SFT parquet schemas."""
     result = deepcopy(row)
+    entities = dataset_candidate_entities(result)
+
+    def augment_content(content: str) -> str:
+        if entities:
+            return build_hyper_prompt("", entities, str(content))
+        return append_hyper_instructions(content)
+
     prompt = result.get("prompt")
     if isinstance(prompt, str):
-        result["prompt"] = append_hyper_instructions(prompt)
+        result["prompt"] = augment_content(prompt)
     elif isinstance(prompt, list):
         for message in prompt:
             if isinstance(message, dict) and message.get("role") == "user":
-                message["content"] = append_hyper_instructions(message.get("content", ""))
+                message["content"] = augment_content(message.get("content", ""))
                 break
 
     messages = result.get("messages")
     if isinstance(messages, list):
         for message in messages:
             if isinstance(message, dict) and message.get("role") == "user":
-                message["content"] = append_hyper_instructions(message.get("content", ""))
+                message["content"] = augment_content(message.get("content", ""))
                 break
     return result

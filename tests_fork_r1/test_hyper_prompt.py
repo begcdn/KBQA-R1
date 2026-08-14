@@ -1,4 +1,8 @@
-from kbqa_r1.hyper_prompt import augment_dataset_row, extract_hyper_question
+from kbqa_r1.hyper_prompt import (
+    augment_dataset_row,
+    dataset_candidate_entities,
+    extract_hyper_question,
+)
 
 
 def test_augment_rl_prompt_once():
@@ -24,3 +28,29 @@ def test_extracts_immutable_question_before_protocol_instructions():
     )["prompt"][0]["content"]
     assert extract_hyper_question(content) == "Who founded Apple?"
     assert "Find_relation [ source ]" in content
+
+
+def test_augment_rl_prompt_uses_available_entity_names():
+    row = {
+        "prompt": [{
+            "role": "user",
+            "content": "Candidate Entities: ['m.apple' (m.apple)]\nQuestion: Who founded Apple?",
+        }],
+        "extra_info": {
+            "extracted_entities": [["Apple Inc.", "m.apple"]],
+        },
+    }
+
+    content = augment_dataset_row(row)["prompt"][0]["content"]
+
+    assert "Candidate Entities: ['Apple Inc.' (m.apple)]" in content
+    assert "['m.apple' (m.apple)]" not in content
+
+
+def test_candidate_entities_fall_back_to_reward_metadata():
+    entities = [["Apple Inc.", "m.apple"]]
+    row = {
+        "reward_model": {"ground_truth": {"candidate_entities": entities}},
+    }
+
+    assert dataset_candidate_entities(row) == entities

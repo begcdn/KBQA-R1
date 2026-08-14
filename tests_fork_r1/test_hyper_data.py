@@ -126,7 +126,8 @@ def test_builds_replayable_delayed_frontier_recovery():
         "answer": ["m.answer"],
     }
     builder = DemonstrationBuilder(fake_executor, candidates)
-    demo = builder.build(row)[0]
+    demos = builder.build(row)
+    demo = demos[0]
     assert demo.family == "delayed_frontier_recovery"
     actions = [step.action for step in demo.steps]
     assert actions[:3] == ["Find_relation", "Select", "Find_relation"]
@@ -165,15 +166,27 @@ def test_builds_replayable_delayed_frontier_recovery():
     assert "nodes=3 executions=3" in graph_observations[0]
     assert "H3" not in graph_observations[0]
 
-    direct = DemonstrationBuilder(fake_executor, candidates).build(row)[1]
-    assert direct.family == "direct_frontier_progress"
-    assert [step.action for step in direct.steps] == [
-        "Find_relation", "Select", "Find_relation", "Commit"
-    ]
-    assert DemonstrationValidator(fake_executor, max_active=6).validate(direct) == []
+    assert len(demos) == 1
     assert builder.stats["recovery_probe_natural_frontier"] == 1
     assert builder.stats["recovery_probe_visible_empty"] == 1
     assert builder.stats["continuation_proposal_hit"] == 1
+
+
+def test_recovery_does_not_emit_a_contradictory_direct_twin():
+    row = {
+        "ID": "no-twin",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    demos = DemonstrationBuilder(fake_executor, candidates).build(row)
+
+    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
 
 
 def test_recovery_probe_uses_natural_frontier_without_hidden_gold_injection():
@@ -310,6 +323,9 @@ def test_recovery_is_not_manufactured_from_a_nonempty_wrong_terminal_answer():
     demos = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)
     assert [demo.family for demo in demos] == ["direct_frontier_progress"]
     assert all(step.action != "Prune" for step in demos[0].steps)
+    rendered = str(trajectory_sft_record(demos[0]))
+    assert "relation best matches the question" in rendered
+    assert "r.gold1" in rendered
     assert DemonstrationValidator(
         nonempty_wrong_executor, max_active=6
     ).validate(demos[0]) == []
@@ -329,7 +345,7 @@ def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget()
     builder = DemonstrationBuilder(fake_executor, candidates, max_turns=4)
 
     assert builder.build(row) == []
-    assert builder.stats["trajectory_turn_budget_miss"] == 2
+    assert builder.stats["trajectory_turn_budget_miss"] == 1
 
 
 def test_builder_requires_room_for_two_complete_relation_frontiers():

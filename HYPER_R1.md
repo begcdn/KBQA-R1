@@ -56,14 +56,20 @@ The retained trajectory families teach distinct policy behavior:
   combine the branches, and commit the executed intersection while unrelated
   plausible candidates remain available.
 
+Each complete student-visible observation has one teacher action. Recovery
+examples are not paired with direct-progress twins from the identical frontier;
+that would train contradictory choices at the decision where the method is
+supposed to learn whether to investigate or proceed.
+
 The builder round-robins these families before filling the remaining corpus so
 easy one-hop commits cannot erase the method-specific behavior. Exported
 reports also block expensive SFT unless readable evidence covers at least 95%
-of displayed MIDs and the verified corpus contains at least 100 recovery
-trajectories (or 1% of a still larger corpus). Answer-equivalent paths are
-reported as an ambiguity diagnostic; equality of denotation alone never turns
-a semantically different path into a positive teacher action. Questions with
-more than 100 answers are omitted from SFT to prevent answer copying from
+of displayed MIDs, no identical observation has conflicting teacher actions,
+and the verified corpus contains at least 100 recovery trajectories (or 1% of
+a still larger multi-hop corpus). Answer-equivalent alternatives are measured
+at every executed frontier and at Commit; equality of denotation alone never
+turns a semantically different path into a positive teacher action. Questions
+with more than 100 answers are omitted from SFT to prevent answer copying from
 dominating policy learning. A deterministic question-level 95/5 split writes
 `train.parquet` and `validation.parquet` without trajectory leakage.
 

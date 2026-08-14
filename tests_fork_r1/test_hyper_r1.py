@@ -12,6 +12,7 @@ from kbqa_r1.hyper_r1 import (
     enforce_commit_reward,
     dependency_function_state,
     graph_action_token_mask,
+    result_display_labels,
     result_denotation_values,
     required_hyper_relation_model,
 )
@@ -23,6 +24,12 @@ def test_execution_results_keep_identity_separate_from_display_label():
     assert result_denotation_values(rows, ["x:m.answer (Readable Answer)"]) == (
         "m.answer",
     )
+
+
+def test_runtime_display_labels_match_builder_fallback_for_schema_values():
+    assert result_display_labels([{"x": "people.person.author"}]) == {
+        "people.person.author": "author"
+    }
 
 
 def test_hyper_runtime_requires_explicit_relation_ranker():
