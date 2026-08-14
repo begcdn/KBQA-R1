@@ -21,6 +21,7 @@ class ActionType(Enum):
     TIME_CONSTRAINT = "Time_constraint"
     COUNT = "Count"
     SELECT_HYPOTHESIS = "Select"
+    WIDEN_FRONTIER = "Widen"
     PRUNE_HYPOTHESIS = "Prune"
     COMMIT_HYPOTHESIS = "Commit"
     COMBINE_HYPOTHESES = "Combine"
@@ -78,6 +79,10 @@ class ActionParser:
             ActionType.SELECT_HYPOTHESIS: {
                 "pattern": r"(?:Action(\d+):\s*|^)Select\s*\[\s*(H\d+)\s*\]",
                 "description": "Restore one active executable hypothesis for further reasoning"
+            },
+            ActionType.WIDEN_FRONTIER: {
+                "pattern": r"(?:Action(\d+):\s*|^)Widen\s*\[\s*([^\]]+)\s*\]",
+                "description": "Expose the next ranked relation proposals for an open frontier"
             },
             ActionType.PRUNE_HYPOTHESIS: {
                 "pattern": r"(?:Action(\d+):\s*|^)Prune\s*\[\s*(H\d+)\s*\]",

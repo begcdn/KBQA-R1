@@ -95,6 +95,7 @@ def summarize(rows: Iterable[dict]) -> dict:
             "commit_valid_rate": "hyper_r1_commit_valid",
             "branch_switch_rate": "hyper_r1_branch_switch",
             "combine_usage_rate": "hyper_r1_used_combine",
+            "widen_usage_rate": "hyper_r1_used_widen",
             "preserved_alternatives_rate": "hyper_r1_preserved_alternatives",
         }
         for output_key, row_key in optional_rates.items():
@@ -109,6 +110,7 @@ def summarize(rows: Iterable[dict]) -> dict:
         for name, key in (
             ("branch_switch_f1", "hyper_r1_branch_switch"),
             ("conjunction_f1", "hyper_r1_used_combine"),
+            ("widen_f1", "hyper_r1_used_widen"),
         ):
             selected_items = [item for item in items if _number(item, key) > 0]
             result[name] = (

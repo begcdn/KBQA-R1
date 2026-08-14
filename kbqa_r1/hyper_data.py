@@ -15,7 +15,7 @@ import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .hyper_prompt import build_hyper_prompt
-from .hyper_r1 import combine_function_states, serialize_frontier
+from .hyper_r1 import combine_function_states, relation_path, serialize_frontier
 
 
 _EXPRESSION = r"expression\d*"
@@ -28,6 +28,19 @@ _STOP = re.compile(rf"^STOP\(({_EXPRESSION})\)$")
 
 def normalize_values(values: Iterable[Any]) -> Tuple[str, ...]:
     return tuple(sorted({str(value).strip() for value in values or () if str(value).strip()}))
+
+
+def answer_set_f1(predicted: Sequence[str], gold: Sequence[str]) -> float:
+    predicted_set = set(normalize_values(predicted))
+    gold_set = set(normalize_values(gold))
+    if not predicted_set and not gold_set:
+        return 1.0
+    if not predicted_set or not gold_set:
+        return 0.0
+    overlap = len(predicted_set & gold_set)
+    precision = overlap / len(predicted_set)
+    recall = overlap / len(gold_set)
+    return 2 * precision * recall / (precision + recall) if overlap else 0.0
 
 
 @dataclass(frozen=True)
@@ -257,6 +270,7 @@ class DemonstrationBuilder:
         candidate_provider: CandidateProvider,
         max_active: int = 6,
         frontier_width: int = 3,
+        max_frontier_width: int = 6,
         max_turns: int = 10,
         entity_display_provider: Optional[EntityDisplayProvider] = None,
     ):
@@ -264,10 +278,15 @@ class DemonstrationBuilder:
             raise ValueError("frontier_width must permit alternatives")
         if max_active < frontier_width * 2:
             raise ValueError("max_active must hold two complete relation frontiers")
+        if max_frontier_width < frontier_width:
+            raise ValueError("max_frontier_width cannot be smaller than frontier_width")
+        if max_frontier_width > max_active:
+            raise ValueError("max_frontier_width cannot exceed max_active")
         self.executor = executor
         self.candidate_provider = candidate_provider
         self.max_active = int(max_active)
         self.frontier_width = int(frontier_width)
+        self.max_frontier_width = int(max_frontier_width)
         self.max_turns = int(max_turns)
         self.entity_display_provider = entity_display_provider
         self._display_cache: Dict[str, str] = {}
@@ -376,8 +395,27 @@ class DemonstrationBuilder:
             demo.private_metadata["candidate_entity_order"] = "stable_question_hash"
             demo.private_metadata["base_prompt"] = base_prompt
             demo.private_metadata["max_active"] = self.max_active
+            demo.private_metadata["max_frontier_width"] = self.max_frontier_width
             demo.private_metadata["max_turns"] = self.max_turns
         return demos
+
+    def _candidate_future_value(
+        self,
+        plan: GoldPlan,
+        join: ProgramStatement,
+        option: RelationOption,
+        gold_answers: Tuple[str, ...],
+    ) -> Dict[str, Any]:
+        """Private teacher-only outcome for one naturally retrieved action."""
+        program = list(plan.executable_functions)
+        program[join.index] = replace_join_relation(join.raw, option.relation)
+        answers = self._execute(program, plan.target_expression)
+        return {
+            "execution_success": answers is not None,
+            "answer_count": len(answers or ()),
+            "answer_exact": answers == gold_answers,
+            "answer_f1": answer_set_f1(answers or (), gold_answers),
+        }
 
     def _build_relation_demo(
         self,
@@ -399,14 +437,27 @@ class DemonstrationBuilder:
         # Gold labels may judge the resulting frontier, but must not shape the
         # semantic request that the student has to reproduce at inference.
         query = question.strip()
-        options = list(self.candidate_provider(query, state_before, join))[
-            : self.frontier_width
+        ranked_options = list(self.candidate_provider(query, state_before, join))[
+            : self.max_frontier_width
         ]
-        gold_option = next((option for option in options if option.relation == join.relation), None)
+        initial_options = ranked_options[: self.frontier_width]
+        gold_option = next(
+            (option for option in ranked_options if option.relation == join.relation), None
+        )
         if gold_option is None:
+            self.stats["proposal_max_frontier_miss"] += 1
             self.stats["proposal_miss"] += 1
             return None
-        self.stats["proposal_hit"] += 1
+        self.stats["proposal_max_frontier_hit"] += 1
+        initial_relations = {option.relation for option in initial_options}
+        needs_widen = gold_option.relation not in initial_relations
+        if needs_widen:
+            self.stats["proposal_miss"] += 1
+            self.stats["proposal_recovered_by_widen"] += 1
+            options = ranked_options
+        else:
+            self.stats["proposal_hit"] += 1
+            options = initial_options
         self.stats[f"proposal_gold_rank_{gold_option.rank}"] += 1
         if gold_option.rank == 1:
             self.stats["proposal_top1_hit"] += 1
@@ -438,19 +489,49 @@ class DemonstrationBuilder:
         gold_entry = next(
             (item for item in candidates if item[0].relation == join.relation), None
         )
-        if gold_entry is None or len(candidates) < 2:
+        initial_created = tuple(
+            node.hypothesis_id
+            for option, node in candidates
+            if option.relation in initial_relations
+        )
+        widened_created = tuple(
+            node.hypothesis_id
+            for option, node in candidates
+            if option.relation not in initial_relations
+        )
+        if (
+            gold_entry is None
+            or len(initial_created) < 2
+            or (needs_widen and gold_entry[1].hypothesis_id not in widened_created)
+        ):
             return None
 
         hypotheses = {item[1].hypothesis_id: item[1] for item in candidates}
-        created = tuple(hypotheses)
+        created = initial_created + widened_created
         source = _action_source(state_before, join.raw)
         steps = [
             DemonstrationStep(
-                "Find_relation", (source,), (), created,
+                "Find_relation", (source,), (), initial_created,
                 ("open_ranked_frontier",),
             )
         ]
+        if needs_widen:
+            steps.append(
+                DemonstrationStep(
+                    "Widen",
+                    (source,),
+                    initial_created,
+                    widened_created,
+                    ("required_relation_missing_from_initial_frontier",),
+                )
+            )
         gold = gold_entry[1]
+        candidate_future_values = {
+            option.relation: self._candidate_future_value(
+                plan, join, option, gold_answers
+            )
+            for option, _ in candidates
+        }
         best_alternative_score = max(
             (
                 option.score
@@ -470,162 +551,273 @@ class DemonstrationBuilder:
                     ),
                 ]
             )
-            family = "frontier_commit"
+            family = "adaptive_frontier_widen" if needs_widen else "frontier_commit"
             probe_relation = None
         else:
-            # A genuine delayed-recovery trace requires exactly one remaining
-            # linear JOIN. This keeps every action replayable by the runtime.
             if not _is_immediate_linear_terminal(plan, join, next_join):
                 return None
-            wrong_entries = []
-            for option, node in candidates:
-                if (
-                    option.relation == join.relation
-                    or option.rank >= gold_option.rank
-                    or not node.denotation
-                ):
-                    continue
-                full_program = list(plan.executable_functions)
-                full_program[join.index] = replace_join_relation(
-                    join.raw, option.relation
-                )
-                if self._execute(full_program, plan.target_expression) == ():
-                    wrong_entries.append((option, node))
-            if not wrong_entries:
-                return self._build_direct_progress_demo(
-                    question_id,
-                    question,
-                    join,
+            if needs_widen:
+                gold_children = self._expand_terminal_frontier(
+                    gold,
                     next_join,
-                    candidates,
-                    gold_answers,
-                    gold_option,
-                    best_alternative_score,
-                )
-            self.stats["recovery_opportunity"] += 1
-            wrong_entries.sort(key=lambda item: (item[0].rank, -item[0].score))
-            wrong = wrong_entries[0][1]
-            steps.append(
-                DemonstrationStep(
-                    "Select", (wrong.hypothesis_id,), created, (),
-                    ("plausible_branch_requires_more_evidence",),
-                )
-            )
-            active = list(created)
-            wrong_children = self._expand_terminal_frontier(
-                wrong,
-                next_join,
-                hypotheses,
-                question,
-                stat_scope="recovery_probe",
-                require_required_relation=False,
-            )
-            empty_children = [
-                node_id
-                for node_id in wrong_children
-                if not hypotheses[node_id].denotation
-            ]
-            top_probe_failed = any(
-                not hypotheses[node_id].denotation
-                and "policy_choice" in hypotheses[node_id].provenance
-                for node_id in wrong_children
-            )
-            if not wrong_children or not top_probe_failed:
-                self.stats["recovery_probe_without_visible_failure"] += 1
-                return self._build_direct_progress_demo(
-                    question_id,
+                    hypotheses,
                     question,
-                    join,
-                    next_join,
-                    candidates,
-                    gold_answers,
-                    gold_option,
-                    best_alternative_score,
+                    stat_scope="continuation",
                 )
-            active.remove(wrong.hypothesis_id)
-            active.extend(wrong_children)
-            self.stats["recovery_probe_visible_empty"] += 1
-            steps.append(
-                DemonstrationStep(
-                    "Find_relation", (wrong.target_expression,), created,
-                    tuple(wrong_children), ("test_top_ranked_continuation",),
+                final_gold = next(
+                    (
+                        hypotheses[node_id]
+                        for node_id in gold_children
+                        if hypotheses[node_id].relation == next_join.relation
+                        and hypotheses[node_id].denotation == gold_answers
+                    ),
+                    None,
                 )
-            )
-            for child_id in empty_children:
-                before = tuple(active)
-                active.remove(child_id)
+                if final_gold is None:
+                    return None
+                active = list(created)
+                required_prunes = max(
+                    0,
+                    len(active) - 1 + len(gold_children) - self.max_active,
+                )
+                rank_by_relation = {
+                    option.relation: option.rank for option, _ in candidates
+                }
+                prunable = sorted(
+                    (
+                        hypotheses[node_id]
+                        for node_id in active
+                        if node_id != gold.hypothesis_id
+                    ),
+                    key=lambda node: (
+                        bool(node.denotation),
+                        -rank_by_relation.get(node.relation, 0),
+                    ),
+                )
+                for victim in prunable[:required_prunes]:
+                    before = tuple(active)
+                    active.remove(victim.hypothesis_id)
+                    rationale = (
+                        ("empty_execution",)
+                        if not victim.denotation
+                        else (f"question_path_mismatch:{victim.relation}",)
+                    )
+                    steps.append(
+                        DemonstrationStep(
+                            "Prune",
+                            (victim.hypothesis_id,),
+                            before,
+                            (),
+                            rationale,
+                        )
+                    )
                 steps.append(
                     DemonstrationStep(
-                        "Prune", (child_id,), before, (),
-                        ("empty_execution",),
+                        "Select",
+                        (gold.hypothesis_id,),
+                        tuple(active),
+                        (),
+                        (f"question_relation_match:{gold.relation}",),
                     )
                 )
-            steps.append(
-                DemonstrationStep(
-                    "Select", (gold.hypothesis_id,), tuple(active), (),
-                    ("return_after_top_probe_failed",),
+                before_expansion = tuple(active)
+                active.remove(gold.hypothesis_id)
+                active.extend(gold_children)
+                if len(active) > self.max_active:
+                    return None
+                steps.extend(
+                    [
+                        DemonstrationStep(
+                            "Find_relation",
+                            (gold.target_expression,),
+                            before_expansion,
+                            tuple(gold_children),
+                            ("continue_widened_branch",),
+                        ),
+                        DemonstrationStep(
+                            "Commit",
+                            (final_gold.hypothesis_id,),
+                            tuple(active),
+                            (),
+                            ("complete", "executable"),
+                        ),
+                    ]
                 )
-            )
-            gold_children = self._expand_terminal_frontier(
-                gold,
-                next_join,
-                hypotheses,
-                question,
-                stat_scope="continuation",
-            )
-            final_gold = next(
-                (
-                    hypotheses[node_id]
-                    for node_id in gold_children
-                    if hypotheses[node_id].relation == next_join.relation
-                    and hypotheses[node_id].denotation == gold_answers
-                ),
-                None,
-            )
-            if final_gold is None:
-                return self._build_direct_progress_demo(
-                    question_id,
-                    question,
-                    join,
-                    next_join,
-                    candidates,
-                    gold_answers,
-                    gold_option,
-                    best_alternative_score,
-                )
-            before_gold_expansion = tuple(active)
-            active.remove(gold.hypothesis_id)
-            active.extend(gold_children)
-            if len(active) > self.max_active:
-                return self._build_direct_progress_demo(
-                    question_id,
-                    question,
-                    join,
-                    next_join,
-                    candidates,
-                    gold_answers,
-                    gold_option,
-                    best_alternative_score,
-                )
-            steps.extend(
-                [
+                family = "adaptive_frontier_widen"
+                probe_relation = None
+            else:
+                # Recovery candidates are higher-ranked natural proposals whose
+                # complete counterfactual program is not answer-equivalent.
+                wrong_entries = []
+                for option, node in candidates:
+                    future = candidate_future_values[option.relation]
+                    if (
+                        option.relation == join.relation
+                        or option.rank >= gold_option.rank
+                        or not node.denotation
+                        or not future["execution_success"]
+                        or future["answer_exact"]
+                    ):
+                        continue
+                    wrong_entries.append((option, node))
+                if not wrong_entries:
+                    direct = self._build_direct_progress_demo(
+                        question_id,
+                        question,
+                        join,
+                        next_join,
+                        candidates,
+                        gold_answers,
+                        gold_option,
+                        best_alternative_score,
+                    )
+                    if direct is not None:
+                        direct.private_metadata["candidate_future_values"] = candidate_future_values
+                    return direct
+                self.stats["recovery_opportunity"] += 1
+                wrong_entries.sort(key=lambda item: (item[0].rank, -item[0].score))
+                wrong = wrong_entries[0][1]
+                steps.append(
                     DemonstrationStep(
-                        "Find_relation",
-                        (gold.target_expression,),
-                        before_gold_expansion,
-                        tuple(gold_children),
-                        ("continue_preserved_alternative",),
+                        "Select", (wrong.hypothesis_id,), created, (),
+                        ("plausible_branch_requires_more_evidence",),
+                    )
+                )
+                active = list(created)
+                wrong_children = self._expand_terminal_frontier(
+                    wrong,
+                    next_join,
+                    hypotheses,
+                    question,
+                    stat_scope="recovery_probe",
+                    require_required_relation=False,
+                )
+                top_probe = next(
+                    (
+                        hypotheses[node_id]
+                        for node_id in wrong_children
+                        if "policy_choice" in hypotheses[node_id].provenance
                     ),
+                    None,
+                )
+                if top_probe is None:
+                    self.stats["recovery_probe_without_visible_failure"] += 1
+                    direct = self._build_direct_progress_demo(
+                        question_id,
+                        question,
+                        join,
+                        next_join,
+                        candidates,
+                        gold_answers,
+                        gold_option,
+                        best_alternative_score,
+                    )
+                    if direct is not None:
+                        direct.private_metadata["candidate_future_values"] = candidate_future_values
+                    return direct
+                active.remove(wrong.hypothesis_id)
+                active.extend(wrong_children)
+                steps.append(
                     DemonstrationStep(
-                        "Commit", (final_gold.hypothesis_id,), tuple(active), (),
-                        ("complete", "executable"),
-                    ),
+                        "Find_relation", (wrong.target_expression,), created,
+                        tuple(wrong_children), ("test_top_ranked_continuation",),
+                    )
+                )
+                semantic_mismatch = bool(top_probe.denotation)
+                prune_ids = [
+                    node_id
+                    for node_id in wrong_children
+                    if not hypotheses[node_id].denotation
                 ]
-            )
-            family = "delayed_frontier_recovery"
-            probe_relation = "question_conditioned"
-            self.stats["recovery_built"] += 1
+                if semantic_mismatch and top_probe.hypothesis_id not in prune_ids:
+                    prune_ids.append(top_probe.hypothesis_id)
+                if not prune_ids:
+                    self.stats["recovery_probe_without_visible_failure"] += 1
+                    direct = self._build_direct_progress_demo(
+                        question_id,
+                        question,
+                        join,
+                        next_join,
+                        candidates,
+                        gold_answers,
+                        gold_option,
+                        best_alternative_score,
+                    )
+                    if direct is not None:
+                        direct.private_metadata["candidate_future_values"] = candidate_future_values
+                    return direct
+                self.stats[
+                    "recovery_probe_visible_semantic_mismatch"
+                    if semantic_mismatch
+                    else "recovery_probe_visible_empty"
+                ] += 1
+                for child_id in prune_ids:
+                    before = tuple(active)
+                    active.remove(child_id)
+                    rationale = (
+                        (f"question_path_mismatch:{wrong.relation}",)
+                        if hypotheses[child_id].denotation
+                        else ("empty_execution",)
+                    )
+                    steps.append(
+                        DemonstrationStep(
+                            "Prune", (child_id,), before, (), rationale,
+                        )
+                    )
+                steps.append(
+                    DemonstrationStep(
+                        "Select", (gold.hypothesis_id,), tuple(active), (),
+                        ("return_after_top_probe_failed",),
+                    )
+                )
+                gold_children = self._expand_terminal_frontier(
+                    gold,
+                    next_join,
+                    hypotheses,
+                    question,
+                    stat_scope="continuation",
+                )
+                final_gold = next(
+                    (
+                        hypotheses[node_id]
+                        for node_id in gold_children
+                        if hypotheses[node_id].relation == next_join.relation
+                        and hypotheses[node_id].denotation == gold_answers
+                    ),
+                    None,
+                )
+                if final_gold is None:
+                    return None
+                before_gold_expansion = tuple(active)
+                active.remove(gold.hypothesis_id)
+                active.extend(gold_children)
+                if len(active) > self.max_active:
+                    return None
+                steps.extend(
+                    [
+                        DemonstrationStep(
+                            "Find_relation",
+                            (gold.target_expression,),
+                            before_gold_expansion,
+                            tuple(gold_children),
+                            ("continue_preserved_alternative",),
+                        ),
+                        DemonstrationStep(
+                            "Commit", (final_gold.hypothesis_id,), tuple(active), (),
+                            ("complete", "executable"),
+                        ),
+                    ]
+                )
+                family = (
+                    "semantic_frontier_recovery"
+                    if semantic_mismatch
+                    else "delayed_frontier_recovery"
+                )
+                probe_relation = "question_conditioned"
+                self.stats["recovery_built"] += 1
 
+        if needs_widen:
+            self.stats["widen_demo_built"] += 1
         return HyperDemonstration(
             demo_id=f"{question_id}:join:{join.index}:{_digest(tuple(option.relation for option, _ in candidates))}",
             question_id=question_id,
@@ -643,7 +835,10 @@ class DemonstrationBuilder:
                     if best_alternative_score is not None else None
                 ),
                 "proposal_relations": [option.relation for option, _ in candidates],
-                "proposal_recall_at_frontier": True,
+                "proposal_recall_at_frontier": not needs_widen,
+                "proposal_recall_at_max_frontier": True,
+                "candidate_future_values": candidate_future_values,
+                "widen_sources": [source] if needs_widen else [],
                 "retrieval_intent_source": "question",
                 "probe_relation": probe_relation,
                 "decision_index": join.index,
@@ -669,13 +864,14 @@ class DemonstrationBuilder:
         gold = next(
             item[1] for item in candidates if item[0].relation == join.relation
         )
-        gold_children = self._expand_terminal_frontier(
+        initial_children, widened_children = self._expand_terminal_frontier_batches(
             gold,
             next_join,
             hypotheses,
             question,
             stat_scope="continuation",
         )
+        gold_children = initial_children + widened_children
         final_gold = next(
             (
                 hypotheses[node_id]
@@ -688,12 +884,79 @@ class DemonstrationBuilder:
         if final_gold is None:
             self.stats["direct_progress_miss"] += 1
             return None
-        active_after = tuple(
-            node_id for node_id in created if node_id != gold.hypothesis_id
-        ) + tuple(gold_children)
-        if len(active_after) > self.max_active:
+        source = _action_source(gold.function_state[:-1], join.raw)
+        steps = [
+            DemonstrationStep(
+                "Find_relation", (source,), (), created,
+                ("open_ranked_frontier",),
+            ),
+            DemonstrationStep(
+                "Select",
+                (gold.hypothesis_id,),
+                created,
+                rationale_facts=(f"question_relation_match:{gold.relation}",),
+            ),
+            DemonstrationStep(
+                "Find_relation",
+                (gold.target_expression,),
+                created,
+                tuple(initial_children),
+                ("continue_supported_branch",),
+            ),
+        ]
+        active = [node_id for node_id in created if node_id != gold.hypothesis_id]
+        active.extend(initial_children)
+        family = "direct_frontier_progress"
+        widen_sources = []
+        if widened_children:
+            required_prunes = max(
+                0, len(active) + len(widened_children) - self.max_active
+            )
+            prunable = sorted(
+                (hypotheses[node_id] for node_id in active),
+                key=lambda node: (
+                    bool(node.denotation),
+                    -node.depth,
+                    node.hypothesis_id,
+                ),
+            )
+            for victim in prunable[:required_prunes]:
+                before = tuple(active)
+                active.remove(victim.hypothesis_id)
+                rationale = (
+                    ("empty_execution",)
+                    if not victim.denotation
+                    else (f"question_path_mismatch:{victim.relation}",)
+                )
+                steps.append(
+                    DemonstrationStep(
+                        "Prune", (victim.hypothesis_id,), before, (), rationale,
+                    )
+                )
+            steps.append(
+                DemonstrationStep(
+                    "Widen",
+                    (gold.target_expression,),
+                    tuple(active),
+                    tuple(widened_children),
+                    ("required_relation_missing_from_initial_frontier",),
+                )
+            )
+            active.extend(widened_children)
+            family = "adaptive_frontier_widen"
+            widen_sources.append(gold.target_expression)
+            self.stats["widen_demo_built"] += 1
+        if len(active) > self.max_active:
             self.stats["direct_progress_capacity_miss"] += 1
             return None
+        steps.append(
+            DemonstrationStep(
+                "Commit",
+                (final_gold.hypothesis_id,),
+                tuple(active),
+                rationale_facts=("complete", "executable"),
+            )
+        )
         self.stats["direct_progress_built"] += 1
         return HyperDemonstration(
             demo_id=(
@@ -702,36 +965,9 @@ class DemonstrationBuilder:
             ),
             question_id=question_id,
             question=question,
-            family="direct_frontier_progress",
+            family=family,
             hypotheses=hypotheses,
-            steps=[
-                DemonstrationStep(
-                    "Find_relation",
-                    (_action_source(gold.function_state[:-1], join.raw),),
-                    (),
-                    created,
-                    ("open_ranked_frontier",),
-                ),
-                DemonstrationStep(
-                    "Select",
-                    (gold.hypothesis_id,),
-                    created,
-                    rationale_facts=(f"question_relation_match:{gold.relation}",),
-                ),
-                DemonstrationStep(
-                    "Find_relation",
-                    (gold.target_expression,),
-                    created,
-                    tuple(gold_children),
-                    ("continue_supported_branch",),
-                ),
-                DemonstrationStep(
-                    "Commit",
-                    (final_gold.hypothesis_id,),
-                    active_after,
-                    rationale_facts=("complete", "executable"),
-                ),
-            ],
+            steps=steps,
             gold_answers=gold_answers,
             private_metadata={
                 "gold_relation": join.relation,
@@ -745,11 +981,79 @@ class DemonstrationBuilder:
                     option.relation for option, _ in candidates
                 ],
                 "proposal_recall_at_frontier": True,
+                "proposal_recall_at_max_frontier": True,
+                "widen_sources": widen_sources,
                 "retrieval_intent_source": "question",
                 "probe_relation": None,
                 "decision_index": join.index,
             },
         )
+
+    def _expand_terminal_frontier_batches(
+        self,
+        parent: ExecutedHypothesis,
+        join: ProgramStatement,
+        hypotheses: Dict[str, ExecutedHypothesis],
+        question: str,
+        stat_scope: str,
+    ) -> Tuple[List[str], List[str]]:
+        """Execute initial and optional widened batches from one relation ranking."""
+        options = list(
+            self.candidate_provider(question.strip(), parent.function_state, join)
+        )[: self.max_frontier_width]
+        initial_options = options[: self.frontier_width]
+        required = next(
+            (option for option in options if option.relation == join.relation), None
+        )
+        self.stats[f"{stat_scope}_decisions"] += 1
+        if required is None:
+            self.stats[f"{stat_scope}_proposal_miss"] += 1
+            self.stats[f"{stat_scope}_max_frontier_miss"] += 1
+            return [], []
+        self.stats[f"{stat_scope}_max_frontier_hit"] += 1
+        initial_relations = {option.relation for option in initial_options}
+        if required.relation in initial_relations:
+            self.stats[f"{stat_scope}_proposal_hit"] += 1
+        else:
+            self.stats[f"{stat_scope}_proposal_miss"] += 1
+            self.stats[f"{stat_scope}_recovered_by_widen"] += 1
+        self.stats[f"{stat_scope}_gold_rank_{required.rank}"] += 1
+        if required.rank == 1:
+            self.stats[f"{stat_scope}_top1_hit"] += 1
+
+        visible_options = (
+            initial_options if required.relation in initial_relations else options
+        )
+        initial_children: List[str] = []
+        widened_children: List[str] = []
+        for option in visible_options:
+            statement = replace_join_relation(join.raw, option.relation)
+            state = list(parent.function_state) + [statement]
+            values = self._execute(state, join.target)
+            if values is None:
+                continue
+            node_id = f"H{len(hypotheses)}"
+            hypotheses[node_id] = ExecutedHypothesis(
+                node_id,
+                tuple(state),
+                join.target,
+                values,
+                denotation_labels=self._display_pairs(values),
+                relation=option.relation,
+                role="continuation",
+                parent_id=parent.hypothesis_id,
+                depth=parent.depth + 1,
+                provenance=(
+                    "policy_choice" if option.rank == 1 else "ranked_alternative",
+                ),
+            )
+            target_batch = (
+                initial_children
+                if option.relation in initial_relations
+                else widened_children
+            )
+            target_batch.append(node_id)
+        return initial_children, widened_children
 
     def _expand_terminal_frontier(
         self,
@@ -1130,6 +1434,21 @@ class DemonstrationBuilder:
         visit(target, len(plan.statements) + 1 if before is None else before)
         return [statement.raw for statement in ordered]
 
+def _has_visible_path_mismatch(
+    demo: HyperDemonstration,
+    step: DemonstrationStep,
+    node: ExecutedHypothesis,
+) -> bool:
+    if demo.family not in {"semantic_frontier_recovery", "adaptive_frontier_widen"}:
+        return False
+    visible_relations = set(relation_path(node.function_state))
+    return any(
+        fact.split(":", 1)[1] in visible_relations
+        for fact in step.rationale_facts
+        if fact.startswith("question_path_mismatch:") and ":" in fact
+    )
+
+
 class DemonstrationValidator:
     """Replay private executable states and verify graph-action consistency."""
 
@@ -1196,7 +1515,8 @@ class DemonstrationValidator:
             if step.action == "Prune":
                 if step.arguments[0] not in active:
                     errors.append(f"Prune targets inactive {step.arguments[0]}")
-                if demo.hypotheses[step.arguments[0]].denotation:
+                node = demo.hypotheses[step.arguments[0]]
+                if node.denotation and not _has_visible_path_mismatch(demo, step, node):
                     errors.append(
                         f"Prune {step.arguments[0]} lacks visible contradictory evidence"
                     )
@@ -1209,6 +1529,16 @@ class DemonstrationValidator:
                 if not demo.hypotheses[step.arguments[0]].denotation:
                     errors.append(f"Select targets empty {step.arguments[0]}")
                 selected = step.arguments[0]
+            elif step.action == "Widen":
+                if selected is not None:
+                    errors.append("Widen must occur before Select")
+                if not active:
+                    errors.append("Widen requires an open active frontier")
+                if step.arguments[0] not in demo.private_metadata.get("widen_sources", ()):
+                    errors.append(f"Widen source {step.arguments[0]} is not an open frontier")
+                if not step.created:
+                    errors.append("Widen must create at least one additional hypothesis")
+                active.update(step.created)
             elif step.action == "Find_relation":
                 if len(step.arguments) != 1:
                     errors.append(
@@ -1370,6 +1700,12 @@ def _action_text(step: DemonstrationStep) -> str:
             thought = "I will continue the preserved branch after the failed probe."
         else:
             thought = "I will execute a bounded relation frontier and retain its alternatives."
+    elif step.action == "Widen":
+        body = f"Widen [ {step.arguments[0]} ]"
+        thought = (
+            "The initial frontier does not cover the question, so I will inspect the next "
+            "ranked batch before selecting a path."
+        )
     elif step.action == "Combine":
         body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
         thought = "Both active branches express required parts of the question."
@@ -1390,7 +1726,14 @@ def _action_text(step: DemonstrationStep) -> str:
                     "I will investigate this hypothesis without discarding the others.",
                 )
             ),
-            "Prune": "This hypothesis has an empty execution result, so it cannot answer the question.",
+            "Prune": (
+                "This visible relation path conflicts with what the question asks, so I will remove it."
+                if any(
+                    fact.startswith("question_path_mismatch:")
+                    for fact in step.rationale_facts
+                )
+                else "This hypothesis has an empty execution result, so it cannot answer the question."
+            ),
             "Commit": "This executable hypothesis covers the full question.",
         }
         thought = thoughts[step.action]
@@ -1443,6 +1786,14 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             executions += len(step.created)
             selected = None
             event = "Executed the requested relation frontier."
+        elif step.action == "Widen":
+            active.extend(step.created)
+            known.update(step.created)
+            executions += len(step.created)
+            event = (
+                f"Widened the frontier from {step.arguments[0]} with "
+                f"{len(step.created)} additional executable hypotheses."
+            )
         elif step.action == "Select":
             selected = step.arguments[0]
             event = (
@@ -1450,7 +1801,8 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 "this hypothesis."
             )
         elif step.action == "Prune":
-            if demo.hypotheses[step.arguments[0]].denotation:
+            node = demo.hypotheses[step.arguments[0]]
+            if node.denotation and not _has_visible_path_mismatch(demo, step, node):
                 raise ValueError(
                     f"trajectory {demo.demo_id} prunes a nonempty branch without public evidence"
                 )
@@ -1515,3 +1867,36 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             "gold_injected_into_proposals": False,
         },
     }
+
+
+def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
+    """Export one exact conversation prefix per graph decision.
+
+    The final answer-copy turn is deliberately excluded. This makes behavior
+    cloning optimize the policy actions that SFT is meant to install, while the
+    complete trajectory remains available for replay checks and inspection.
+    """
+    trajectory = trajectory_sft_record(demo)
+    records = []
+    decision_index = 0
+    for message_index, message in enumerate(trajectory["messages"]):
+        if message.get("role") != "assistant" or "<action>" not in message.get("content", ""):
+            continue
+        prefix = [dict(item) for item in trajectory["messages"][: message_index + 1]]
+        for prior in prefix:
+            if prior.get("role") == "assistant":
+                prior["loss_mask"] = 0
+        prefix[-1]["loss_mask"] = 1
+        records.append(
+            {
+                "messages": prefix,
+                "data_source": "hyper_r1_verified_decision",
+                "extra_info": {
+                    **trajectory["extra_info"],
+                    "decision_index": decision_index,
+                    "target_is_graph_action": True,
+                },
+            }
+        )
+        decision_index += 1
+    return records

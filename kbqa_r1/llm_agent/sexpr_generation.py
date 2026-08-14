@@ -87,7 +87,15 @@ class SExprLLMGenerationManager:
             raise ValueError("HyPER-R1 frontier width must be at least two")
         if self.hyper_frontier_width > self.hyper_graph.max_active:
             raise ValueError("HyPER-R1 frontier width cannot exceed max_active")
+        self.hyper_max_frontier_width = int(
+            getattr(config, "hyper_r1_max_frontier_width", 6)
+        )
+        if self.hyper_max_frontier_width < self.hyper_frontier_width:
+            raise ValueError("HyPER-R1 max frontier width cannot be smaller than its initial width")
+        if self.hyper_max_frontier_width > self.hyper_graph.max_active:
+            raise ValueError("HyPER-R1 max frontier width cannot exceed max_active")
         self._hyper_action_records: Dict[int, List[dict]] = {}
+        self._hyper_frontiers: Dict[int, List[dict]] = {}
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -125,7 +133,7 @@ class SExprLLMGenerationManager:
             relation_config = None
             if self.hyper_r1_enable:
                 relation_config = {
-                    "relation_topk": self.hyper_frontier_width,
+                    "relation_topk": self.hyper_max_frontier_width,
                     "relation_threshold": 0.0,
                     "entity_topk": 1,
                     "entity_threshold": 0.5,
@@ -341,6 +349,55 @@ class SExprLLMGenerationManager:
             }
         )
 
+    def _execute_hyper_candidate(
+        self,
+        sample_id: int,
+        decision: ForkDecision,
+        candidate,
+        *,
+        parent_id,
+        contrast_group: str,
+        provenance: str,
+    ):
+        """Execute one cached natural relation proposal without changing policy state."""
+        alternative_state = append_intervened_join(
+            decision, relation=candidate.relation
+        )
+        alternative_target = self._target_expression(alternative_state)
+        alternative_branch_state = list(
+            dependency_function_state(alternative_state, alternative_target)
+        )
+        alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
+            alternative_state, alternative_target
+        )
+        if not alternative_sexpr.is_valid:
+            return None
+        alternative_execution = self.sexpr_executor.execute_sexpr(
+            alternative_sexpr.sexpr, function_state=alternative_state
+        )
+        if not alternative_execution.is_successful:
+            return None
+        alternative_mids = self.result_processor.extract_mid_list(
+            alternative_execution.results
+        )
+        return self.hyper_graph.add_executed(
+            sample_id=sample_id,
+            function_state=alternative_branch_state,
+            target_expression=alternative_target,
+            sexpr=alternative_sexpr.sexpr,
+            denotation=result_denotation_values(
+                alternative_execution.results, alternative_mids
+            ),
+            denotation_labels=result_display_labels(alternative_execution.results),
+            parent_id=parent_id,
+            operation="expand",
+            relation_id=candidate.relation,
+            relation_prompt=decision.relation_prompt,
+            resolver_score=float(candidate.score),
+            contrast_group=contrast_group,
+            provenance=[provenance],
+        )
+
     def _process_hyper_control(self, action, sample_id: int, turn: int) -> str:
         from ..sexpr.action_parser import ActionType
 
@@ -355,6 +412,84 @@ class SExprLLMGenerationManager:
             action_key = self.hyper_graph.action_key(
                 sample_id, action.action_type.value, action.arguments
             )
+            if action.action_type == ActionType.WIDEN_FRONTIER:
+                if graph_state.selected_id is not None:
+                    raise ValueError("Widen before Select so the original frontier remains current")
+                source = str(action.arguments[0])
+                active_ids = {
+                    node.node_id for node in self.hyper_graph.active_nodes(sample_id)
+                }
+                frontier = next(
+                    (
+                        item
+                        for item in reversed(self._hyper_frontiers.get(sample_id, ()))
+                        if item["source"] == source
+                        and item["next_offset"] < item["max_width"]
+                        and active_ids.intersection(item["node_ids"])
+                    ),
+                    None,
+                )
+                if frontier is None:
+                    raise ValueError(f"no open frontier from {source} has further ranked proposals")
+                ranked = frontier["decision"].frontier(frontier["max_width"])
+                batch = ranked[frontier["next_offset"] : frontier["max_width"]]
+                if not batch:
+                    raise ValueError(f"frontier from {source} is already fully exposed")
+                if self.hyper_graph.available_active_slots(sample_id) < len(batch):
+                    raise ValueError(
+                        f"Widen needs {len(batch)} free active slots; prune visible mismatches first"
+                    )
+                if not self.hyper_graph.has_capacity(sample_id, len(batch)):
+                    raise ValueError("the executed-node budget cannot hold the widened frontier")
+                created = []
+                exposed_relations = []
+                for candidate in batch:
+                    exposed_relations.append(candidate.relation)
+                    try:
+                        node = self._execute_hyper_candidate(
+                            sample_id,
+                            frontier["decision"],
+                            candidate,
+                            parent_id=frontier["parent_id"],
+                            contrast_group=frontier["contrast_group"],
+                            provenance="widened_alternative",
+                        )
+                    except (KeyError, ValueError, RuntimeError):
+                        logger.exception(
+                            "[HyPER-R1] Failed to execute widened relation %s for sample %s",
+                            candidate.relation,
+                            sample_id,
+                        )
+                        node = None
+                    if node is not None:
+                        effective_id = node.equivalent_to or node.node_id
+                        created.append(effective_id)
+                        frontier["node_ids"].append(effective_id)
+                frontier["next_offset"] = frontier["max_width"]
+                action_key = self.hyper_graph.action_key(
+                    sample_id,
+                    action.action_type.value,
+                    created,
+                    details=(f"source:{source}", *exposed_relations),
+                )
+                self._record_hyper_action(
+                    sample_id,
+                    action,
+                    turn,
+                    state_key=state_key,
+                    action_key=action_key,
+                    node_id=created[-1] if created else "",
+                    active_before=active_before,
+                    selected_before=selected_before,
+                )
+                return self._hyper_info(
+                    sample_id,
+                    (
+                        f"Widened the frontier from {source} with {len(created)} "
+                        "additional executable hypotheses."
+                    ),
+                    is_final_turn,
+                )
             if action.action_type == ActionType.SELECT_HYPOTHESIS:
                 node = self.hyper_graph.select(sample_id, action.arguments[0])
                 current = self.state_manager.snapshot_sample_state(sample_id)
@@ -594,6 +729,7 @@ class SExprLLMGenerationManager:
         if not has_relation or decision is None:
             return
         frontier = decision.frontier(self.hyper_frontier_width)
+        opened_node_ids = [factual.equivalent_to or factual.node_id]
         for candidate in frontier:
             if candidate.relation == decision.chosen_relation:
                 continue
@@ -606,51 +742,35 @@ class SExprLLMGenerationManager:
                 )
                 break
             try:
-                alternative_state = append_intervened_join(
-                    decision, relation=candidate.relation
-                )
-                alternative_target = self._target_expression(alternative_state)
-                alternative_branch_state = list(
-                    dependency_function_state(alternative_state, alternative_target)
-                )
-                alternative_sexpr = self.sexpr_generator.generate_sexpr_from_strings(
-                    alternative_state, alternative_target
-                )
-                if not alternative_sexpr.is_valid:
-                    continue
-                alternative_execution = self.sexpr_executor.execute_sexpr(
-                    alternative_sexpr.sexpr, function_state=alternative_state
-                )
-                if not alternative_execution.is_successful:
-                    continue
-                alternative_mids = self.result_processor.extract_mid_list(
-                    alternative_execution.results
-                )
-                self.hyper_graph.add_executed(
-                    sample_id=sample_id,
-                    function_state=alternative_branch_state,
-                    target_expression=alternative_target,
-                    sexpr=alternative_sexpr.sexpr,
-                    denotation=result_denotation_values(
-                        alternative_execution.results, alternative_mids
-                    ),
-                    denotation_labels=result_display_labels(
-                        alternative_execution.results
-                    ),
+                node = self._execute_hyper_candidate(
+                    sample_id,
+                    decision,
+                    candidate,
                     parent_id=parent_id,
-                    operation="expand",
-                    relation_id=candidate.relation,
-                    relation_prompt=decision.relation_prompt,
-                    resolver_score=float(candidate.score),
                     contrast_group=contrast_group,
-                    provenance=["ranked_alternative"],
+                    provenance="ranked_alternative",
                 )
+                if node is not None:
+                    opened_node_ids.append(node.equivalent_to or node.node_id)
             except (KeyError, ValueError, RuntimeError):
                 logger.exception(
                     "[HyPER-R1] Failed to execute frontier relation %s for sample %s",
                     candidate.relation,
                     sample_id,
                 )
+        max_frontier = decision.frontier(self.hyper_max_frontier_width)
+        if len(max_frontier) > len(frontier):
+            self._hyper_frontiers.setdefault(sample_id, []).append(
+                {
+                    "source": str(decision.entity_argument),
+                    "decision": decision,
+                    "parent_id": parent_id,
+                    "contrast_group": contrast_group,
+                    "node_ids": opened_node_ids,
+                    "next_offset": len(frontier),
+                    "max_width": len(max_frontier),
+                }
+            )
         # Opening a frontier does not select its top-1 member. The next
         # expansion must be preceded by an explicit policy Select action.
 
@@ -658,7 +778,7 @@ class SExprLLMGenerationManager:
         """Build token-local masks for all deliberate graph-control actions.
 
         Useful exploration can occur off the final lineage. Outcome credit is
-        therefore concentrated on every valid Select/Prune/Combine/Commit
+        therefore concentrated on every valid Select/Widen/Prune/Combine/Commit
         decision, while the execution-budget reward discourages wandering.
         """
         if not self.hyper_r1_enable:
@@ -981,6 +1101,7 @@ class SExprLLMGenerationManager:
 
             graph_action_types = {
                 ActionType.SELECT_HYPOTHESIS,
+                ActionType.WIDEN_FRONTIER,
                 ActionType.PRUNE_HYPOTHESIS,
                 ActionType.COMMIT_HYPOTHESIS,
                 ActionType.COMBINE_HYPOTHESES,
@@ -997,7 +1118,7 @@ class SExprLLMGenerationManager:
                 if len(actions) != 1:
                     return self._hyper_info(
                         index,
-                        "Use exactly one Select, Prune, Combine, or Commit action per turn.",
+                        "Use exactly one Select, Widen, Prune, Combine, or Commit action per turn.",
                         is_final_turn,
                     )
                 return self._process_hyper_control(graph_actions[0], index, turn)
@@ -1582,6 +1703,7 @@ class SExprLLMGenerationManager:
             if self.hyper_r1_enable:
                 self.hyper_graph.clear()
                 self._hyper_action_records.clear()
+                self._hyper_frontiers.clear()
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
 

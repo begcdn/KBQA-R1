@@ -202,6 +202,7 @@ hyper_r1_enable=${hyper_r1_enable:-false}
 hyper_r1_max_active=${hyper_r1_max_active:-6}
 hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
 hyper_r1_frontier_width=${hyper_r1_frontier_width:-3}
+hyper_r1_max_frontier_width=${hyper_r1_max_frontier_width:-6}
 hyper_r1_relation_model=${hyper_r1_relation_model:-}
 hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
@@ -386,6 +387,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     hyper_r1.max_active=${hyper_r1_max_active} \
     hyper_r1.max_nodes=${hyper_r1_max_nodes} \
     hyper_r1.frontier_width=${hyper_r1_frontier_width} \
+    hyper_r1.max_frontier_width=${hyper_r1_max_frontier_width} \
     hyper_r1.relation_model="${hyper_r1_relation_model}" \
     +sexpr_config.enable_logging=false \
     max_turns=${max_turns} \

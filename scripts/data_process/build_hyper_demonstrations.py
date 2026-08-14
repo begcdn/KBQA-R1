@@ -28,6 +28,7 @@ from kbqa_r1.hyper_data import (
     ProgramStatement,
     RelationOption,
     compile_gold_plan,
+    decision_sft_records,
     step_sft_records,
     trajectory_sft_record,
 )
@@ -372,6 +373,7 @@ def main() -> None:
     )
     parser.add_argument("--relation-topk", type=int, default=20)
     parser.add_argument("--frontier-width", type=int, default=3)
+    parser.add_argument("--max-frontier-width", type=int, default=6)
     parser.add_argument("--max-active", type=int, default=6)
     parser.add_argument("--max-turns", type=int, default=10)
     parser.add_argument(
@@ -414,6 +416,7 @@ def main() -> None:
             provider,
             max_active=args.max_active,
             frontier_width=args.frontier_width,
+            max_frontier_width=args.max_frontier_width,
             max_turns=args.max_turns,
             entity_display_provider=display_provider,
         )
@@ -519,8 +522,14 @@ def main() -> None:
             for record in step_sft_records(demo):
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     trajectory_rows = [trajectory_sft_record(demo) for demo in demonstrations]
+    decision_rows = [
+        row for demo in demonstrations for row in decision_sft_records(demo)
+    ]
     with (output / "trajectory_sft.jsonl").open("w", encoding="utf-8") as handle:
         for record in trajectory_rows:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with (output / "decision_sft.jsonl").open("w", encoding="utf-8") as handle:
+        for record in decision_rows:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     train_pairs = [
         (demo, row) for demo, row in zip(demonstrations, trajectory_rows)
@@ -534,9 +543,17 @@ def main() -> None:
     validation_demonstrations = [demo for demo, _ in validation_pairs]
     train_rows = [row for _, row in train_pairs]
     validation_rows = [row for _, row in validation_pairs]
+    train_decision_rows = [
+        row for demo in train_demonstrations for row in decision_sft_records(demo)
+    ]
+    validation_decision_rows = [
+        row for demo in validation_demonstrations for row in decision_sft_records(demo)
+    ]
     for name, rows_for_split in (
         ("train_trajectory_sft.jsonl", train_rows),
         ("validation_trajectory_sft.jsonl", validation_rows),
+        ("train_decision_sft.jsonl", train_decision_rows),
+        ("validation_decision_sft.jsonl", validation_decision_rows),
     ):
         with (output / name).open("w", encoding="utf-8") as handle:
             for record in rows_for_split:
@@ -545,9 +562,15 @@ def main() -> None:
         from datasets import Dataset
 
         Dataset.from_list(train_rows).to_parquet(str(output / "train.parquet"))
+        Dataset.from_list(train_decision_rows).to_parquet(
+            str(output / "train_decision.parquet")
+        )
         if validation_rows:
             Dataset.from_list(validation_rows).to_parquet(
                 str(output / "validation.parquet")
+            )
+            Dataset.from_list(validation_decision_rows).to_parquet(
+                str(output / "validation_decision.parquet")
             )
         parquet_written = True
     except ImportError:
@@ -580,6 +603,10 @@ def main() -> None:
     conjunction_total = proposal_stats.get("conjunction_decisions", 0)
     relation_recall = (
         proposal_stats.get("proposal_hit", 0) / relation_total
+        if relation_total else None
+    )
+    relation_max_recall = (
+        proposal_stats.get("proposal_max_frontier_hit", 0) / relation_total
         if relation_total else None
     )
     relation_top1 = (
@@ -646,12 +673,15 @@ def main() -> None:
     decision_consistency = _decision_contradictions(train_rows)
     frontier_diagnostics = _frontier_diagnostics(train_demonstrations)
     family_difficulty = _frontier_difficulty_by_family(train_demonstrations)
-    recovery_count = families.get("delayed_frontier_recovery", 0)
+    recovery_count = (
+        families.get("delayed_frontier_recovery", 0)
+        + families.get("semantic_frontier_recovery", 0)
+    )
     multi_hop_count = sum(
         any(node.depth > 0 for node in demo.hypotheses.values())
         for demo in train_demonstrations
     )
-    minimum_recoveries = max(100, math.ceil(0.01 * multi_hop_count))
+    minimum_recoveries = max(500, math.ceil(0.10 * multi_hop_count))
     entity_display_total = visible_mid_count + candidate_mid_count
     entity_display_labeled = labeled_mid_count + candidate_labeled_count
     entity_display_described = descriptor_mid_count + candidate_descriptor_count
@@ -670,6 +700,10 @@ def main() -> None:
             or families.get("direct_frontier_progress", 0)
         ),
         "recovery_skill_has_training_mass": recovery_count >= minimum_recoveries,
+        "adaptive_widening_is_represented": (
+            proposal_stats.get("proposal_recovered_by_widen", 0) == 0
+            or families.get("adaptive_frontier_widen", 0) > 0
+        ),
         "contains_required_conjunction": families.get("conjunction", 0) > 0,
         "natural_frontier_has_non_top1_gold": any(
             int(rank) > 1 and count > 0 for rank, count in gold_ranks.items()
@@ -699,6 +733,7 @@ def main() -> None:
         "gold_rank_by_family": family_difficulty,
         "find_relation_source_types": dict(sorted(source_types.items())),
         "frontier_width": args.frontier_width,
+        "max_frontier_width": args.max_frontier_width,
         "max_active": args.max_active,
         "max_turns": args.max_turns,
         "graph_query_workers": args.workers,
@@ -706,6 +741,7 @@ def main() -> None:
             (len(demo.steps) + 1 for demo in demonstrations), default=0
         ),
         "sft_rows": len(train_rows),
+        "decision_sft_rows": len(train_decision_rows),
         "validation_rows": len(validation_rows),
         "question_disjoint_split": "sha256_question_id_95_5",
         "train_parquet_written": parquet_written,
@@ -718,6 +754,12 @@ def main() -> None:
             ),
             "relation_at_frontier": (
                 relation_recall
+            ),
+            "relation_at_max_frontier": relation_max_recall,
+            "recovered_by_widen": (
+                relation_max_recall - relation_recall
+                if relation_max_recall is not None and relation_recall is not None
+                else None
             ),
             "relation_top1": relation_top1,
             "topk_opportunity_over_top1": (
@@ -822,7 +864,8 @@ def main() -> None:
             "note": (
                 "Validity failures block export. Expensive SFT additionally requires "
                 "readable entity evidence, non-positional conjunction roots, and enough "
-                "verified recovery trajectories to teach the method-specific behavior."
+                "verified recovery trajectories to teach the method-specific behavior. "
+                "Decision-level SFT rows exclude the final answer-copy turn."
             ),
         },
     }

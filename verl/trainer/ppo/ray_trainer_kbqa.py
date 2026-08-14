@@ -629,6 +629,7 @@ class RayPPOTrainer:
             hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
             hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
             hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
+            hyper_r1_max_frontier_width=self.config.get('hyper_r1', {}).get('max_frontier_width', 6),
             hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
             sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
             use_odbc=self.config.get('use_odbc', False),
@@ -837,6 +838,7 @@ class RayPPOTrainer:
                     hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
                     hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
                     hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
+                    hyper_r1_max_frontier_width=self.config.get('hyper_r1', {}).get('max_frontier_width', 6),
                     hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
                     sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                     use_odbc=self.config.get('use_odbc', False),
@@ -924,6 +926,9 @@ class RayPPOTrainer:
                     )
                     reward_extra_infos_dict["hyper_r1_used_combine"].append(
                         float(any(record.get("action") == "Combine" for record in records))
+                    )
+                    reward_extra_infos_dict["hyper_r1_used_widen"].append(
+                        float(any(record.get("action") == "Widen" for record in records))
                     )
                     reward_extra_infos_dict["hyper_r1_max_active"].append(
                         float(max((record.get("active_before", 0) for record in records), default=0))
@@ -1501,6 +1506,7 @@ class RayPPOTrainer:
                                 hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 6),
                                 hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
                                 hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 3),
+                                hyper_r1_max_frontier_width=self.config.get('hyper_r1', {}).get('max_frontier_width', 6),
                                 hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
                                 sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                                 use_odbc=self.config.get('use_odbc', False),

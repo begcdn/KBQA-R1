@@ -11,6 +11,7 @@ def test_summarize_reports_grailqa_levels_and_execution_cost():
             "hyper_r1_commit_valid": 1,
             "hyper_r1_branch_switch": 1,
             "hyper_r1_used_combine": 0,
+            "hyper_r1_used_widen": 1,
             "hyper_r1_preserved_alternatives": 1,
             "hyper_r1_max_active": 3,
             "metadata": {"level": "i.i.d."},
@@ -18,6 +19,7 @@ def test_summarize_reports_grailqa_levels_and_execution_cost():
         {
             "mid_f1": 0.5,
             "hyper_r1_execution_calls": 8,
+            "hyper_r1_used_widen": 0,
             "metadata": {"level": "compositional"},
         },
     ]
@@ -29,6 +31,7 @@ def test_summarize_reports_grailqa_levels_and_execution_cost():
     assert report["overall"]["branch_switch_rate"] == 1.0
     assert report["overall"]["branch_switch_f1"] == 1.0
     assert report["overall"]["mean_max_active_frontier"] == 3.0
+    assert report["overall"]["widen_usage_rate"] == 0.5
     assert report["by_level"]["i.i.d."]["questions"] == 1
     assert report["by_level"]["compositional"]["mean_f1"] == pytest.approx(0.5)
 

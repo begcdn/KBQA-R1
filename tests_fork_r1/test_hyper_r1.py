@@ -235,7 +235,7 @@ def test_serialization_exposes_compact_executable_state():
     assert node.node_id in text
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
-    assert "Actions: Select, Find_relation [ source ], Combine, Prune, or Commit" in text
+    assert "Actions: Select, Find_relation [ source ], Widen [ source ]" in text
 
 
 def test_serialization_pairs_readable_labels_with_stable_entity_ids():

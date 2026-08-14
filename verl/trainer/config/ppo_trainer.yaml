@@ -404,6 +404,9 @@ hyper_r1:
   # Natural ranked relations executed for each exploration decision.
   frontier_width: 3
 
+  # Maximum ranked frontier exposed after an explicit Widen action.
+  max_frontier_width: 6
+
   # Explicit ranker shared by demonstration building and runtime retrieval.
   relation_model: null
 

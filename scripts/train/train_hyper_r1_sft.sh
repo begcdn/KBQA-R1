@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-"$(cd "$(dirname "$0")/../.." && pwd)"}
 : "${BASE_MODEL:?Set BASE_MODEL to the released KBQA-R1 SFT checkpoint}"
-HYPER_SFT=${HYPER_SFT:-"${REPO_ROOT}/data/grailqa_hyper_r1_demonstrations/train.parquet"}
+HYPER_SFT=${HYPER_SFT:-"${REPO_ROOT}/data/grailqa_hyper_r1_demonstrations/train_decision.parquet"}
 HYPER_REPORT=${HYPER_REPORT:-"$(dirname "${HYPER_SFT}")/report.json"}
 if [[ ! -f "${HYPER_SFT}" ]]; then
   echo "Missing verified HyPER-R1 trajectory data: ${HYPER_SFT}" >&2

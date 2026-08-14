@@ -220,7 +220,7 @@ def serialize_frontier(
             f"path={path} answers={len(denotation)}: {answers}"
         )
     lines.append(
-        "Actions: Select, Find_relation [ source ], Combine, Prune, or Commit. "
+        "Actions: Select, Find_relation [ source ], Widen [ source ], Combine, Prune, or Commit. "
         "Prune only when visible path or execution evidence contradicts the question."
     )
     lines.append("</hypothesis_graph>")

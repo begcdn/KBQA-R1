@@ -25,5 +25,6 @@ exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --workers "${HYPER_BUILD_WORKERS}" \
   --relation-topk 20 \
   --frontier-width 3 \
+  --max-frontier-width 6 \
   --max-active 6 \
   --max-turns 10

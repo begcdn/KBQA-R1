@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from ..sparql.sparql_manager import SPARQLConfig
 from .constants import COMPARISON_MODE_READABLE_MAPPING
 from .dynamic_relation_retrieval import DynamicRelationRetrieval
@@ -114,6 +116,9 @@ class RelationRetrieval:
 
         # Store the most recent raw similarity scores for external inspection/logging
         self.last_similarity_scores = []  # type: ignore[var-annotated]
+        # Relation names and questions recur across frontier decisions. Keep their
+        # normalized embeddings on CPU instead of running the encoder repeatedly.
+        self._ranking_embedding_cache = {}
         # Track relations filtered by relation_list in the most recent dynamic retrieval
         self.last_filtered_by_relation_list = []  # type: ignore[var-annotated]
         # File path for recording relations filtered by relation_list (whitelist)
@@ -737,8 +742,32 @@ class RelationRetrieval:
 
         relation_names = [r for r, _ in candidate_relations]
 
-        # Calculate scores
-        if self.simcse_rel:
+        # Calculate scores. Production SimCSE backends expose encode(), allowing
+        # us to cache static relation embeddings and repeated question embeddings.
+        if self.simcse_rel and hasattr(self.simcse_rel, "encode"):
+            cache = getattr(self, "_ranking_embedding_cache", None)
+            if cache is None:
+                cache = {}
+                self._ranking_embedding_cache = cache
+
+            missing = [text for text in [gen_argument, *relation_names] if text not in cache]
+            if missing:
+                unique_missing = list(dict.fromkeys(missing))
+                encoded = self.simcse_rel.encode(
+                    unique_missing,
+                    return_numpy=True,
+                    normalize_to_unit=True,
+                )
+                encoded = np.asarray(encoded)
+                if encoded.ndim == 1:
+                    encoded = encoded.reshape(1, -1)
+                cache.update(zip(unique_missing, encoded))
+
+            query_embedding = np.asarray(cache[gen_argument]).reshape(-1)
+            relation_embeddings = np.stack([cache[name] for name in relation_names])
+            similarities = relation_embeddings @ query_embedding
+            scores_list = similarities.tolist()
+        elif self.simcse_rel:
             similarities = self.simcse_rel.similarity(gen_argument, relation_names)
             if isinstance(similarities, (int, float)):
                 scores_list = [similarities]

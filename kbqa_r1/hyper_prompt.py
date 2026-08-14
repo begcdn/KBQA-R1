@@ -12,6 +12,7 @@ HYPER_R1_INSTRUCTIONS = """
 HyPER-R1 executable hypothesis graph:
 - These instructions replace the legacy two-argument Find_relation format. Never write a relation name or free-text relation intent; relation proposals belong to the environment.
 - `Find_relation [ source ]` asks the environment to rank relations from the immutable question and that exact executable state. The environment executes a small frontier and returns H-numbered alternatives.
+- `Widen [ source ]` asks for the next ranked batch from the same open frontier when the visible candidates do not cover the question. Widen before Select, and prune first if the active frontier lacks room.
 - When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
 - Use `Prune [ Hn ]` only when its visible path or execution result contradicts the question. An empty result is direct negative evidence; a merely different nonempty answer is not.
@@ -19,7 +20,7 @@ HyPER-R1 executable hypothesis graph:
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
 - Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
-- The active frontier is bounded. Prune unsupported hypotheses before exploring when it is full.
+- The active frontier is bounded. Widen only when the extra evidence is needed, and prune visibly unsupported hypotheses before exploring when it is full.
 Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. After Commit, perform no more graph actions and copy the committed values exactly into <answer>.
 """.rstrip()
 

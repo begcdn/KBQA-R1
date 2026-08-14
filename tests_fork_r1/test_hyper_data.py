@@ -7,6 +7,7 @@ from kbqa_r1.hyper_data import (
     ProgramExecutionError,
     RelationOption,
     compile_gold_plan,
+    decision_sft_records,
     step_sft_records,
     trajectory_sft_record,
 )
@@ -242,6 +243,16 @@ def test_one_hop_frontier_commits_without_ceremonial_select():
     assert demo.family == "frontier_commit"
     assert [step.action for step in demo.steps] == ["Find_relation", "Commit"]
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    decisions = decision_sft_records(demo)
+    assert len(decisions) == 2
+    assert all("<action>" in row["messages"][-1]["content"] for row in decisions)
+    assert all("<answer>" not in row["messages"][-1]["content"] for row in decisions)
+    assert decisions[-1]["messages"][-1]["loss_mask"] == 1
+    assert all(
+        message.get("loss_mask") == 0
+        for message in decisions[-1]["messages"][:-1]
+        if message["role"] == "assistant"
+    )
 
 
 def test_recovery_is_not_manufactured_when_gold_is_already_top1():
@@ -302,7 +313,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
     assert [demo.family for demo in demos] == ["direct_frontier_progress"]
 
 
-def test_recovery_is_not_manufactured_from_a_nonempty_wrong_terminal_answer():
+def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer():
     row = {
         "ID": "wrong-answer",
         "question": "Which answer follows both intended relations?",
@@ -321,14 +332,100 @@ def test_recovery_is_not_manufactured_from_a_nonempty_wrong_terminal_answer():
         return fake_executor(functions, target)
 
     demos = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)
-    assert [demo.family for demo in demos] == ["direct_frontier_progress"]
-    assert all(step.action != "Prune" for step in demos[0].steps)
+    assert [demo.family for demo in demos] == ["semantic_frontier_recovery"]
+    semantic_prunes = [
+        step for step in demos[0].steps
+        if step.action == "Prune"
+        and any(
+            fact.startswith("question_path_mismatch:")
+            for fact in step.rationale_facts
+        )
+    ]
+    assert semantic_prunes
     rendered = str(trajectory_sft_record(demos[0]))
-    assert "relation best matches the question" in rendered
-    assert "r.gold1" in rendered
+    assert "visible relation path conflicts" in rendered
     assert DemonstrationValidator(
         nonempty_wrong_executor, max_active=6
     ).validate(demos[0]) == []
+
+
+def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
+    row = {
+        "ID": "widen",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+
+    def wider_candidates(query, state, join):
+        return [
+            RelationOption("r.alt1", 0.95, 1),
+            RelationOption("r.other1", 0.90, 2),
+            RelationOption("r.unrelated", 0.85, 3),
+            RelationOption("r.gold1", 0.80, 4),
+            RelationOption("r.extra1", 0.75, 5),
+            RelationOption("r.extra2", 0.70, 6),
+        ]
+
+    builder = DemonstrationBuilder(fake_executor, wider_candidates)
+    demo = builder.build(row)[0]
+
+    assert demo.family == "adaptive_frontier_widen"
+    assert [step.action for step in demo.steps] == [
+        "Find_relation", "Widen", "Commit"
+    ]
+    assert demo.private_metadata["gold_rank"] == 4
+    assert demo.private_metadata["proposal_recall_at_frontier"] is False
+    assert demo.private_metadata["proposal_recall_at_max_frontier"] is True
+    assert demo.private_metadata["candidate_future_values"]["r.gold1"]["answer_exact"]
+    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    rendered = trajectory_sft_record(demo)
+    assert any(
+        "Widen [ m.topic ]" in message["content"]
+        for message in rendered["messages"]
+        if message["role"] == "assistant"
+    )
+
+
+def test_widen_also_applies_to_a_selected_hypothesis_continuation():
+    row = {
+        "ID": "continuation-widen",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def continuation_candidates(query, state, join):
+        if join.relation == "r.gold1":
+            return [
+                RelationOption("r.gold1", 0.95, 1),
+                RelationOption("r.alt1", 0.90, 2),
+                RelationOption("r.other1", 0.85, 3),
+            ]
+        return [
+            RelationOption("r.alt2", 0.95, 1),
+            RelationOption("r.other2", 0.90, 2),
+            RelationOption("r.third2", 0.85, 3),
+            RelationOption("r.gold2", 0.80, 4),
+            RelationOption("r.extra2", 0.75, 5),
+            RelationOption("r.last2", 0.70, 6),
+        ]
+
+    demo = DemonstrationBuilder(fake_executor, continuation_candidates).build(row)[0]
+
+    assert demo.family == "adaptive_frontier_widen"
+    assert [step.action for step in demo.steps].count("Widen") == 1
+    widen = next(step for step in demo.steps if step.action == "Widen")
+    assert widen.arguments == ("expression1",)
+    assert len(widen.created) == 3
+    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
 
 
 def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget():

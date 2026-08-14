@@ -108,6 +108,7 @@ HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
 HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-6}
 HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-24}
 HYPER_R1_FRONTIER_WIDTH=${HYPER_R1_FRONTIER_WIDTH:-3}
+HYPER_R1_MAX_FRONTIER_WIDTH=${HYPER_R1_MAX_FRONTIER_WIDTH:-6}
 
 # GPU 配置
 NNODES=${NNODES:-1}
@@ -246,6 +247,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     hyper_r1.max_active=${HYPER_R1_MAX_ACTIVE} \
     hyper_r1.max_nodes=${HYPER_R1_MAX_NODES} \
     hyper_r1.frontier_width=${HYPER_R1_FRONTIER_WIDTH} \
+    hyper_r1.max_frontier_width=${HYPER_R1_MAX_FRONTIER_WIDTH} \
     max_turns=${SEXPR_MAX_TURNS} \
     use_odbc=true \
     use_aioodbc=false \
