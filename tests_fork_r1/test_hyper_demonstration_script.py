@@ -54,3 +54,10 @@ def test_explicit_limit_is_round_robin_across_available_families():
         "frontier_commit",
         "direct_frontier_progress",
     }
+
+
+def test_question_split_keeps_all_trajectories_for_a_question_together():
+    assert MODULE._question_split("question-1") == MODULE._question_split("question-1")
+    assert {
+        MODULE._question_split(f"question-{index}") for index in range(100)
+    } == {"train", "validation"}

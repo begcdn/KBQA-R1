@@ -9,8 +9,8 @@ covers the complete question.
 
 ## Fixed protocol
 
-1. `Find_relation [ source | relation intent ]` executes the normal top-3
-   relation proposals from one exact graph state. Gold relations are never
+1. `Find_relation [ source ]` asks the environment to execute the normal top-3
+   question-conditioned relation proposals from one exact graph state. Gold relations are never
    inserted into this frontier. Unlike the released single-path resolver,
    HyPER-R1 does not reject low-similarity top candidates at a fixed threshold;
    uncertainty is represented by the bounded executable frontier itself.
@@ -36,11 +36,12 @@ hypotheses and final answers are replayed through Freebase. Examples are
 rejected when the natural frontier misses a required relation; this miss is
 reported rather than repaired with gold injection.
 
-The builder uses a gold-derived semantic relation hint to construct verified
-teacher trajectories. Its proposal-recall statistic is therefore teacher-query
-recall, not inference-time recall. The learned policy must produce relation
-intents from the question at inference; this is measured separately in the
-end-to-end evaluation.
+The proposal query contains only the immutable question and the visible
+executable state. Gold programs choose and verify teacher actions but never add
+a missed relation to a frontier. Entity evidence is serialized as readable
+`label [MID]` pairs: labels support semantic decisions while MIDs preserve exact
+Freebase identity. Candidate roots are placed in a stable question-hash order,
+so their list position cannot reveal which gold branch should be opened first.
 
 The retained trajectory families teach distinct policy behavior:
 
@@ -48,14 +49,23 @@ The retained trajectory families teach distinct policy behavior:
 - `direct_frontier_progress`: select and continue a supported multi-hop branch
   while preserving its siblings;
 - `delayed_frontier_recovery`: investigate a plausible wrong branch, execute
-  its continuation, prune it after negative evidence, return to a preserved
+  its naturally retrieved continuation frontier, prune an empty child after
+  visible negative evidence, return to a preserved
   alternative, and finish correctly;
 - `conjunction`: retrieve two necessary branches in one natural frontier,
   combine the branches, and commit the executed intersection while unrelated
   plausible candidates remain available.
 
 The builder round-robins these families before filling the remaining corpus so
-easy one-hop commits cannot erase the method-specific behavior.
+easy one-hop commits cannot erase the method-specific behavior. Exported
+reports also block expensive SFT unless readable evidence covers at least 95%
+of displayed MIDs and the verified corpus contains at least 100 recovery
+trajectories (or 1% of a still larger corpus). Answer-equivalent paths are
+reported as an ambiguity diagnostic; equality of denotation alone never turns
+a semantically different path into a positive teacher action. Questions with
+more than 100 answers are omitted from SFT to prevent answer copying from
+dominating policy learning. A deterministic question-level 95/5 split writes
+`train.parquet` and `validation.parquet` without trajectory leakage.
 
 ```bash
 export PROCESSED_GRAILQA=/path/to/processed/GrailQA_train.json

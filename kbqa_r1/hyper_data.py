@@ -130,6 +130,7 @@ class ExecutedHypothesis:
     function_state: Tuple[str, ...]
     target_expression: str
     denotation: Tuple[str, ...]
+    denotation_labels: Tuple[Tuple[str, str], ...] = ()
     relation: Optional[str] = None
     role: str = "gold"
     parent_id: Optional[str] = None
@@ -176,6 +177,7 @@ ProgramExecutor = Callable[[Sequence[str], str], Iterable[Any]]
 CandidateProvider = Callable[
     [str, Sequence[str], ProgramStatement], Sequence[RelationOption]
 ]
+EntityDisplayProvider = Callable[[Sequence[str]], Mapping[str, str]]
 
 
 def replace_join_relation(raw: str, relation: str) -> str:
@@ -256,6 +258,7 @@ class DemonstrationBuilder:
         max_active: int = 6,
         frontier_width: int = 3,
         max_turns: int = 10,
+        entity_display_provider: Optional[EntityDisplayProvider] = None,
     ):
         if frontier_width < 2:
             raise ValueError("frontier_width must permit alternatives")
@@ -266,12 +269,34 @@ class DemonstrationBuilder:
         self.max_active = int(max_active)
         self.frontier_width = int(frontier_width)
         self.max_turns = int(max_turns)
+        self.entity_display_provider = entity_display_provider
+        self._display_cache: Dict[str, str] = {}
         if self.max_turns < 2:
             raise ValueError("max_turns must include at least one action and the answer")
         self.stats: Counter = Counter()
         self._execution_cache: Dict[
             Tuple[Tuple[str, ...], str], Optional[Tuple[str, ...]]
         ] = {}
+
+    def _resolve_display_labels(self, values: Sequence[str]) -> None:
+        identities = tuple(str(value) for value in values)
+        missing = [value for value in identities if value not in self._display_cache]
+        if missing and self.entity_display_provider is not None:
+            resolved = self.entity_display_provider(missing)
+            for identity, label in resolved.items():
+                key = str(identity).strip()
+                value = str(label).strip()
+                if key and value and key != value:
+                    self._display_cache[key] = value
+
+    def _display_pairs(self, values: Sequence[str]) -> Tuple[Tuple[str, str], ...]:
+        visible_values = tuple(str(value) for value in values[:4])
+        self._resolve_display_labels(visible_values)
+        return tuple(
+            (value, self._display_cache[value])
+            for value in visible_values
+            if value in self._display_cache
+        )
 
     def _execute(
         self, functions: Sequence[str], target: str
@@ -301,6 +326,9 @@ class DemonstrationBuilder:
             annotated = row.get("target")
         gold_answers = normalize_values(() if annotated is None else annotated)
         if not gold_answers:
+            return []
+        if len(gold_answers) > 100:
+            self.stats["large_answer_row_skipped"] += 1
             return []
         executed_gold = self._execute(plan.executable_functions, plan.target_expression)
         if not executed_gold:
@@ -347,10 +375,11 @@ class DemonstrationBuilder:
                 continue
             within_budget.append(demo)
         demos = within_budget
-        candidate_entities = self._row_candidate_entities(row, plan)
+        candidate_entities = self._row_candidate_entities(row, plan, question_id)
         base_prompt = self._row_base_prompt(row)
         for demo in demos:
             demo.private_metadata["candidate_entities"] = candidate_entities
+            demo.private_metadata["candidate_entity_order"] = "stable_question_hash"
             demo.private_metadata["base_prompt"] = base_prompt
             demo.private_metadata["max_active"] = self.max_active
             demo.private_metadata["max_turns"] = self.max_turns
@@ -501,6 +530,7 @@ class DemonstrationBuilder:
                 tuple(prefix),
                 join.target,
                 prefix_values,
+                denotation_labels=self._display_pairs(prefix_values),
                 relation=option.relation,
                 role="gold" if option.relation == join.relation else "alternative",
                 provenance=(
@@ -591,17 +621,20 @@ class DemonstrationBuilder:
                 hypotheses,
                 question,
                 stat_scope="recovery_probe",
+                require_required_relation=False,
             )
             empty_children = [
                 node_id
                 for node_id in wrong_children
                 if not hypotheses[node_id].denotation
             ]
-            intended_empty = any(
-                hypotheses[node_id].relation == next_join.relation
-                for node_id in empty_children
+            top_probe_failed = any(
+                not hypotheses[node_id].denotation
+                and "policy_choice" in hypotheses[node_id].provenance
+                for node_id in wrong_children
             )
-            if not wrong_children or not intended_empty:
+            if not wrong_children or not top_probe_failed:
+                self.stats["recovery_probe_without_visible_failure"] += 1
                 return self._build_direct_progress_demo(
                     question_id,
                     question,
@@ -614,10 +647,11 @@ class DemonstrationBuilder:
                 )
             active.remove(wrong.hypothesis_id)
             active.extend(wrong_children)
+            self.stats["recovery_probe_visible_empty"] += 1
             steps.append(
                 DemonstrationStep(
                     "Find_relation", (wrong.target_expression,), created,
-                    tuple(wrong_children), ("test_plausible_alternative",),
+                    tuple(wrong_children), ("test_top_ranked_continuation",),
                 )
             )
             for child_id in empty_children:
@@ -632,7 +666,7 @@ class DemonstrationBuilder:
             steps.append(
                 DemonstrationStep(
                     "Select", (gold.hypothesis_id,), tuple(active), (),
-                    ("return_to_preserved_alternative",),
+                    ("return_after_top_probe_failed",),
                 )
             )
             gold_children = self._expand_terminal_frontier(
@@ -827,6 +861,7 @@ class DemonstrationBuilder:
         hypotheses: Dict[str, ExecutedHypothesis],
         question: str,
         stat_scope: str,
+        require_required_relation: bool = True,
     ) -> List[str]:
         options = list(
             self.candidate_provider(question.strip(), parent.function_state, join)
@@ -834,16 +869,19 @@ class DemonstrationBuilder:
             : self.frontier_width
         ]
         self.stats[f"{stat_scope}_decisions"] += 1
-        required = next(
-            (option for option in options if option.relation == join.relation), None
-        )
-        if required is None:
-            self.stats[f"{stat_scope}_proposal_miss"] += 1
-            return []
-        self.stats[f"{stat_scope}_proposal_hit"] += 1
-        self.stats[f"{stat_scope}_gold_rank_{required.rank}"] += 1
-        if required.rank == 1:
-            self.stats[f"{stat_scope}_top1_hit"] += 1
+        if require_required_relation:
+            required = next(
+                (option for option in options if option.relation == join.relation), None
+            )
+            if required is None:
+                self.stats[f"{stat_scope}_proposal_miss"] += 1
+                return []
+            self.stats[f"{stat_scope}_proposal_hit"] += 1
+            self.stats[f"{stat_scope}_gold_rank_{required.rank}"] += 1
+            if required.rank == 1:
+                self.stats[f"{stat_scope}_top1_hit"] += 1
+        else:
+            self.stats[f"{stat_scope}_natural_frontier"] += 1
         children: List[str] = []
         for option in options:
             statement = replace_join_relation(join.raw, option.relation)
@@ -857,12 +895,13 @@ class DemonstrationBuilder:
                 tuple(state),
                 join.target,
                 values,
+                denotation_labels=self._display_pairs(values),
                 relation=option.relation,
                 role="continuation",
                 parent_id=parent.hypothesis_id,
                 depth=parent.depth + 1,
                 provenance=(
-                    "policy_choice" if option.relation == join.relation else "ranked_alternative",
+                    "policy_choice" if option.rank == 1 else "ranked_alternative",
                 ),
             )
             children.append(node_id)
@@ -920,6 +959,7 @@ class DemonstrationBuilder:
                     tuple(state),
                     left_join.target,
                     values,
+                    denotation_labels=self._display_pairs(values),
                     relation=option.relation,
                     role=(
                         "required_branch"
@@ -970,6 +1010,7 @@ class DemonstrationBuilder:
                         tuple(state),
                         join.target,
                         values,
+                        denotation_labels=self._display_pairs(values),
                         relation=option.relation,
                         role=(
                             "required_branch"
@@ -1013,7 +1054,8 @@ class DemonstrationBuilder:
             return None
         combined = ExecutedHypothesis(
             f"H{len(hypotheses)}", tuple(combined_state), combined_target,
-            combined_values, role="combined", parent_id=left.hypothesis_id,
+            combined_values, denotation_labels=self._display_pairs(combined_values),
+            role="combined", parent_id=left.hypothesis_id,
             parent_ids=(left.hypothesis_id, right.hypothesis_id),
             operation="combine", depth=max(left.depth, right.depth) + 1,
             provenance=(f"combined_with:{right.hypothesis_id}",),
@@ -1103,25 +1145,43 @@ class DemonstrationBuilder:
             return ()
         return branches
 
-    @staticmethod
     def _row_candidate_entities(
-        row: Mapping[str, Any], plan: GoldPlan
+        self, row: Mapping[str, Any], plan: GoldPlan, question_id: str
     ) -> List[Tuple[str, str]]:
         extra = row.get("extra_info") or {}
         if isinstance(extra, Mapping):
             entities = extra.get("extracted_entities") or extra.get("candidate_entities")
             if entities:
-                return [(str(item[0]), str(item[-1])) for item in entities if item]
-        values = []
-        for statement in plan.statements:
-            if statement.kind == "start":
-                assignment = _ASSIGNMENT.match(statement.raw)
-                start = _START.match(assignment.group(2)) if assignment else None
-                if start is None:
-                    continue
-                value = start.group(1)
-                values.append((value, value))
-        return values
+                values = [(str(item[0]), str(item[-1])) for item in entities if item]
+            else:
+                values = []
+        else:
+            values = []
+        if not values:
+            for statement in plan.statements:
+                if statement.kind == "start":
+                    assignment = _ASSIGNMENT.match(statement.raw)
+                    start = _START.match(assignment.group(2)) if assignment else None
+                    if start is None:
+                        continue
+                    value = start.group(1)
+                    values.append((value, value))
+
+        unique: Dict[str, str] = {}
+        for name, identity in values:
+            unique.setdefault(identity, name)
+        unresolved = [
+            identity for identity, name in unique.items()
+            if name == identity and (identity.startswith("m.") or identity.startswith("g."))
+        ]
+        if unresolved:
+            self._resolve_display_labels(unresolved)
+            for identity in unresolved:
+                if identity in self._display_cache:
+                    unique[identity] = self._display_cache[identity]
+        ordered = [(name, identity) for identity, name in unique.items()]
+        ordered.sort(key=lambda item: _digest(question_id, item[1]))
+        return ordered
 
     @staticmethod
     def _row_base_prompt(row: Mapping[str, Any]) -> str:
@@ -1326,6 +1386,7 @@ def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
                     # These are ordinary executor observations available at
                     # inference.  The private role (gold/distractor) is omitted.
                     "answer_examples": list(node.denotation[:3]),
+                    "answer_labels": dict(node.denotation_labels),
                     "function_state": list(node.function_state),
                 }
             )
@@ -1360,6 +1421,7 @@ def _public_graph(
                 "node_id": node.hypothesis_id,
                 "function_state": node.function_state,
                 "denotation": node.denotation,
+                "denotation_labels": dict(node.denotation_labels),
                 "parent_id": node.parent_id,
                 "parent_ids": node.parent_ids,
                 "operation": node.operation,
@@ -1382,14 +1444,26 @@ def _public_graph(
 def _action_text(step: DemonstrationStep) -> str:
     if step.action == "Find_relation":
         body = f"Find_relation [ {step.arguments[0]} ]"
-        thought = "I will execute a bounded relation frontier and retain its alternatives."
+        if "test_top_ranked_continuation" in step.rationale_facts:
+            thought = (
+                "I will test this branch's top continuation while its alternatives remain available."
+            )
+        elif "continue_preserved_alternative" in step.rationale_facts:
+            thought = "I will continue the preserved branch after the failed probe."
+        else:
+            thought = "I will execute a bounded relation frontier and retain its alternatives."
     elif step.action == "Combine":
         body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
         thought = "Both active branches express required parts of the question."
     else:
         body = f"{step.action} [ {step.arguments[0]} ]"
         thoughts = {
-            "Select": "I will investigate this hypothesis without discarding the others.",
+            "Select": (
+                "The probe supplied negative evidence, so I will return to a preserved "
+                "alternative."
+                if "return_after_top_probe_failed" in step.rationale_facts
+                else "I will investigate this hypothesis without discarding the others."
+            ),
             "Prune": "This hypothesis has an empty execution result, so it cannot answer the question.",
             "Commit": "This executable hypothesis covers the full question.",
         }

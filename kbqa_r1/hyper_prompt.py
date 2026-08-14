@@ -18,6 +18,7 @@ HyPER-R1 executable hypothesis graph:
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
+- Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
 - The active frontier is bounded. Prune unsupported hypotheses before exploring when it is full.
 Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. After Commit, perform no more graph actions and copy the committed values exactly into <answer>.
 """.rstrip()
@@ -47,8 +48,6 @@ def build_hyper_prompt(
     base_prompt: str = "",
 ) -> str:
     """Build the same student-visible protocol used by SFT and RL datasets."""
-    if base_prompt:
-        return append_hyper_instructions(base_prompt)
     entities = []
     for entity in candidate_entities:
         if not entity:
@@ -57,6 +56,23 @@ def build_hyper_prompt(
         entity_id = str(entity[-1])
         entities.append(f"'{name}' ({entity_id})")
     entity_text = ", ".join(entities) or "none"
+    if base_prompt:
+        candidate_line = f"Candidate Entities: [{entity_text}]"
+        if re.search(r"(?m)^Candidate Entities:\s*.*$", base_prompt):
+            base_prompt = re.sub(
+                r"(?m)^Candidate Entities:\s*.*$",
+                lambda _match: candidate_line,
+                base_prompt,
+                count=1,
+            )
+        else:
+            base_prompt = re.sub(
+                r"(?m)^(Question:\s*)",
+                lambda match: candidate_line + "\n" + match.group(1),
+                base_prompt,
+                count=1,
+            )
+        return append_hyper_instructions(base_prompt)
     prompt = (
         "You are an expert assistant for querying Freebase with executable actions.\n"
         "Find_relation [ source ] opens a question-conditioned relation frontier; "

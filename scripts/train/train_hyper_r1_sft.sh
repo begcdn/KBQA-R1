@@ -30,6 +30,8 @@ if not quality.get("structurally_ready_for_sft", False):
 print("HyPER-R1 corpus passed structural checks.")
 print(json.dumps({
     "accepted_demonstrations": report.get("accepted_demonstrations"),
+    "training_demonstrations": report.get("training_demonstrations"),
+    "validation_rows": report.get("validation_rows"),
     "families": report.get("families"),
     "proposal_recall": report.get("proposal_recall"),
 }, indent=2))

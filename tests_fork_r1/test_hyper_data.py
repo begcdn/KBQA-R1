@@ -40,6 +40,11 @@ def fake_executor(functions, target):
 
 
 def candidates(query, state, join):
+    if "r.alt1" in "\n".join(state):
+        return [
+            RelationOption("r.gold2", 0.90, 1),
+            RelationOption("r.alt2", 0.82, 2),
+        ]
     if join.relation == "r.left":
         return [
             RelationOption("r.left", 0.93, 1),
@@ -166,8 +171,48 @@ def test_builds_replayable_delayed_frontier_recovery():
         "Find_relation", "Select", "Find_relation", "Commit"
     ]
     assert DemonstrationValidator(fake_executor, max_active=6).validate(direct) == []
-    assert builder.stats["recovery_probe_proposal_hit"] == 1
+    assert builder.stats["recovery_probe_natural_frontier"] == 1
+    assert builder.stats["recovery_probe_visible_empty"] == 1
     assert builder.stats["continuation_proposal_hit"] == 1
+
+
+def test_recovery_probe_uses_natural_frontier_without_hidden_gold_injection():
+    row = {
+        "ID": "natural-recovery",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        if "r.dead" in "\n".join(functions):
+            return []
+        return fake_executor(functions, target)
+
+    def provider(query, state, join):
+        if "r.alt1" in "\n".join(state):
+            return [
+                RelationOption("r.dead", 0.91, 1),
+                RelationOption("r.alt2", 0.84, 2),
+            ]
+        return candidates(query, state, join)
+
+    builder = DemonstrationBuilder(executor, provider)
+    recovery = builder.build(row)[0]
+
+    assert recovery.family == "delayed_frontier_recovery"
+    wrong_children = [
+        node for node in recovery.hypotheses.values()
+        if node.parent_id == "H0"
+    ]
+    assert {node.relation for node in wrong_children} == {"r.alt2", "r.dead"}
+    assert all(node.relation != "r.gold2" for node in wrong_children)
+    assert any(step.action == "Prune" for step in recovery.steps)
+    assert DemonstrationValidator(executor, max_active=6).validate(recovery) == []
 
 
 def test_one_hop_frontier_commits_without_ceremonial_select():
@@ -355,6 +400,54 @@ def test_candidate_queries_use_only_question_visible_intent():
     )
 
 
+def test_builder_resolves_entity_labels_and_uses_stable_nonpositional_order():
+    row = {
+        "ID": "readable-roots",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+        "extra_info": {
+            "candidate_entities": [
+                ["m.topic", "m.topic"],
+                ["m.other", "m.other"],
+            ]
+        },
+        "prompt": (
+            "Candidate Entities: ['m.topic' (m.topic), 'm.other' (m.other)]\n"
+            "Question: Which answer follows the intended relation?"
+        ),
+    }
+    labels = {
+        "m.topic": "Topic Entity",
+        "m.other": "Other Entity",
+        "m.gold_prefix": "Answer Entity",
+    }
+    builder = DemonstrationBuilder(
+        fake_executor,
+        one_hop_candidates,
+        entity_display_provider=lambda values: {
+            value: labels[value] for value in values if value in labels
+        },
+    )
+
+    first = builder.build(row)[0]
+    second = builder.build(row)[0]
+    assert first.private_metadata["candidate_entities"] == second.private_metadata[
+        "candidate_entities"
+    ]
+    assert set(first.private_metadata["candidate_entities"]) == {
+        ("Topic Entity", "m.topic"),
+        ("Other Entity", "m.other"),
+    }
+    rendered = str(trajectory_sft_record(first))
+    assert "Topic Entity" in rendered
+    assert "Answer Entity [m.gold_prefix]" in rendered
+    assert "'m.topic' (m.topic)" not in rendered
+
+
 def test_failed_candidate_is_not_misrepresented_as_empty_evidence():
     row = {
         "ID": "execution-failure",
@@ -395,6 +488,26 @@ def test_rejects_rows_without_annotated_answers():
         ],
     }
     assert DemonstrationBuilder(fake_executor, candidates).build(row) == []
+
+
+def test_large_answer_rows_do_not_turn_sft_into_answer_copying():
+    answers = [f"m.answer_{index}" for index in range(101)]
+    row = {
+        "ID": "large-answer",
+        "question": "List every answer.",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": answers,
+    }
+    builder = DemonstrationBuilder(
+        lambda functions, target: answers,
+        one_hop_candidates,
+    )
+
+    assert builder.build(row) == []
+    assert builder.stats["large_answer_row_skipped"] == 1
 
 
 def test_conjunction_requires_both_branches():

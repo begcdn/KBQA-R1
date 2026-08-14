@@ -12,8 +12,17 @@ from kbqa_r1.hyper_r1 import (
     enforce_commit_reward,
     dependency_function_state,
     graph_action_token_mask,
+    result_denotation_values,
     required_hyper_relation_model,
 )
+
+
+def test_execution_results_keep_identity_separate_from_display_label():
+    rows = [{"x": "m.answer", "name": "Readable Answer"}]
+
+    assert result_denotation_values(rows, ["x:m.answer (Readable Answer)"]) == (
+        "m.answer",
+    )
 
 
 def test_hyper_runtime_requires_explicit_relation_ranker():
@@ -220,6 +229,25 @@ def test_serialization_exposes_compact_executable_state():
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
     assert "Actions: Select, Find_relation [ source ], Combine, Prune, or Commit" in text
+
+
+def test_serialization_pairs_readable_labels_with_stable_entity_ids():
+    graph = HypothesisGraph(max_active=3)
+    node = graph.add_executed(
+        sample_id=0,
+        function_state=("expression1 = JOIN('r.answer', expression1)",),
+        target_expression="expression1",
+        sexpr="(JOIN r.answer m.topic)",
+        denotation=["m.answer"],
+        denotation_labels={"m.answer": "Readable Answer"},
+        parent_id=None,
+        operation="expand",
+        relation_id="r.answer",
+    )
+
+    text = graph.serialize(0)
+    assert node.denotation == ("m.answer",)
+    assert "Readable Answer [m.answer]" in text
 
 
 def test_expanding_parent_frees_one_frontier_slot_but_keeps_history():

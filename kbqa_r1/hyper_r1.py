@@ -51,6 +51,7 @@ class HypothesisNode:
     denotation: Tuple[str, ...]
     parent_id: Optional[str]
     operation: str
+    denotation_labels: Dict[str, str] = field(default_factory=dict)
     parent_ids: Tuple[str, ...] = ()
     relation_id: Optional[str] = None
     relation_prompt: Optional[str] = None
@@ -84,6 +85,54 @@ def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(sorted(set(normalized)))
+
+
+def normalize_display_labels(labels: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """Keep only useful executor-owned labels for public graph observations."""
+    normalized: Dict[str, str] = {}
+    for identity, label in (labels or {}).items():
+        key = str(identity).strip()
+        value = str(label).strip()
+        if key and value and value != key:
+            normalized[key] = value
+    return normalized
+
+
+def result_display_labels(results: Any) -> Dict[str, str]:
+    """Extract entity labels already returned by the executable SPARQL query."""
+    labels: Dict[str, str] = {}
+    rows = results if isinstance(results, list) else [results]
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        identity = row.get("x")
+        label = row.get("name") or row.get("label")
+        if identity is not None and label is not None:
+            labels[str(identity).strip()] = str(label).strip()
+    return normalize_display_labels(labels)
+
+
+def result_denotation_values(results: Any, fallback: Iterable[str] = ()) -> Tuple[str, ...]:
+    """Keep executor identities separate from optional human-readable labels."""
+    values: List[str] = []
+    rows = results if isinstance(results, list) else [results]
+    for row in rows:
+        if isinstance(row, Mapping) and row.get("x") is not None:
+            values.append(str(row["x"]))
+    return normalize_denotation(values if values else fallback)
+
+
+_MID_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*:)?([mg]\.[A-Za-z0-9_]+)")
+
+
+def _display_answer(value: str, labels: Mapping[str, str]) -> str:
+    text = str(value)
+    match = _MID_RE.search(text)
+    identity = match.group(1) if match else text
+    label = labels.get(text) or labels.get(identity)
+    if not label:
+        return text
+    return f"{label} [{identity}]"
 
 
 def extract_answer_values(text: str) -> Tuple[str, ...]:
@@ -148,7 +197,10 @@ def serialize_frontier(
         if node_id not in visible:
             continue
         denotation = normalize_denotation(node.get("denotation", ()))
-        answers = ", ".join(denotation[:max_answers]) or "empty"
+        labels = normalize_display_labels(node.get("denotation_labels", {}))
+        answers = ", ".join(
+            _display_answer(value, labels) for value in denotation[:max_answers]
+        ) or "empty"
         if len(denotation) > max_answers:
             answers += f", ... (+{len(denotation) - max_answers})"
         status = "committed" if node_id == committed_id else "active"
@@ -309,6 +361,7 @@ class HypothesisGraph:
         parent_id: Optional[str],
         parent_ids: Sequence[str] = (),
         operation: str,
+        denotation_labels: Optional[Mapping[str, str]] = None,
         relation_id: Optional[str] = None,
         relation_prompt: Optional[str] = None,
         resolver_score: float = 0.0,
@@ -341,6 +394,7 @@ class HypothesisGraph:
             target_expression=str(target_expression),
             sexpr=str(sexpr),
             denotation=normalize_denotation(denotation),
+            denotation_labels=normalize_display_labels(denotation_labels),
             parent_id=parent_id,
             parent_ids=all_parent_ids,
             operation=str(operation),
@@ -636,6 +690,7 @@ class HypothesisGraph:
                     **node.__dict__,
                     "function_state": list(node.function_state),
                     "denotation": list(node.denotation),
+                    "denotation_labels": dict(node.denotation_labels),
                     "parent_ids": list(node.parent_ids),
                     "status": node.status.value,
                 }

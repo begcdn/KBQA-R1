@@ -16,6 +16,8 @@ from verl import DataProto
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
+                              result_denotation_values,
+                              result_display_labels,
                               required_hyper_relation_model)
 from kbqa_r1.hyper_prompt import extract_hyper_question
 
@@ -443,7 +445,8 @@ class SExprLLMGenerationManager:
                     function_state=state,
                     target_expression=target,
                     sexpr=sexpr_result.sexpr,
-                    denotation=mids,
+                    denotation=result_denotation_values(execution.results, mids),
+                    denotation_labels=result_display_labels(execution.results),
                     parent_id=left.node_id,
                     parent_ids=(left.node_id, right.node_id),
                     operation="combine",
@@ -566,7 +569,8 @@ class SExprLLMGenerationManager:
             function_state=branch_state,
             target_expression=target,
             sexpr=sexpr_result.sexpr,
-            denotation=mid_list,
+            denotation=result_denotation_values(execution_result.results, mid_list),
+            denotation_labels=result_display_labels(execution_result.results),
             parent_id=parent_id,
             operation=operation,
             relation_id=relation_id,
@@ -627,7 +631,12 @@ class SExprLLMGenerationManager:
                     function_state=alternative_branch_state,
                     target_expression=alternative_target,
                     sexpr=alternative_sexpr.sexpr,
-                    denotation=alternative_mids,
+                    denotation=result_denotation_values(
+                        alternative_execution.results, alternative_mids
+                    ),
+                    denotation_labels=result_display_labels(
+                        alternative_execution.results
+                    ),
                     parent_id=parent_id,
                     operation="expand",
                     relation_id=candidate.relation,

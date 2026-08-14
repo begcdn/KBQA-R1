@@ -7,8 +7,11 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+import hashlib
+import math
 import json
 from pathlib import Path
+import re
 import sys
 import threading
 from typing import Any, Iterable, List, Sequence
@@ -90,13 +93,79 @@ def _curriculum_take(demos, limit: int):
     return selected
 
 
-class LiveProgramExecutor:
+def _question_split(question_id: str) -> str:
+    """Deterministic 95/5 split that keeps every trajectory for a question together."""
+    bucket = int(hashlib.sha256(str(question_id).encode()).hexdigest()[:8], 16) % 20
+    return "validation" if bucket == 0 else "train"
+
+
+class LiveEntityDisplayProvider:
+    """Cache readable labels while preserving MIDs as executable identities."""
+
+    _MID = re.compile(r"^[mg]\.[A-Za-z0-9_]+$")
+
     def __init__(self, config: Any):
+        from kbqa_r1.sparql.sparql_manager import SPARQLExecutionManager
+
+        self.manager = SPARQLExecutionManager(config)
+        self._cache = {}
+        self._attempted = set()
+        self._lock = threading.RLock()
+
+    def remember(self, results: Any) -> None:
+        rows = results if isinstance(results, list) else [results]
+        with self._lock:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                identity = row.get("x")
+                label = row.get("name") or row.get("label")
+                if identity and label and str(identity) != str(label):
+                    self._cache[str(identity)] = str(label)
+
+    def __call__(self, values: Sequence[str]):
+        identities = [str(value) for value in values]
+        with self._lock:
+            missing = [
+                value for value in identities
+                if self._MID.fullmatch(value)
+                and value not in self._cache
+                and value not in self._attempted
+            ]
+            self._attempted.update(missing)
+            if missing:
+                terms = " ".join(f"ns:{value}" for value in missing)
+                query = f"""SPARQL
+PREFIX ns: <http://rdf.freebase.com/ns/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?x ?name WHERE {{
+  VALUES ?x {{ {terms} }}
+  OPTIONAL {{ ?x rdfs:label ?name . FILTER(langMatches(lang(?name), 'en')) }}
+}}"""
+                payload = self.manager.execute_batch([query])
+                envelope = (payload.get("results") or [{}])[0] or {}
+                self.remember(envelope.get("results") or [])
+
+            for identity in identities:
+                if identity in self._cache:
+                    continue
+                if not self._MID.fullmatch(identity) and "." in identity:
+                    self._cache[identity] = identity.rsplit(".", 1)[-1].replace("_", " ")
+            return {
+                identity: self._cache[identity]
+                for identity in identities
+                if identity in self._cache
+            }
+
+
+class LiveProgramExecutor:
+    def __init__(self, config: Any, display_provider: LiveEntityDisplayProvider):
         from kbqa_r1.sexpr.sexpr_executor import SExprExecutor
         from kbqa_r1.sexpr.sexpr_generator import SExprGenerator
 
         self.generator = SExprGenerator()
         self.executor = SExprExecutor(config, dataset_type="grailqa")
+        self.display_provider = display_provider
 
     def __call__(self, functions: Sequence[str], target: str) -> Iterable[str]:
         generated = self.generator.generate_sexpr_from_strings(list(functions), target)
@@ -107,6 +176,7 @@ class LiveProgramExecutor:
         )
         if not executed.is_successful:
             raise ProgramExecutionError(executed.error_message)
+        self.display_provider.remember(executed.results)
         return _flatten_results(executed.results)
 
 
@@ -176,7 +246,8 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     odbc = ODBCConfig.from_env()
     config = SPARQLConfig(use_odbc=True, odbc_config=asdict(odbc))
-    executor = LiveProgramExecutor(config)
+    display_provider = LiveEntityDisplayProvider(config)
+    executor = LiveProgramExecutor(config, display_provider)
     retrieval = RelationRetrieval(
         relation_config={
             "relation_topk": args.relation_topk,
@@ -198,6 +269,7 @@ def main() -> None:
             max_active=args.max_active,
             frontier_width=args.frontier_width,
             max_turns=args.max_turns,
+            entity_display_provider=display_provider,
         )
         demonstrations = builder.build(row)
         validator = DemonstrationValidator(
@@ -304,23 +376,47 @@ def main() -> None:
     with (output / "trajectory_sft.jsonl").open("w", encoding="utf-8") as handle:
         for record in trajectory_rows:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    train_pairs = [
+        (demo, row) for demo, row in zip(demonstrations, trajectory_rows)
+        if _question_split(demo.question_id) == "train"
+    ]
+    validation_pairs = [
+        (demo, row) for demo, row in zip(demonstrations, trajectory_rows)
+        if _question_split(demo.question_id) == "validation"
+    ]
+    train_demonstrations = [demo for demo, _ in train_pairs]
+    validation_demonstrations = [demo for demo, _ in validation_pairs]
+    train_rows = [row for _, row in train_pairs]
+    validation_rows = [row for _, row in validation_pairs]
+    for name, rows_for_split in (
+        ("train_trajectory_sft.jsonl", train_rows),
+        ("validation_trajectory_sft.jsonl", validation_rows),
+    ):
+        with (output / name).open("w", encoding="utf-8") as handle:
+            for record in rows_for_split:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     try:
         from datasets import Dataset
 
-        Dataset.from_list(trajectory_rows).to_parquet(str(output / "train.parquet"))
+        Dataset.from_list(train_rows).to_parquet(str(output / "train.parquet"))
+        if validation_rows:
+            Dataset.from_list(validation_rows).to_parquet(
+                str(output / "validation.parquet")
+            )
         parquet_written = True
     except ImportError:
         parquet_written = False
 
-    families = Counter(demo.family for demo in demonstrations)
+    families = Counter(demo.family for demo in train_demonstrations)
+    validation_families = Counter(demo.family for demo in validation_demonstrations)
     qualified_families = Counter(demo.family for demo in unique_qualified)
     gold_ranks = Counter(
         str(demo.private_metadata["gold_rank"])
-        for demo in demonstrations
+        for demo in train_demonstrations
         if demo.private_metadata.get("gold_rank") is not None
     )
     source_types = Counter()
-    for demo in demonstrations:
+    for demo in train_demonstrations:
         for step in demo.steps:
             if step.action != "Find_relation":
                 continue
@@ -346,17 +442,71 @@ def main() -> None:
     )
     margins = [
         float(demo.private_metadata["gold_vs_best_alternative_margin"])
-        for demo in demonstrations
+        for demo in train_demonstrations
         if demo.private_metadata.get("gold_vs_best_alternative_margin") is not None
     ]
-    hypothesis_nodes = [node for demo in demonstrations for node in demo.hypotheses.values()]
+    hypothesis_nodes = [
+        node for demo in train_demonstrations for node in demo.hypotheses.values()
+    ]
+    visible_mid_count = 0
+    labeled_mid_count = 0
+    for node in hypothesis_nodes:
+        labels = dict(node.denotation_labels)
+        for identity in node.denotation[:4]:
+            if LiveEntityDisplayProvider._MID.fullmatch(identity):
+                visible_mid_count += 1
+                labeled_mid_count += int(identity in labels)
+    candidate_mid_count = 0
+    candidate_labeled_count = 0
+    conjunction_source_positions = Counter()
+    ambiguous_frontiers = 0
+    for demo in train_demonstrations:
+        candidates = list(demo.private_metadata.get("candidate_entities", ()))
+        candidate_ids = [str(entity[-1]) for entity in candidates if entity]
+        for entity in candidates:
+            if not entity:
+                continue
+            name, identity = str(entity[0]), str(entity[-1])
+            if LiveEntityDisplayProvider._MID.fullmatch(identity):
+                candidate_mid_count += 1
+                candidate_labeled_count += int(name != identity)
+        if demo.family == "conjunction":
+            roots = [
+                str(step.arguments[0])
+                for step in demo.steps
+                if step.action == "Find_relation"
+                and not str(step.arguments[0]).startswith("expression")
+            ]
+            positions = tuple(
+                candidate_ids.index(root) for root in roots if root in candidate_ids
+            )
+            if positions:
+                conjunction_source_positions[str(positions)] += 1
+        initial = demo.steps[0].created if demo.steps else ()
+        if sum(
+            demo.hypotheses[node_id].denotation == demo.gold_answers
+            for node_id in initial
+        ) > 1:
+            ambiguous_frontiers += 1
     serialized_trajectories = [
         json.dumps(row["messages"], sort_keys=True, ensure_ascii=True)
-        for row in trajectory_rows
+        for row in train_rows
     ]
     duplicate_rate = (
         1 - len(set(serialized_trajectories)) / len(serialized_trajectories)
         if serialized_trajectories else None
+    )
+    recovery_count = families.get("delayed_frontier_recovery", 0)
+    minimum_recoveries = max(100, math.ceil(0.01 * len(train_demonstrations)))
+    entity_display_total = visible_mid_count + candidate_mid_count
+    entity_display_labeled = labeled_mid_count + candidate_labeled_count
+    entity_display_rate = (
+        entity_display_labeled / entity_display_total
+        if entity_display_total else 1.0
+    )
+    varied_conjunction_order = (
+        len(conjunction_source_positions) >= 2
+        if families.get("conjunction", 0) >= 2 else True
     )
     quality_checks = {
         "all_saved_trajectories_replay": True,
@@ -364,17 +514,20 @@ def main() -> None:
             families.get("frontier_commit", 0)
             or families.get("direct_frontier_progress", 0)
         ),
-        "contains_real_recovery": families.get("delayed_frontier_recovery", 0) > 0,
+        "recovery_skill_has_training_mass": recovery_count >= minimum_recoveries,
         "contains_required_conjunction": families.get("conjunction", 0) > 0,
         "natural_frontier_has_non_top1_gold": any(
             int(rank) > 1 and count > 0 for rank, count in gold_ranks.items()
         ),
         "no_exact_duplicate_trajectories": duplicate_rate == 0.0,
+        "readable_entity_evidence": entity_display_rate >= 0.95,
+        "conjunction_roots_are_not_position_fixed": varied_conjunction_order,
     }
     report = {
         "input": args.input,
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
+        "training_demonstrations": len(train_demonstrations),
         "qualified_before_balancing": len(qualified),
         "qualified_after_exact_deduplication": len(unique_qualified),
         "curriculum_selection": (
@@ -382,6 +535,7 @@ def main() -> None:
             "cap repetitive one-hop commits at the informative-trajectory count"
         ),
         "families": dict(sorted(families.items())),
+        "validation_families": dict(sorted(validation_families.items())),
         "qualified_families_before_balancing": dict(sorted(qualified_families.items())),
         "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
         "find_relation_source_types": dict(sorted(source_types.items())),
@@ -392,7 +546,9 @@ def main() -> None:
         "maximum_selected_trajectory_turns": max(
             (len(demo.steps) + 1 for demo in demonstrations), default=0
         ),
-        "sft_rows": len(trajectory_rows),
+        "sft_rows": len(train_rows),
+        "validation_rows": len(validation_rows),
+        "question_disjoint_split": "sha256_question_id_95_5",
         "train_parquet_written": parquet_written,
         "skipped": dict(sorted(skipped.items())),
         "proposal_statistics": proposal_stats,
@@ -424,7 +580,12 @@ def main() -> None:
                 if continuation_total else None
             ),
             "recovery_probe_at_frontier": (
-                proposal_stats.get("recovery_probe_proposal_hit", 0)
+                proposal_stats.get("recovery_probe_natural_frontier", 0)
+                / recovery_probe_total
+                if recovery_probe_total else None
+            ),
+            "recovery_probe_visible_failure": (
+                proposal_stats.get("recovery_probe_visible_empty", 0)
                 / recovery_probe_total
                 if recovery_probe_total else None
             ),
@@ -450,12 +611,44 @@ def main() -> None:
             sum(not node.denotation for node in hypothesis_nodes) / len(hypothesis_nodes)
             if hypothesis_nodes else None
         ),
+        "entity_display": {
+            "labeled_mid_rate": entity_display_rate,
+            "labeled_mids": entity_display_labeled,
+            "visible_mids": entity_display_total,
+            "candidate_labeled_mids": candidate_labeled_count,
+            "candidate_mids": candidate_mid_count,
+            "denotation_labeled_mids": labeled_mid_count,
+            "denotation_mids": visible_mid_count,
+        },
+        "candidate_entity_order": {
+            "method": "stable_question_hash",
+            "conjunction_source_position_patterns": dict(
+                sorted(conjunction_source_positions.items())
+            ),
+        },
+        "denotational_ambiguity": {
+            "frontiers_with_multiple_gold_answer_sets": ambiguous_frontiers,
+            "rate": (
+                ambiguous_frontiers / len(train_demonstrations)
+                if train_demonstrations else None
+            ),
+            "interpretation": (
+                "Answer equality is diagnostic only; it does not turn a different "
+                "relation path into an additional semantic positive."
+            ),
+        },
         "exact_duplicate_trajectory_rate": (
             duplicate_rate
         ),
         "exact_duplicate_trajectories_removed": duplicates_removed,
         "actions": dict(
-            sorted(Counter(step.action for demo in demonstrations for step in demo.steps).items())
+            sorted(
+                Counter(
+                    step.action
+                    for demo in train_demonstrations
+                    for step in demo.steps
+                ).items()
+            )
         ),
         "teacher_action_selection_uses_gold_program": True,
         "retrieval_intent_source": "question_and_visible_state_only",
@@ -465,10 +658,11 @@ def main() -> None:
         "quality_assessment": {
             "structurally_ready_for_sft": all(quality_checks.values()),
             "checks": quality_checks,
+            "minimum_recovery_trajectories": minimum_recoveries,
             "note": (
-                "Validity failures block export. Structural readiness does not impose "
-                "an arbitrary sample-size threshold; inspect the reported family counts "
-                "and natural-frontier recall before starting expensive SFT."
+                "Validity failures block export. Expensive SFT additionally requires "
+                "readable entity evidence, non-positional conjunction roots, and enough "
+                "verified recovery trajectories to teach the method-specific behavior."
             ),
         },
     }
