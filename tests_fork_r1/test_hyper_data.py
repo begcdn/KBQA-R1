@@ -554,6 +554,73 @@ def test_conjunction_requires_both_branches():
     )
 
 
+def test_failed_conjunction_is_not_relabelled_as_complete_linear_branch():
+    row = {
+        "ID": "missing-conjunction-frontier",
+        "question": "Which entity satisfies both conditions?",
+        "function_list": [
+            "expression0 = START('m.topic')",
+            "expression1 = JOIN('r.left', expression0)",
+            "expression2 = JOIN('r.right', expression0)",
+            "expression3 = AND(expression1, expression2)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def misses_right_relation(query, state, join):
+        return [
+            RelationOption("r.left", 0.93, 1),
+            RelationOption("r.unrelated", 0.88, 2),
+        ]
+
+    demos = DemonstrationBuilder(fake_executor, misses_right_relation).build(row)
+
+    assert demos == []
+
+
+def test_failed_multihop_conjunction_does_not_export_either_partial_branch():
+    row = {
+        "ID": "missing-multihop-conjunction",
+        "question": "Which answer follows both the direct and described conditions?",
+        "function_list": [
+            "expression = START('m.direct')",
+            "expression = JOIN('r.right', expression)",
+            "expression1 = START('m.description')",
+            "expression1 = JOIN('r.clue', expression1)",
+            "expression1 = JOIN('r.left', expression1)",
+            "expression = AND(expression1, expression)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.shared"]
+        if "r.right" in text:
+            return ["m.shared"]
+        if "r.left" in text and "r.clue" in text:
+            return ["m.shared"]
+        if "r.clue" in text:
+            return ["m.prefix"]
+        return ["m.other"]
+
+    def misses_full_conjunction(query, state, join):
+        if join.relation == "r.clue":
+            return [
+                RelationOption("r.clue", 0.9, 1),
+                RelationOption("r.other", 0.8, 2),
+            ]
+        return [
+            RelationOption("r.right", 0.9, 1),
+            RelationOption("r.other", 0.8, 2),
+        ]
+
+    demos = DemonstrationBuilder(executor, misses_full_conjunction).build(row)
+
+    assert demos == []
+
+
 def test_answer_type_and_is_not_used_as_a_conjunction_lesson():
     row = {
         "ID": "answer-type",

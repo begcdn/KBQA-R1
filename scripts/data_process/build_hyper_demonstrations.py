@@ -194,6 +194,40 @@ def _frontier_difficulty_by_family(demonstrations):
     return dict(sorted(report.items()))
 
 
+_GENERIC_ENTITY_TYPES = {
+    "common.topic",
+    "type.object",
+    "type.type",
+    "base.type_ontology.inanimate",
+    "base.type_ontology.non_agent",
+    "base.type_ontology.physically_instantiable",
+}
+
+
+def _readable_type_descriptor(type_ids: Sequence[str]):
+    """Describe an unnamed MID by its most useful asserted Freebase type."""
+    candidates = {
+        str(type_id).strip()
+        for type_id in type_ids
+        if str(type_id).strip() and str(type_id).strip() not in _GENERIC_ENTITY_TYPES
+    }
+    if not candidates:
+        return None
+
+    def priority(type_id: str):
+        if type_id.startswith("user."):
+            namespace = 2
+        elif type_id.startswith("base."):
+            namespace = 1
+        else:
+            namespace = 0
+        return namespace, len(type_id), type_id
+
+    chosen = min(candidates, key=priority)
+    kind = chosen.rsplit(".", 1)[-1].replace("_", " ").strip()
+    return f"unnamed {kind}" if kind else None
+
+
 class LiveEntityDisplayProvider:
     """Cache readable labels while preserving MIDs as executable identities."""
 
@@ -204,11 +238,13 @@ class LiveEntityDisplayProvider:
 
         self.manager = SPARQLExecutionManager(config)
         self._cache = {}
+        self._descriptor_ids = set()
         self._attempted = set()
         self._lock = threading.RLock()
 
     def remember(self, results: Any) -> None:
         rows = results if isinstance(results, list) else [results]
+        types = {}
         with self._lock:
             for row in rows:
                 if not isinstance(row, dict):
@@ -217,6 +253,20 @@ class LiveEntityDisplayProvider:
                 label = row.get("name") or row.get("label")
                 if identity and label and str(identity) != str(label):
                     self._cache[str(identity)] = str(label)
+                    self._descriptor_ids.discard(str(identity))
+                if identity and row.get("type"):
+                    types.setdefault(str(identity), set()).add(str(row["type"]))
+            for identity, type_ids in types.items():
+                if identity in self._cache:
+                    continue
+                descriptor = _readable_type_descriptor(tuple(type_ids))
+                if descriptor:
+                    self._cache[identity] = descriptor
+                    self._descriptor_ids.add(identity)
+
+    def is_type_descriptor(self, identity: str) -> bool:
+        with self._lock:
+            return str(identity) in self._descriptor_ids
 
     def __call__(self, values: Sequence[str]):
         identities = [str(value) for value in values]
@@ -233,9 +283,10 @@ class LiveEntityDisplayProvider:
                 query = f"""SPARQL
 PREFIX ns: <http://rdf.freebase.com/ns/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?x ?name WHERE {{
+SELECT ?x ?name ?type WHERE {{
   VALUES ?x {{ {terms} }}
   OPTIONAL {{ ?x rdfs:label ?name . FILTER(langMatches(lang(?name), 'en')) }}
+  OPTIONAL {{ ?x ns:type.object.type ?type . }}
 }}"""
                 payload = self.manager.execute_batch([query])
                 envelope = (payload.get("results") or [{}])[0] or {}
@@ -545,14 +596,19 @@ def main() -> None:
     ]
     visible_mid_count = 0
     labeled_mid_count = 0
+    descriptor_mid_count = 0
     for node in hypothesis_nodes:
         labels = dict(node.denotation_labels)
         for identity in node.denotation[:4]:
             if LiveEntityDisplayProvider._MID.fullmatch(identity):
                 visible_mid_count += 1
                 labeled_mid_count += int(identity in labels)
+                descriptor_mid_count += int(
+                    identity in labels and display_provider.is_type_descriptor(identity)
+                )
     candidate_mid_count = 0
     candidate_labeled_count = 0
+    candidate_descriptor_count = 0
     conjunction_source_positions = Counter()
     for demo in train_demonstrations:
         candidates = list(demo.private_metadata.get("candidate_entities", ()))
@@ -564,6 +620,9 @@ def main() -> None:
             if LiveEntityDisplayProvider._MID.fullmatch(identity):
                 candidate_mid_count += 1
                 candidate_labeled_count += int(name != identity)
+                candidate_descriptor_count += int(
+                    name != identity and display_provider.is_type_descriptor(identity)
+                )
         if demo.family == "conjunction":
             roots = [
                 str(step.arguments[0])
@@ -595,6 +654,7 @@ def main() -> None:
     minimum_recoveries = max(100, math.ceil(0.01 * multi_hop_count))
     entity_display_total = visible_mid_count + candidate_mid_count
     entity_display_labeled = labeled_mid_count + candidate_labeled_count
+    entity_display_described = descriptor_mid_count + candidate_descriptor_count
     entity_display_rate = (
         entity_display_labeled / entity_display_total
         if entity_display_total else 1.0
@@ -715,6 +775,8 @@ def main() -> None:
             "labeled_mid_rate": entity_display_rate,
             "labeled_mids": entity_display_labeled,
             "visible_mids": entity_display_total,
+            "named_mids": entity_display_labeled - entity_display_described,
+            "typed_descriptor_mids": entity_display_described,
             "candidate_labeled_mids": candidate_labeled_count,
             "candidate_mids": candidate_mid_count,
             "denotation_labeled_mids": labeled_mid_count,

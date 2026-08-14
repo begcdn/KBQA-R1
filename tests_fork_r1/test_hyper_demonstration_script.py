@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import threading
 
 from kbqa_r1.hyper_data import (
     DemonstrationStep,
@@ -78,6 +79,30 @@ def test_decision_consistency_detects_conflicting_actions_for_same_state():
 
     assert result["decision_states"] == 1
     assert result["contradictory_states"] == 1
+
+
+def test_unnamed_entity_uses_specific_type_without_claiming_a_name():
+    assert MODULE._readable_type_descriptor(
+        ["common.topic", "food.cheese"]
+    ) == "unnamed cheese"
+    assert MODULE._readable_type_descriptor(
+        ["common.topic", "base.type_ontology.inanimate"]
+    ) is None
+
+
+def test_entity_display_provider_prefers_real_name_over_type_descriptor():
+    provider = object.__new__(MODULE.LiveEntityDisplayProvider)
+    provider._cache = {}
+    provider._descriptor_ids = set()
+    provider._lock = threading.RLock()
+
+    provider.remember([{"x": "m.entity", "type": "food.cheese"}])
+    assert provider._cache["m.entity"] == "unnamed cheese"
+    assert provider.is_type_descriptor("m.entity")
+
+    provider.remember([{"x": "m.entity", "name": "Brie", "type": "food.cheese"}])
+    assert provider._cache["m.entity"] == "Brie"
+    assert not provider.is_type_descriptor("m.entity")
 
 
 def test_frontier_diagnostics_inspect_continuation_frontiers():

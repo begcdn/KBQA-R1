@@ -40,8 +40,11 @@ The proposal query contains only the immutable question and the visible
 executable state. Gold programs choose and verify teacher actions but never add
 a missed relation to a frontier. Entity evidence is serialized as readable
 `label [MID]` pairs: labels support semantic decisions while MIDs preserve exact
-Freebase identity. Candidate roots are placed in a stable question-hash order,
-so their list position cannot reveal which gold branch should be opened first.
+Freebase identity. When Freebase has no English name, the serializer uses an
+explicit type descriptor such as `unnamed cheese [MID]` rather than inventing a
+name; reports count names and type fallbacks separately. Candidate roots are
+placed in a stable question-hash order, so their list position cannot reveal
+which gold branch should be opened first.
 
 The retained trajectory families teach distinct policy behavior:
 
@@ -59,7 +62,9 @@ The retained trajectory families teach distinct policy behavior:
 Each complete student-visible observation has one teacher action. Recovery
 examples are not paired with direct-progress twins from the identical frontier;
 that would train contradictory choices at the decision where the method is
-supposed to learn whether to investigate or proceed.
+supposed to learn whether to investigate or proceed. Likewise, if a required
+conjunction frontier cannot be built, none of its individual branches is
+relabelled as a complete question-answering trajectory.
 
 The builder round-robins these families before filling the remaining corpus so
 easy one-hop commits cannot erase the method-specific behavior. Exported

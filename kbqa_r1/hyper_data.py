@@ -338,16 +338,15 @@ class DemonstrationBuilder:
         intersection_demos: List[HyperDemonstration] = []
         semantic_branch_indexes = set()
         for combine in plan.intersections:
+            semantic_branch_indexes.update(
+                self._semantic_intersection_join_indexes(plan, combine)
+            )
             demo = self._build_intersection_demo(
                 question_id, question, plan, combine, gold_answers
             )
             if demo is None:
                 continue
             intersection_demos.append(demo)
-            semantic_branch_indexes.update(
-                statement.index
-                for statement in self._immediate_intersection_branches(plan, combine)
-            )
 
         demos: List[HyperDemonstration] = []
         joins = list(plan.joins)
@@ -1042,6 +1041,27 @@ class DemonstrationBuilder:
         ):
             return ()
         return branches
+
+    def _semantic_intersection_join_indexes(
+        self, plan: GoldPlan, combine: ProgramStatement
+    ) -> Tuple[int, ...]:
+        """Return every JOIN that belongs to a real two-branch intersection."""
+        branches = self._immediate_intersection_branches(plan, combine)
+        if len(branches) != 2:
+            return ()
+        indexes = set()
+
+        def visit(statement: ProgramStatement) -> None:
+            if statement.kind == "join":
+                indexes.add(statement.index)
+            for source in statement.sources:
+                dependency = self._definition_before(plan, source, statement.index)
+                if dependency is not None:
+                    visit(dependency)
+
+        for branch in branches:
+            visit(branch)
+        return tuple(sorted(indexes))
 
     def _row_candidate_entities(
         self, row: Mapping[str, Any], plan: GoldPlan, question_id: str
