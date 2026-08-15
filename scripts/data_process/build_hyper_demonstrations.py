@@ -585,11 +585,13 @@ def main() -> None:
         if demo.private_metadata.get("gold_rank") is not None
     )
     source_types = Counter()
+    runtime_incompatible_expression_sources = 0
     for demo in train_demonstrations:
         for step in demo.steps:
-            if step.action != "Find_relation":
+            if step.action not in {"Find_relation", "Widen"}:
                 continue
             source = str(step.arguments[0])
+            runtime_incompatible_expression_sources += int(source == "expression")
             if source.startswith("expression"):
                 source_types["expression"] += 1
             elif source.startswith("m.") or source.startswith("g."):
@@ -711,6 +713,9 @@ def main() -> None:
         "no_exact_duplicate_trajectories": duplicate_rate == 0.0,
         "readable_entity_evidence": entity_display_rate >= 0.95,
         "conjunction_roots_are_not_position_fixed": varied_conjunction_order,
+        "all_expression_sources_match_runtime_vocabulary": (
+            runtime_incompatible_expression_sources == 0
+        ),
         "no_conflicting_teacher_actions_for_same_observation": (
             decision_consistency["contradictory_states"] == 0
         ),
@@ -732,6 +737,9 @@ def main() -> None:
         "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
         "gold_rank_by_family": family_difficulty,
         "find_relation_source_types": dict(sorted(source_types.items())),
+        "runtime_incompatible_expression_sources": (
+            runtime_incompatible_expression_sources
+        ),
         "frontier_width": args.frontier_width,
         "max_frontier_width": args.max_frontier_width,
         "max_active": args.max_active,
