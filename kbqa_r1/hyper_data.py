@@ -77,52 +77,97 @@ class ProgramExecutionError(RuntimeError):
 
 
 def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
-    """Compile the initial HyPER-R1 action subset: START, JOIN, AND, STOP."""
+    """Compile START/JOIN/AND/STOP into runtime-compatible expression names."""
+    raw_functions = [str(value).strip() for value in function_list]
+    has_bare_expression = any(
+        re.search(r"\bexpression\b", raw) for raw in raw_functions
+    )
     statements: List[ProgramStatement] = []
     executable: List[str] = []
     defined = set()
+    expression_names: Dict[str, str] = (
+        {"expression": "expression1"} if has_bare_expression else {}
+    )
     final_target: Optional[str] = None
     stopped = False
 
-    for index, raw_value in enumerate(function_list):
-        raw = str(raw_value).strip()
+    def expression_name(source_name: str) -> str:
+        if not has_bare_expression:
+            return source_name
+        if source_name not in expression_names:
+            expression_names[source_name] = f"expression{len(expression_names) + 1}"
+        return expression_names[source_name]
+
+    for index, raw in enumerate(raw_functions):
         if stopped:
             raise IneligibleProgram("STOP must be the terminal statement")
         match = _ASSIGNMENT.match(raw)
         if not match:
             raise IneligibleProgram(f"invalid function statement at {index}: {raw}")
-        target, rhs = match.groups()
+        source_target, rhs = match.groups()
+        target = expression_name(source_target)
 
         start = _START.match(rhs)
         join = _JOIN.match(rhs)
         combine = _AND.match(rhs)
         stop = _STOP.match(rhs)
         if start:
-            statement = ProgramStatement(index, target, "start", (), None, raw)
+            entity = start.group(1)
+            canonical_raw = f"{target} = START('{entity}')"
+            statement = ProgramStatement(
+                index, target, "start", (), None, canonical_raw
+            )
         elif join:
             relation, source = join.groups()
-            sources = (source,) if source.startswith("expression") else ()
-            statement = ProgramStatement(index, target, "join", sources, relation, raw)
+            if source.startswith("expression"):
+                if source not in defined:
+                    raise IneligibleProgram(
+                        f"statement {index} references undefined {[source]}"
+                    )
+                canonical_source = expression_name(source)
+                sources = (canonical_source,)
+            else:
+                canonical_source = source
+                sources = ()
+            canonical_raw = (
+                f"{target} = JOIN('{relation}', {canonical_source})"
+            )
+            statement = ProgramStatement(
+                index, target, "join", sources, relation, canonical_raw
+            )
         elif combine:
-            statement = ProgramStatement(index, target, "and", combine.groups(), None, raw)
+            source_names = combine.groups()
+            missing = [source for source in source_names if source not in defined]
+            if missing:
+                raise IneligibleProgram(
+                    f"statement {index} references undefined {missing}"
+                )
+            sources = tuple(expression_name(source) for source in source_names)
+            canonical_raw = f"{target} = AND({sources[0]}, {sources[1]})"
+            statement = ProgramStatement(
+                index, target, "and", sources, None, canonical_raw
+            )
         elif stop:
             source = stop.group(1)
             if source not in defined:
                 raise IneligibleProgram(f"STOP references undefined {source}")
-            final_target = source
-            statements.append(ProgramStatement(index, target, "stop", (source,), None, raw))
+            canonical_source = expression_name(source)
+            final_target = canonical_source
+            canonical_raw = f"{target} = STOP({canonical_source})"
+            statements.append(
+                ProgramStatement(
+                    index, target, "stop", (canonical_source,), None, canonical_raw
+                )
+            )
             stopped = True
             continue
         else:
             operator = rhs.split("(", 1)[0]
             raise IneligibleProgram(f"unsupported operator {operator or rhs}")
 
-        missing = [source for source in statement.sources if source not in defined]
-        if missing:
-            raise IneligibleProgram(f"statement {index} references undefined {missing}")
         statements.append(statement)
-        executable.append(raw)
-        defined.add(target)
+        executable.append(statement.raw)
+        defined.add(source_target)
         final_target = target
 
     if not executable or final_target is None:

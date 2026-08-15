@@ -91,7 +91,13 @@ def test_compile_accepts_unnumbered_grailqa_expression_variable():
         ]
     )
 
-    assert plan.target_expression == "expression"
+    assert plan.target_expression == "expression1"
+    assert plan.executable_functions == (
+        "expression1 = START('m.0hqs1x_')",
+        "expression1 = JOIN('medicine.routed_drug.marketed_formulations', expression1)",
+        "expression2 = START('medicine.routed_drug')",
+        "expression1 = AND(expression2, expression1)",
+    )
     assert [statement.kind for statement in plan.statements] == [
         "start",
         "join",
@@ -310,7 +316,14 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
 
     demos = DemonstrationBuilder(typed_executor, candidates).build(row)
 
-    assert [demo.family for demo in demos] == ["direct_frontier_progress"]
+    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+    continuation_sources = [
+        step.arguments[0]
+        for step in demos[0].steps
+        if step.action == "Find_relation" and step.arguments[0].startswith("expression")
+    ]
+    assert continuation_sources
+    assert set(continuation_sources) == {"expression1"}
 
 
 def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer():
