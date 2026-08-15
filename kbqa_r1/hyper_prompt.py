@@ -15,7 +15,7 @@ HyPER-R1 executable hypothesis graph:
 - `Widen [ source ]` asks for the next ranked batch from the same open frontier when the visible candidates do not cover the question. Widen before Select, and prune first if the active frontier lacks room.
 - When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
-- Use `Prune [ Hn ]` only when its visible path or execution result contradicts the question. An empty result is direct negative evidence; a merely different nonempty answer is not.
+- Use `Prune [ Hn ]` for visible path or execution contradictions. A lower-ranked nonempty branch may be removed for capacity only when the active frontier is full, or before an expansion or widening whose incoming candidates would exceed capacity. An empty result is direct negative evidence; a merely different nonempty answer is not.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.

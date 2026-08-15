@@ -38,6 +38,7 @@ print(json.dumps({
 PY
 
 export TRAIN_PARQUET="${HYPER_SFT}"
+export VAL_PARQUET=${VAL_PARQUET:-"$(dirname "${HYPER_SFT}")/validation_decision.parquet"}
 export DATASET_TYPE=${DATASET_TYPE:-grailqa}
 export PROJECT_NAME=${PROJECT_NAME:-HyPER-R1-SFT}
 export EXPERIMENT_NAME=${EXPERIMENT_NAME:-grailqa-hyper-r1-sft}

@@ -645,7 +645,11 @@ class DemonstrationBuilder:
                     rationale = (
                         ("empty_execution",)
                         if not victim.denotation
-                        else (f"question_path_mismatch:{victim.relation}",)
+                        else (
+                            ("frontier_capacity_eviction",)
+                            if len(before) == self.max_active
+                            else ("frontier_capacity_reservation",)
+                        )
                     )
                     steps.append(
                         DemonstrationStep(
@@ -971,7 +975,11 @@ class DemonstrationBuilder:
                 rationale = (
                     ("empty_execution",)
                     if not victim.denotation
-                    else (f"question_path_mismatch:{victim.relation}",)
+                    else (
+                        ("frontier_capacity_eviction",)
+                        if len(before) == self.max_active
+                        else ("frontier_capacity_reservation",)
+                    )
                 )
                 steps.append(
                     DemonstrationStep(
@@ -1494,6 +1502,22 @@ def _has_visible_path_mismatch(
     )
 
 
+def _has_public_prune_reason(
+    demo: HyperDemonstration,
+    step: DemonstrationStep,
+    node: ExecutedHypothesis,
+    active_count: Optional[int] = None,
+    max_active: Optional[int] = None,
+) -> bool:
+    if "frontier_capacity_eviction" in step.rationale_facts:
+        return active_count is not None and max_active is not None and active_count == max_active
+    if "frontier_capacity_reservation" in step.rationale_facts:
+        return active_count is not None and max_active is not None and active_count < max_active
+    return (
+        _has_visible_path_mismatch(demo, step, node)
+    )
+
+
 class DemonstrationValidator:
     """Replay private executable states and verify graph-action consistency."""
 
@@ -1561,10 +1585,29 @@ class DemonstrationValidator:
                 if step.arguments[0] not in active:
                     errors.append(f"Prune targets inactive {step.arguments[0]}")
                 node = demo.hypotheses[step.arguments[0]]
-                if node.denotation and not _has_visible_path_mismatch(demo, step, node):
-                    errors.append(
-                        f"Prune {step.arguments[0]} lacks visible contradictory evidence"
-                    )
+                if node.denotation:
+                    if (
+                        "frontier_capacity_eviction" in step.rationale_facts
+                        and len(active) != self.max_active
+                    ):
+                        errors.append(
+                            f"Prune {step.arguments[0]} uses capacity eviction when the "
+                            f"frontier is {len(active)}/{self.max_active}, not full"
+                        )
+                    elif (
+                        "frontier_capacity_reservation" in step.rationale_facts
+                        and len(active) >= self.max_active
+                    ):
+                        errors.append(
+                            f"Prune {step.arguments[0]} uses capacity reservation when the "
+                            f"frontier is already {len(active)}/{self.max_active}"
+                        )
+                    elif not _has_public_prune_reason(
+                        demo, step, node, len(active), self.max_active
+                    ):
+                        errors.append(
+                            f"Prune {step.arguments[0]} lacks visible contradictory evidence"
+                        )
                 active.discard(step.arguments[0])
                 if selected == step.arguments[0]:
                     selected = None
@@ -1772,7 +1815,11 @@ def _action_text(step: DemonstrationStep) -> str:
                 )
             ),
             "Prune": (
-                "This visible relation path conflicts with what the question asks, so I will remove it."
+                "The frontier is full, so I will remove this lower-ranked branch to make room for a higher-priority continuation."
+                if "frontier_capacity_eviction" in step.rationale_facts
+                else "The current frontier does not have enough room for the incoming continuation, so I will remove a lower-ranked branch before expanding."
+                if "frontier_capacity_reservation" in step.rationale_facts
+                else "This visible relation path conflicts with what the question asks, so I will remove it."
                 if any(
                     fact.startswith("question_path_mismatch:")
                     for fact in step.rationale_facts
@@ -1847,7 +1894,13 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             )
         elif step.action == "Prune":
             node = demo.hypotheses[step.arguments[0]]
-            if node.denotation and not _has_visible_path_mismatch(demo, step, node):
+            if node.denotation and not _has_public_prune_reason(
+                demo,
+                step,
+                node,
+                len(active),
+                int(demo.private_metadata.get("max_active", 6)),
+            ):
                 raise ValueError(
                     f"trajectory {demo.demo_id} prunes a nonempty branch without public evidence"
                 )

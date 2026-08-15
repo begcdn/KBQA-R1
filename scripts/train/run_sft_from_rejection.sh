@@ -20,14 +20,17 @@ DATASET_TYPE=${DATASET_TYPE:-webqsp}
 #   data/${DATASET_TYPE}_rl_dataset_sft/train_sft.parquet
 TRAIN_PARQUET=${TRAIN_PARQUET:-"${REPO_ROOT}/data/${DATASET_TYPE}_rl_dataset_sft/train_sft_new.parquet"}
 
-# Optional: validation parquet (not required by trainer; only echoed)
+# Optional validation parquet.
 VAL_PARQUET=${VAL_PARQUET:-"${REPO_ROOT}/data/${DATASET_TYPE}_rl_dataset/test.parquet"}
 
 # Base model (can override via env BASE_MODEL)
 BASE_MODEL=${BASE_MODEL:-"/ossfs/workspace/aml2/aml_ri/fengyi/Llama-3.1-8B-Instruct"}
 
-# Total training steps (set via env TOTAL_STEPS, default 1000)
+# Preserve the authors' 5,000-update schedule and effective batch of 32 even
+# when fewer than their eight A100s are used.
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-4}
 TOTAL_STEPS=${TOTAL_STEPS:-5000}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
 
 # Max tokens per GPU used by dynamic batcher (must be >= longest sequence length)
 # Defaults to 16k to match data.max_length override; adjust based on memory.
@@ -75,6 +78,11 @@ PY
 
 detect_gpu_count
 
+if (( GPU_COUNT > 0 && GLOBAL_BATCH_SIZE % GPU_COUNT != 0 )); then
+  echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by GPU_COUNT=${GPU_COUNT}" >&2
+  exit 1
+fi
+
 if [[ "${GPU_COUNT}" -eq 16 ]]; then
   export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
   NGPUS=16
@@ -113,6 +121,8 @@ echo "Project       : ${PROJECT_NAME}"
 echo "Experiment    : ${EXP_NAME}"
 echo "GPUs          : ${NGPUS} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 echo "Total steps   : ${TOTAL_STEPS}"
+echo "Total epochs  : ${TOTAL_EPOCHS}"
+echo "Global batch  : ${GLOBAL_BATCH_SIZE}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "========================================"
 
@@ -133,16 +143,21 @@ TRAINER=${TRAINER:-engine}
 echo "Trainer       : ${TRAINER}"
 
 if [[ "${TRAINER}" == "engine" ]]; then
+  VAL_OVERRIDES=()
+  if [[ -f "${VAL_PARQUET}" ]]; then
+    VAL_OVERRIDES+=("data.val_files=['${VAL_PARQUET}']" "trainer.test_freq=after_each_epoch")
+  fi
   # sft_trainer (engine config: sft_trainer_engine.yaml)
   ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
+    "${VAL_OVERRIDES[@]}" \
     data.messages_key=messages \
     data.pad_mode=no_padding \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     checkpoint.save_contents=['hf_model'] \
     data.max_length=16384 \
     data.truncation=right \
-    data.train_batch_size=$((NGPUS * 4)) \
+    data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=4 \
     model.path="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
@@ -151,21 +166,27 @@ if [[ "${TRAINER}" == "engine" ]]; then
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.save_freq=after_each_epoch \
+    trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_STEPS} \
     trainer.logger=['console','tensorboard'] \
     optim.lr=1e-5 \
     optim.clip_grad=1.0 \
     2>&1 | tee "${LOG_DIR}/${EXP_NAME//\//_}.log"
 else
+  VAL_OVERRIDES=()
+  if [[ -f "${VAL_PARQUET}" ]]; then
+    VAL_OVERRIDES+=("data.val_files=['${VAL_PARQUET}']" "trainer.test_freq=after_each_epoch")
+  fi
   # fsdp_sft_trainer (legacy path; no data.pad_mode key)
   ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.fsdp_sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
+    "${VAL_OVERRIDES[@]}" \
     data.messages_key=messages \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     trainer.checkpoint.save_contents=['hf_model'] \
     data.max_length=16384 \
     data.truncation=right \
-    data.train_batch_size=$((NGPUS * 4)) \
+    data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=4 \
     model.partial_pretrain="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
@@ -174,6 +195,7 @@ else
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.total_training_steps=${TOTAL_STEPS} \
+    trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.save_freq=after_each_epoch \
     trainer.logger=['console','tensorboard'] \
     optim.lr=1e-5 \

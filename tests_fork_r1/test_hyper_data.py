@@ -438,7 +438,101 @@ def test_widen_also_applies_to_a_selected_hypothesis_continuation():
     widen = next(step for step in demo.steps if step.action == "Widen")
     assert widen.arguments == ("expression1",)
     assert len(widen.created) == 3
+    capacity_prunes = [step for step in demo.steps if step.action == "Prune"]
+    assert capacity_prunes
+    assert all(
+        any(
+            fact in {"frontier_capacity_eviction", "frontier_capacity_reservation"}
+            for fact in step.rationale_facts
+        )
+        for step in capacity_prunes
+        if any(demo.hypotheses[step.arguments[0]].denotation)
+    )
+    rendered = trajectory_sft_record(demo)
+    assert any(
+        "does not have enough room" in message["content"]
+        and "before expanding" in message["content"]
+        for message in rendered["messages"]
+        if message["role"] == "assistant"
+    )
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+
+
+def test_full_frontier_capacity_eviction_uses_pre_prune_state():
+    row = {
+        "ID": "full-capacity-eviction",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def full_frontier_candidates(query, state, join):
+        if join.relation == "r.gold1":
+            return [
+                RelationOption("r.alt1", 0.95, 1),
+                RelationOption("r.other1", 0.90, 2),
+                RelationOption("r.extra1", 0.85, 3),
+                RelationOption("r.extra2", 0.80, 4),
+                RelationOption("r.extra3", 0.75, 5),
+                RelationOption("r.gold1", 0.70, 6),
+            ]
+        return [
+            RelationOption("r.alt2", 0.95, 1),
+            RelationOption("r.gold2", 0.90, 2),
+        ]
+
+    demo = DemonstrationBuilder(fake_executor, full_frontier_candidates).build(row)[0]
+    evictions = [
+        step
+        for step in demo.steps
+        if "frontier_capacity_eviction" in step.rationale_facts
+    ]
+    assert evictions
+    assert all(len(step.visible_before) == 6 for step in evictions)
+    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+
+
+def test_capacity_eviction_is_rejected_when_frontier_is_not_full():
+    row = {
+        "ID": "capacity-rationale-too-early",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def nonempty_wrong_executor(functions, target):
+        text = "\n".join(functions)
+        if "r.gold2" in text:
+            return ["m.answer"] if "r.gold1" in text else ["m.wrong"]
+        return fake_executor(functions, target)
+
+    demo = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)[0]
+    prune_index = next(
+        index
+        for index, step in enumerate(demo.steps)
+        if step.action == "Prune"
+        and any(
+            fact.startswith("question_path_mismatch:")
+            for fact in step.rationale_facts
+        )
+    )
+    bad_steps = list(demo.steps)
+    bad_steps[prune_index] = replace(
+        bad_steps[prune_index], rationale_facts=("frontier_capacity_eviction",)
+    )
+
+    errors = DemonstrationValidator(
+        nonempty_wrong_executor, max_active=6
+    ).validate(replace(demo, steps=bad_steps))
+    assert any("capacity eviction" in error and "not full" in error for error in errors)
 
 
 def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget():

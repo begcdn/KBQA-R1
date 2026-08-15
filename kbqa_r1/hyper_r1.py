@@ -221,7 +221,9 @@ def serialize_frontier(
         )
     lines.append(
         "Actions: Select, Find_relation [ source ], Widen [ source ], Combine, Prune, or Commit. "
-        "Prune only when visible path or execution evidence contradicts the question."
+        "Prune for visible path or execution contradictions, or evict a lower-ranked nonempty "
+        "branch only when the active frontier is full and room is required for a higher-priority continuation; "
+        "before an expansion or widening, remove a lower-ranked branch only when its incoming candidates would exceed capacity."
     )
     lines.append("</hypothesis_graph>")
     return "\n".join(lines)
