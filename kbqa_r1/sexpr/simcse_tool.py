@@ -231,7 +231,8 @@ class SimCSE(object):
             if faiss_fast:            
                 index.train(embeddings.astype(np.float32))
             index.add(embeddings.astype(np.float32))
-            index.nprobe = min(self.num_cells_in_search, len(sentences_or_file_path))
+            if hasattr(index, "nprobe"):
+                index.nprobe = min(self.num_cells_in_search, len(sentences_or_file_path))
             self.is_faiss_index = True
         else:
             index = embeddings
