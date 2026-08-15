@@ -1982,8 +1982,9 @@ def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
             continue
         prefix = [dict(item) for item in trajectory["messages"][: message_index + 1]]
         for prior in prefix:
-            if prior.get("role") == "assistant":
-                prior["loss_mask"] = 0
+            # Keep the nested Parquet field non-nullable. Pandas otherwise
+            # promotes nullable integer masks to floats before VERL sees them.
+            prior["loss_mask"] = 0
         prefix[-1]["loss_mask"] = 1
         records.append(
             {

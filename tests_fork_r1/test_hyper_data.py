@@ -257,7 +257,6 @@ def test_one_hop_frontier_commits_without_ceremonial_select():
     assert all(
         message.get("loss_mask") == 0
         for message in decisions[-1]["messages"][:-1]
-        if message["role"] == "assistant"
     )
 
 

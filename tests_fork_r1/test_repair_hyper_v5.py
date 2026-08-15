@@ -3,6 +3,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pandas as pd
+
 from kbqa_r1.hyper_data import (
     DemonstrationStep,
     ExecutedHypothesis,
@@ -102,6 +104,15 @@ def test_export_accepts_jsonl_gz_writes_sft_parquets_and_split_report(tmp_path):
         "repair_report.json",
     ):
         assert (output / filename).exists()
+
+    messages = pd.read_parquet(
+        output / "train_decision.parquet", columns=["messages"]
+    )["messages"]
+    assert {
+        type(message["loss_mask"])
+        for conversation in messages
+        for message in conversation
+    } == {int}
 
 
 def test_export_carries_forward_audited_report_with_repair_record(tmp_path):
