@@ -30,6 +30,17 @@ def normalize_values(values: Iterable[Any]) -> Tuple[str, ...]:
     return tuple(sorted({str(value).strip() for value in values or () if str(value).strip()}))
 
 
+def normalize_gold_answers(values: Iterable[Any]) -> Tuple[str, ...]:
+    """Extract answer identities from official GrailQA answer records."""
+    normalized = []
+    for value in values or ():
+        if isinstance(value, Mapping):
+            value = value.get("answer_argument")
+        if value is not None and str(value).strip():
+            normalized.append(value)
+    return normalize_values(normalized)
+
+
 def answer_set_f1(predicted: Sequence[str], gold: Sequence[str]) -> float:
     predicted_set = set(normalize_values(predicted))
     gold_set = set(normalize_values(gold))
@@ -388,7 +399,7 @@ class DemonstrationBuilder:
             annotated = row.get("answers")
         if annotated is None:
             annotated = row.get("target")
-        gold_answers = normalize_values(() if annotated is None else annotated)
+        gold_answers = normalize_gold_answers(() if annotated is None else annotated)
         if not gold_answers:
             return []
         if len(gold_answers) > 100:

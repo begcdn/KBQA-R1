@@ -179,6 +179,30 @@ def test_builds_replayable_delayed_frontier_recovery():
     assert builder.stats["continuation_proposal_hit"] == 1
 
 
+def test_builder_extracts_ids_from_official_grailqa_answer_records():
+    row = {
+        "ID": "q-official-answer",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": [
+            {
+                "answer_type": "Entity",
+                "answer_argument": "m.answer",
+                "entity_name": "The answer",
+            }
+        ],
+    }
+
+    demos = DemonstrationBuilder(fake_executor, candidates).build(row)
+
+    assert len(demos) == 1
+    assert demos[0].gold_answers == ("m.answer",)
+
+
 def test_recovery_does_not_emit_a_contradictory_direct_twin():
     row = {
         "ID": "no-twin",
