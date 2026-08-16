@@ -1,7 +1,8 @@
-import json
 import logging
 import os
 import re
+
+from kbqa_r1.answer_utils import extract_last_answer_values
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOG_LEVEL", "INFO"))
@@ -20,44 +21,9 @@ def _is_timeout_error(text: str) -> bool:
     return any(indicator.lower() in text_lower for indicator in TIMEOUT_INDICATORS)
 
 def extract_mid_list(solution_str: str) -> list[str] | None:
-    """
-    Extracts a list of answer values from the <answer> tag in the solution string.
-    Handles both entity MIDs (e.g., m.02mjmr) and literal values (e.g., dates, numbers).
-    Assumes answers are space-separated within the tag, or potentially a JSON list.
-    Handles potential errors gracefully.
-    """
-    answer_pattern = r'<answer>(.*?)</answer>'
-    matches = list(re.finditer(answer_pattern, solution_str, re.DOTALL | re.IGNORECASE)) # Added IGNORECASE
-
-    if not matches:
-        return None # No answer tag found
-
-    # Get content of the last answer tag
-    content = matches[-1].group(1).strip()
-
-    # Try parsing as JSON list first (more robust)
-    try:
-        # Simple check if it looks like a list
-        if content.startswith('[') and content.endswith(']'):
-            # Replace single quotes with double quotes for valid JSON
-            content = content.replace("'", '"')
-            mid_list = json.loads(content)
-            if isinstance(mid_list, list):
-                # Ensure all items are strings
-                return [str(mid).strip() for mid in mid_list if str(mid).strip()] # Ensure non-empty strings
-            else:
-                # Parsed but wasn't a list
-                 return None
-    except json.JSONDecodeError:
-        # Not a valid JSON list, try splitting by space
-        pass # Fall through to space splitting
-
-    # Fallback: Assume space-separated MIDs if not a JSON list
-    # Filter out empty strings that might result from multiple spaces
-    mid_list = [mid.strip() for mid in content.split() if mid.strip()] # Ensure non-empty strings
-    if not mid_list: # Handle case where answer tag is empty or only spaces
-        return None
-    return mid_list
+    """Parse answers exactly as the live HyPER commit validator does."""
+    values = extract_last_answer_values(solution_str)
+    return None if values is None else list(values)
 
 
 def find_in_list(entry, elist):
@@ -325,4 +291,3 @@ def _apply_progressive_scaling(reward: float, training_step: int) -> float:
         scale_factor = max_scale
     
     return reward * scale_factor
-

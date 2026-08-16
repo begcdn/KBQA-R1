@@ -80,16 +80,17 @@ def summarize(rows: Iterable[dict]) -> dict:
 
     def metrics(items: List[dict]) -> dict:
         f1 = [_f1(item) for item in items]
-        execution = [
-            _number(item, "hyper_r1_execution_calls")
-            for item in items
-            if "hyper_r1_execution_calls" in item
-        ]
+        execution = []
+        for item in items:
+            if "hyper_r1_execution_attempts" in item:
+                execution.append(_number(item, "hyper_r1_execution_attempts"))
+            elif "hyper_r1_execution_calls" in item:
+                execution.append(_number(item, "hyper_r1_execution_calls"))
         result = {
             "questions": len(items),
             "mean_f1": mean(f1) if f1 else 0.0,
             "exact_match": mean(value == 1.0 for value in f1) if f1 else 0.0,
-            "mean_execution_calls": mean(execution) if execution else None,
+            "mean_execution_attempts": mean(execution) if execution else None,
         }
         optional_rates = {
             "commit_valid_rate": "hyper_r1_commit_valid",
@@ -97,6 +98,7 @@ def summarize(rows: Iterable[dict]) -> dict:
             "combine_usage_rate": "hyper_r1_used_combine",
             "widen_usage_rate": "hyper_r1_used_widen",
             "preserved_alternatives_rate": "hyper_r1_preserved_alternatives",
+            "premature_answer_rate": "hyper_r1_premature_answer",
         }
         for output_key, row_key in optional_rates.items():
             values = [_number(item, row_key) for item in items if row_key in item]

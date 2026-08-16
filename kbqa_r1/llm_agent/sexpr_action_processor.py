@@ -1499,8 +1499,11 @@ class SExprActionProcessor:
                     arguments=[normalized_entity_arg, best_relation.relation_id],  # Keep entity, replace relation description with selected relation
                     raw_text=action.raw_text,
                     step_number=action.step_number,
-                    is_valid=True
+                    is_valid=True,
+                    source_span=action.source_span,
+                    token_span=action.token_span,
                 )
+                new_action.action_index = action_index
                 return new_action
             else:
                 # Threshold not met: provide candidate list for LLM selection (cap at 20)

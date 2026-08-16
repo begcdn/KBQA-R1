@@ -41,3 +41,27 @@ def test_find_relation_supports_hyper_source_only_and_legacy_intent():
     assert hyper.action_type == ActionType.FIND_RELATION
     assert hyper.arguments == ["expression2"]
     assert legacy.arguments == ["expression2", "place where the person died"]
+
+
+def test_action_span_points_to_tagged_action_not_thought_copy():
+    parser = ActionParser()
+    text = (
+        "<think>I may use Select [ H2 ] later.</think>\n"
+        "<action>Action1: Select [ H2 ] trailing commentary</action>"
+    )
+
+    action = parser.parse_actions_from_text(text)[0]
+
+    assert text[slice(*action.source_span)] == "Action1: Select [ H2 ]"
+
+
+def test_actions_from_multiple_blocks_keep_distinct_offsets():
+    parser = ActionParser()
+    text = "<action>Select [ H1 ]</action> then <action>Commit [ H1 ]</action>"
+
+    actions = parser.parse_actions_from_text(text)
+
+    assert [text[slice(*action.source_span)] for action in actions] == [
+        "Select [ H1 ]",
+        "Commit [ H1 ]",
+    ]

@@ -419,7 +419,13 @@ class DemonstrationBuilder:
                 continue
             next_join = joins[position + 1] if position + 1 < len(joins) else None
             demo = self._build_relation_demo(
-                question_id, question, plan, join, next_join, gold_answers
+                question_id,
+                question,
+                plan,
+                join,
+                next_join,
+                gold_answers,
+                following_joins=tuple(joins[position + 1 :]),
             )
             if demo is not None:
                 demos.append(demo)
@@ -470,12 +476,13 @@ class DemonstrationBuilder:
         join: ProgramStatement,
         next_join: Optional[ProgramStatement],
         gold_answers: Tuple[str, ...],
+        following_joins: Sequence[ProgramStatement] = (),
     ) -> Optional[HyperDemonstration]:
         source = join.sources[0] if join.sources else _join_source(join.raw)
         state_before = self._dependency_state(plan, source, before=join.index)
         # A standalone SFT conversation cannot begin from a hidden gold prefix.
-        # Longer paths are learned by repeating the verified two-step protocol
-        # during RL rather than fabricating an unseen initial state.
+        # Deep demonstrations therefore start at the first relation and replay
+        # every later frontier through public executable observations.
         if any(_JOIN.match(_ASSIGNMENT.match(raw).group(2)) for raw in state_before):
             return None
         self.stats["relation_decisions"] += 1
@@ -599,6 +606,20 @@ class DemonstrationBuilder:
             family = "adaptive_frontier_widen" if needs_widen else "frontier_commit"
             probe_relation = None
         else:
+            if len(following_joins) > 1:
+                return self._build_deep_progress_demo(
+                    question_id=question_id,
+                    question=question,
+                    join=join,
+                    following_joins=following_joins,
+                    candidates=candidates,
+                    gold_answers=gold_answers,
+                    gold_option=gold_option,
+                    best_alternative_score=best_alternative_score,
+                    initial_steps=steps,
+                    needs_initial_widen=needs_widen,
+                    candidate_future_values=candidate_future_values,
+                )
             if not _is_immediate_linear_terminal(plan, join, next_join):
                 return None
             if needs_widen:
@@ -891,6 +912,209 @@ class DemonstrationBuilder:
                 "retrieval_intent_source": "question",
                 "probe_relation": probe_relation,
                 "decision_index": join.index,
+            },
+        )
+
+    def _append_capacity_prunes(
+        self,
+        steps: List[DemonstrationStep],
+        hypotheses: Mapping[str, ExecutedHypothesis],
+        active: List[str],
+        *,
+        maximum_active: int,
+        protected: Sequence[str] = (),
+    ) -> bool:
+        """Free visible frontier slots using only public capacity evidence."""
+        protected_ids = set(protected)
+        while len(active) > maximum_active:
+            candidates = [
+                hypotheses[node_id]
+                for node_id in active
+                if node_id not in protected_ids
+            ]
+            if not candidates:
+                return False
+            victim = min(
+                candidates,
+                key=lambda node: (
+                    bool(node.denotation),
+                    "policy_choice" in node.provenance,
+                    -node.depth,
+                    node.hypothesis_id,
+                ),
+            )
+            before = tuple(active)
+            active.remove(victim.hypothesis_id)
+            rationale = (
+                ("empty_execution",)
+                if not victim.denotation
+                else (
+                    ("frontier_capacity_eviction",)
+                    if len(before) == self.max_active
+                    else ("frontier_capacity_reservation",)
+                )
+            )
+            steps.append(
+                DemonstrationStep(
+                    "Prune",
+                    (victim.hypothesis_id,),
+                    before,
+                    (),
+                    rationale,
+                )
+            )
+        return True
+
+    def _build_deep_progress_demo(
+        self,
+        *,
+        question_id: str,
+        question: str,
+        join: ProgramStatement,
+        following_joins: Sequence[ProgramStatement],
+        candidates: Sequence[Tuple[RelationOption, ExecutedHypothesis]],
+        gold_answers: Tuple[str, ...],
+        gold_option: RelationOption,
+        best_alternative_score: Optional[float],
+        initial_steps: Sequence[DemonstrationStep],
+        needs_initial_widen: bool,
+        candidate_future_values: Mapping[str, Any],
+    ) -> Optional[HyperDemonstration]:
+        """Replay a complete public linear path instead of stopping at hop two."""
+        if not following_joins:
+            return None
+        previous = join
+        for following in following_joins:
+            if following.sources != (previous.target,):
+                return None
+            previous = following
+
+        hypotheses = {item[1].hypothesis_id: item[1] for item in candidates}
+        active = list(hypotheses)
+        steps = list(initial_steps)
+        current_gold = next(
+            item[1] for item in candidates if item[0].relation == join.relation
+        )
+        widen_sources = [
+            step.arguments[0] for step in steps if step.action == "Widen"
+        ]
+
+        for continuation in following_joins:
+            # Runtime checks capacity before replacing the selected parent, so
+            # reserve a complete initial frontier first.
+            if not self._append_capacity_prunes(
+                steps,
+                hypotheses,
+                active,
+                maximum_active=self.max_active - self.frontier_width,
+                protected=(current_gold.hypothesis_id,),
+            ):
+                return None
+            steps.append(
+                DemonstrationStep(
+                    "Select",
+                    (current_gold.hypothesis_id,),
+                    tuple(active),
+                    (),
+                    (f"question_relation_match:{current_gold.relation}",),
+                )
+            )
+            initial_children, widened_children = self._expand_terminal_frontier_batches(
+                current_gold,
+                continuation,
+                hypotheses,
+                question,
+                stat_scope="deep_continuation",
+            )
+            all_children = initial_children + widened_children
+            next_gold = next(
+                (
+                    hypotheses[node_id]
+                    for node_id in all_children
+                    if hypotheses[node_id].relation == continuation.relation
+                ),
+                None,
+            )
+            if next_gold is None or len(all_children) < 2:
+                self.stats["deep_progress_miss"] += 1
+                return None
+
+            before_expansion = tuple(active)
+            active.remove(current_gold.hypothesis_id)
+            active.extend(initial_children)
+            steps.append(
+                DemonstrationStep(
+                    "Find_relation",
+                    (current_gold.target_expression,),
+                    before_expansion,
+                    tuple(initial_children),
+                    ("continue_supported_branch",),
+                )
+            )
+            if widened_children:
+                if not self._append_capacity_prunes(
+                    steps,
+                    hypotheses,
+                    active,
+                    maximum_active=self.max_active - len(widened_children),
+                ):
+                    return None
+                steps.append(
+                    DemonstrationStep(
+                        "Widen",
+                        (current_gold.target_expression,),
+                        tuple(active),
+                        tuple(widened_children),
+                        ("required_relation_missing_from_initial_frontier",),
+                    )
+                )
+                active.extend(widened_children)
+                widen_sources.append(current_gold.target_expression)
+            if len(active) > self.max_active:
+                return None
+            current_gold = next_gold
+
+        if current_gold.denotation != gold_answers:
+            self.stats["deep_progress_terminal_mismatch"] += 1
+            return None
+        steps.append(
+            DemonstrationStep(
+                "Commit",
+                (current_gold.hypothesis_id,),
+                tuple(active),
+                (),
+                ("complete", "executable"),
+            )
+        )
+        self.stats["deep_progress_built"] += 1
+        return HyperDemonstration(
+            demo_id=(
+                f"{question_id}:join:{join.index}:"
+                f"{_digest(tuple(option.relation for option, _ in candidates))}:deep"
+            ),
+            question_id=question_id,
+            question=question,
+            family="deep_frontier_progress",
+            hypotheses=hypotheses,
+            steps=steps,
+            gold_answers=gold_answers,
+            private_metadata={
+                "gold_relation": join.relation,
+                "gold_rank": gold_option.rank,
+                "gold_score": gold_option.score,
+                "gold_vs_best_alternative_margin": (
+                    gold_option.score - best_alternative_score
+                    if best_alternative_score is not None else None
+                ),
+                "proposal_relations": [option.relation for option, _ in candidates],
+                "proposal_recall_at_frontier": not needs_initial_widen,
+                "proposal_recall_at_max_frontier": True,
+                "candidate_future_values": dict(candidate_future_values),
+                "widen_sources": widen_sources,
+                "retrieval_intent_source": "question",
+                "probe_relation": None,
+                "decision_index": join.index,
+                "path_hops": 1 + len(following_joins),
             },
         )
 

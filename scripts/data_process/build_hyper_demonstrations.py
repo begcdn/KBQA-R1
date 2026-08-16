@@ -375,7 +375,7 @@ def main() -> None:
     parser.add_argument("--frontier-width", type=int, default=3)
     parser.add_argument("--max-frontier-width", type=int, default=6)
     parser.add_argument("--max-active", type=int, default=6)
-    parser.add_argument("--max-turns", type=int, default=10)
+    parser.add_argument("--max-turns", type=int, default=14)
     parser.add_argument(
         "--workers",
         type=int,
@@ -695,6 +695,14 @@ def main() -> None:
         len(conjunction_source_positions) >= 2
         if families.get("conjunction", 0) >= 2 else True
     )
+    deep_input_rows = sum(
+        count for hop, count in rows_by_hop.items() if int(hop) >= 3
+    )
+    deep_training_trajectories = families.get("deep_frontier_progress", 0)
+    minimum_deep_trajectories = (
+        min(deep_input_rows, max(100, math.ceil(0.10 * deep_input_rows)))
+        if deep_input_rows else 0
+    )
     quality_checks = {
         "all_saved_trajectories_replay": True,
         "contains_direct_progress": bool(
@@ -707,6 +715,9 @@ def main() -> None:
             or families.get("adaptive_frontier_widen", 0) > 0
         ),
         "contains_required_conjunction": families.get("conjunction", 0) > 0,
+        "deep_progress_has_training_mass": (
+            deep_training_trajectories >= minimum_deep_trajectories
+        ),
         "natural_frontier_has_non_top1_gold": any(
             int(rank) > 1 and count > 0 for rank, count in gold_ranks.items()
         ),
@@ -721,6 +732,7 @@ def main() -> None:
         ),
     }
     report = {
+        "quality_schema": "hyper_r1_v6_depth_aware",
         "input": args.input,
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
@@ -869,10 +881,13 @@ def main() -> None:
             "checks": quality_checks,
             "minimum_recovery_trajectories": minimum_recoveries,
             "multi_hop_training_trajectories": multi_hop_count,
+            "deep_input_rows": deep_input_rows,
+            "deep_training_trajectories": deep_training_trajectories,
+            "minimum_deep_trajectories": minimum_deep_trajectories,
             "note": (
                 "Validity failures block export. Expensive SFT additionally requires "
                 "readable entity evidence, non-positional conjunction roots, and enough "
-                "verified recovery trajectories to teach the method-specific behavior. "
+                "verified recovery and deep trajectories to teach the method-specific behavior. "
                 "Decision-level SFT rows exclude the final answer-copy turn."
             ),
         },

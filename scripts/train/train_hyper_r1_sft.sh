@@ -19,6 +19,10 @@ import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
+if report.get("quality_schema") != "hyper_r1_v6_depth_aware":
+    raise SystemExit(
+        "HyPER-R1 corpus report predates the depth-aware quality gate; rebuild it."
+    )
 quality = report.get("quality_assessment", {})
 if not quality.get("structurally_ready_for_sft", False):
     failed = [
@@ -27,6 +31,10 @@ if not quality.get("structurally_ready_for_sft", False):
     raise SystemExit(
         "HyPER-R1 corpus is not structurally ready for SFT: " + ", ".join(failed)
     )
+if quality.get("deep_training_trajectories", 0) < quality.get(
+    "minimum_deep_trajectories", 1
+):
+    raise SystemExit("HyPER-R1 corpus lacks enough verified deep trajectories for SFT")
 print("HyPER-R1 corpus passed structural checks.")
 print(json.dumps({
     "accepted_demonstrations": report.get("accepted_demonstrations"),
@@ -34,6 +42,8 @@ print(json.dumps({
     "validation_rows": report.get("validation_rows"),
     "families": report.get("families"),
     "proposal_recall": report.get("proposal_recall"),
+    "deep_training_trajectories": quality.get("deep_training_trajectories"),
+    "minimum_deep_trajectories": quality.get("minimum_deep_trajectories"),
 }, indent=2))
 PY
 

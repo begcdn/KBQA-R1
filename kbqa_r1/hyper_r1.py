@@ -17,6 +17,8 @@ import re
 
 import torch
 
+from .answer_utils import extract_last_answer_values
+
 
 class HypothesisStatus(str, Enum):
     ACTIVE = "active"
@@ -73,6 +75,7 @@ class HypothesisGraphState:
     edges: List[HypothesisEdge] = field(default_factory=list)
     selected_id: Optional[str] = None
     committed_id: Optional[str] = None
+    execution_attempts: int = 0
     execution_calls: int = 0
     next_node_index: int = 0
 
@@ -141,20 +144,7 @@ def _display_answer(value: str, labels: Mapping[str, str]) -> str:
 
 def extract_answer_values(text: str) -> Tuple[str, ...]:
     """Read the final answer tag using the same identity-preserving normalization."""
-    matches = list(re.finditer(r"<answer>(.*?)</answer>", str(text), re.I | re.S))
-    if not matches:
-        return ()
-    content = matches[-1].group(1).strip()
-    if not content:
-        return ()
-    if content.startswith("[") and content.endswith("]"):
-        try:
-            values = json.loads(content.replace("'", '"'))
-        except json.JSONDecodeError:
-            values = None
-        if isinstance(values, list):
-            return normalize_denotation(values)
-    return normalize_denotation(re.split(r"[\s,]+", content))
+    return extract_last_answer_values(text) or ()
 
 
 def relation_path(function_state: Sequence[str]) -> Tuple[str, ...]:
@@ -193,7 +183,7 @@ def serialize_frontier(
     lines = [
         "<hypothesis_graph>",
         f"active={len(active)} capacity={max_active} nodes={node_count} "
-        f"executions={execution_calls} selected={selected_id or 'none'} "
+        f"execution_attempts={execution_calls} selected={selected_id or 'none'} "
         f"committed={committed_id or 'none'}",
     ]
     for node in nodes:
@@ -460,6 +450,12 @@ class HypothesisGraph:
 
         return node
 
+    def record_execution_attempt(self, sample_id: int) -> int:
+        """Count every proposed graph execution, including failed proposals."""
+        graph = self.state(sample_id)
+        graph.execution_attempts += 1
+        return graph.execution_attempts
+
     def _find_equivalent(
         self, graph: HypothesisGraphState, candidate: HypothesisNode
     ) -> Optional[HypothesisNode]:
@@ -603,7 +599,22 @@ class HypothesisGraph:
         node = self.committed_node(sample_id)
         return bool(node is not None and extract_answer_values(response) == node.denotation)
 
-    def decision_state_key(self, sample_id: int, turn: Optional[int] = None) -> str:
+    def answer_values_match_commit(
+        self, sample_id: int, values: Optional[Sequence[str]]
+    ) -> bool:
+        node = self.committed_node(sample_id)
+        return bool(
+            node is not None
+            and values is not None
+            and normalize_denotation(values) == node.denotation
+        )
+
+    def decision_state_key(
+        self,
+        sample_id: int,
+        turn: Optional[int] = None,
+        legal_context: Sequence[Any] = (),
+    ) -> str:
         """Stable semantic key for comparing decisions from the same state."""
         graph = self.state(sample_id)
         payload = {
@@ -613,8 +624,10 @@ class HypothesisGraph:
                 key=repr,
             ),
             "node_count": len(graph.nodes),
+            "execution_attempts": graph.execution_attempts,
             "execution_calls": graph.execution_calls,
             "turn": None if turn is None else int(turn),
+            "legal_context": list(legal_context),
         }
         return sha256(
             json.dumps(payload, sort_keys=True, default=str).encode()
@@ -637,6 +650,8 @@ class HypothesisGraph:
         programs = [
             self._node_program_key(graph.nodes.get(node_id)) for node_id in node_ids
         ]
+        if str(action).lower() == "combine":
+            programs = sorted(programs, key=repr)
         payload = {
             "action": str(action),
             "programs": programs,
@@ -680,7 +695,7 @@ class HypothesisGraph:
             committed_id=graph.committed_id,
             max_active=self.max_active,
             node_count=len(graph.nodes),
-            execution_calls=graph.execution_calls,
+            execution_calls=graph.execution_attempts,
             max_answers=max_answers,
         )
 
@@ -691,6 +706,7 @@ class HypothesisGraph:
             "selected_id": graph.selected_id,
             "committed_id": graph.committed_id,
             "execution_calls": graph.execution_calls,
+            "execution_attempts": graph.execution_attempts,
             "nodes": [
                 {
                     **node.__dict__,
@@ -761,7 +777,8 @@ def apply_grouped_decision_credit(
     compared = torch.zeros_like(action_ids, dtype=torch.float32)
     for row, records in enumerate(action_records):
         reward = float(terminal_rewards[row].item())
-        for action_index, record in enumerate(records, 1):
+        for fallback_index, record in enumerate(records, 1):
+            action_index = int(record.get("action_index", fallback_index))
             alternatives = outcomes.get(
                 (str(group_ids[row]), str(record["state_key"])), {}
             )
@@ -778,6 +795,21 @@ def apply_grouped_decision_credit(
             result[row][token_mask[row]] += float(weight) * delta
             compared[row][token_mask[row]] = 1.0
     return result, compared
+
+
+def penalize_invalid_actions(
+    advantages: torch.Tensor,
+    invalid_action_mask: torch.Tensor,
+    penalty: float = 0.25,
+) -> torch.Tensor:
+    """Prevent malformed or rejected actions from receiving positive credit."""
+    if advantages.shape != invalid_action_mask.shape:
+        raise ValueError("advantages and invalid_action_mask must have the same shape")
+    result = advantages.clone()
+    mask = invalid_action_mask.to(dtype=torch.bool)
+    floor = torch.full_like(result, -abs(float(penalty)))
+    result[mask] = torch.minimum(result[mask], floor[mask])
+    return result
 
 
 def enforce_commit_reward(

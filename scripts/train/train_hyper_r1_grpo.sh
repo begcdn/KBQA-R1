@@ -10,6 +10,38 @@ DATA_DIR=${DATA_DIR:-"${REPO_ROOT}/data/${DATASET_TYPE}_rl_dataset"}
 PYTHON_BIN=${PYTHON_BIN:-python3}
 : "${HYPER_SFT_MODEL:?Set HYPER_SFT_MODEL to the verified HyPER-R1 SFT checkpoint}"
 : "${HYPER_RELATION_MODEL:?Set HYPER_RELATION_MODEL to the explicit relation-ranker checkpoint}"
+: "${HYPER_SFT_SCREEN:?Set HYPER_SFT_SCREEN to the behavioral screen metrics.json}"
+
+"${PYTHON_BIN}" - "${HYPER_SFT_SCREEN}" "${HYPER_SFT_MODEL}" <<'PY'
+import json
+import os
+import sys
+
+screen_path, model_path = sys.argv[1:]
+payload = json.load(open(screen_path, encoding="utf-8"))
+expected = os.path.realpath(model_path)
+matches = []
+for row in payload.get("checkpoints", []):
+    candidates = {
+        os.path.realpath(str(row.get("checkpoint", ""))),
+        os.path.realpath(str(row.get("resolved_model_dir", ""))),
+    }
+    if expected in candidates or any(candidate.startswith(expected + os.sep) for candidate in candidates):
+        matches.append(row)
+if len(matches) != 1:
+    raise SystemExit(
+        f"Behavioral screen does not identify HYPER_SFT_MODEL exactly: {model_path}"
+    )
+screen = matches[0].get("minimum_behavior_screen", {})
+if not screen.get("passed", False):
+    failed = [name for name, passed in screen.get("checks", {}).items() if not passed]
+    raise SystemExit(
+        "HyPER-R1 SFT checkpoint failed the minimum behavioral screen: "
+        + ", ".join(failed)
+    )
+print("HyPER-R1 SFT checkpoint passed the minimum behavioral screen.")
+print("It still requires executable held-out evaluation during GRPO validation.")
+PY
 
 RAW_TRAIN_FILE=${RAW_TRAIN_FILE:-"${DATA_DIR}/train.parquet"}
 RAW_VAL_FILE=${RAW_VAL_FILE:-"${DATA_DIR}/test.parquet"}
@@ -37,7 +69,8 @@ export hyper_r1_relation_model=${hyper_r1_relation_model:-"${HYPER_RELATION_MODE
 export hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 export hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 export hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
-export max_turns=${max_turns:-10}
+export hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
+export max_turns=${max_turns:-14}
 # The released format bonus validates the old linear S-expression protocol.
 # HyPER's structured actions are enforced by the environment itself, so that
 # bonus would reward the wrong syntax.

@@ -12,6 +12,7 @@ from kbqa_r1.hyper_r1 import (
     enforce_commit_reward,
     dependency_function_state,
     graph_action_token_mask,
+    penalize_invalid_actions,
     result_display_labels,
     result_denotation_values,
     required_hyper_relation_model,
@@ -337,6 +338,54 @@ def test_decision_state_distinguishes_remaining_turn_budget():
     assert graph.decision_state_key(0, turn=1) != graph.decision_state_key(0, turn=4)
 
 
+def test_decision_state_distinguishes_hidden_widen_choices():
+    graph = HypothesisGraph(max_active=3)
+    add(graph, "r.answer", ["m.answer"])
+
+    assert graph.decision_state_key(
+        0, turn=1, legal_context=(("m.topic", 2, 4, ("r.a", "r.b")),)
+    ) != graph.decision_state_key(
+        0, turn=1, legal_context=(("m.topic", 2, 4, ("r.a", "r.c")),)
+    )
+
+
+def test_combine_action_key_is_parent_order_invariant():
+    graph = HypothesisGraph(max_active=3)
+    left = add(graph, "r.left", ["m.left"])
+    right = add(graph, "r.right", ["m.right"])
+
+    assert graph.action_key(0, "Combine", [left.node_id, right.node_id]) == graph.action_key(
+        0, "Combine", [right.node_id, left.node_id]
+    )
+
+
+def test_execution_attempts_include_failures_without_inventing_nodes():
+    graph = HypothesisGraph(max_active=3)
+
+    graph.record_execution_attempt(0)
+
+    assert graph.state(0).execution_attempts == 1
+    assert graph.state(0).execution_calls == 0
+
+
+def test_hypothesis_graph_supports_three_hop_continuation():
+    graph = HypothesisGraph(max_active=3)
+    first = add(graph, "r.one", ["m.one"])
+    graph.mark_expanded(0, first.node_id)
+    second = add(graph, "r.two", ["m.two"], parent=first.node_id)
+    graph.mark_expanded(0, second.node_id)
+    third = add(graph, "r.three", ["m.answer"], parent=second.node_id)
+
+    # Root executions have graph depth zero, so a three-execution lineage ends
+    # at depth two.
+    assert third.depth == 2
+    assert graph.lineage(0, third.node_id) == [
+        third.node_id,
+        second.node_id,
+        first.node_id,
+    ]
+
+
 def test_invalid_commit_cannot_keep_answer_reward():
     rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
     mask = torch.tensor([[1, 1, 1], [1, 1, 1]])
@@ -346,6 +395,15 @@ def test_invalid_commit_cannot_keep_answer_reward():
 
     assert result[0].tolist() == [0.0, 0.0, 1.0]
     assert result[1].tolist() == [0.0, 0.0, -0.25]
+
+
+def test_invalid_action_tokens_cannot_keep_positive_advantage():
+    advantages = torch.tensor([[0.8, -0.7, 0.1]])
+    invalid = torch.tensor([[True, True, False]])
+
+    result = penalize_invalid_actions(advantages, invalid, penalty=0.25)
+
+    assert torch.allclose(result, torch.tensor([[-0.25, -0.7, 0.1]]))
 
 
 def test_final_answer_must_equal_committed_denotation():

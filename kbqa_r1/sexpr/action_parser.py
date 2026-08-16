@@ -36,6 +36,8 @@ class ActionResult:
     step_number: int
     is_valid: bool = True
     error_message: str = None
+    source_span: Optional[Tuple[int, int]] = None
+    token_span: Optional[Tuple[int, int]] = None
 
 class ActionParser:
     """
@@ -119,7 +121,9 @@ class ActionParser:
         Returns:
             ActionResult if parsing successful, None otherwise
         """
-        text = text.strip()
+        original_text = text
+        leading = len(original_text) - len(original_text.lstrip())
+        text = original_text.strip()
         
         for action_type, pattern in self.compiled_patterns.items():
             match = pattern.search(text)
@@ -167,7 +171,8 @@ class ActionParser:
                         arguments=arguments,
                         raw_text=text,
                         step_number=step_number,
-                        is_valid=True
+                        is_valid=True,
+                        source_span=(leading + match.start(), leading + match.end()),
                     )
                     
                 except Exception as e:
@@ -202,25 +207,28 @@ class ActionParser:
         Returns:
             List of ActionResult objects
         """
-        # Extract content from <action></action> tags
-        action_match = re.search(r'<action>(.*?)</action>', text, re.DOTALL)
-        if not action_match:
+        # Preserve offsets across every action block. Runtime credit assignment
+        # depends on the exact generated occurrence, not a later text search.
+        action_matches = list(
+            re.finditer(r'<action>(.*?)</action>', text, re.DOTALL | re.IGNORECASE)
+        )
+        if not action_matches:
             logger.debug("No <action></action> tags found in prediction")
             return []
-        
-        action_content = action_match.group(1).strip()
-        
-        # Parse each line that starts with "Action"
+
         actions = []
-        lines = action_content.split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            # Parse lines that contain action commands in brackets (with or without Action prefix)
-            if line and '[' in line and ']' in line:
-                action_result = self.parse_action(line)
-                if action_result:
-                    actions.append(action_result)
+        for action_match in action_matches:
+            action_content = action_match.group(1)
+            for line_match in re.finditer(r"[^\r\n]+", action_content):
+                line = line_match.group(0)
+                if line and '[' in line and ']' in line:
+                    action_result = self.parse_action(line)
+                    if action_result:
+                        if action_result.source_span is not None:
+                            start, end = action_result.source_span
+                            base = action_match.start(1) + line_match.start()
+                            action_result.source_span = (base + start, base + end)
+                        actions.append(action_result)
         
         return actions
     

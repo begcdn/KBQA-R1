@@ -298,7 +298,11 @@ def compute_advantage(
 
     hyper_enabled = bool(config.get("hyper_r1_enable", False))
     if hyper_enabled:
-        required = {"hyper_r1_action_ids", "terminal_reward"}
+        required = {
+            "hyper_r1_action_ids",
+            "hyper_r1_invalid_action_mask",
+            "terminal_reward",
+        }
         missing = required.difference(data.batch.keys())
         if "hyper_r1_action_records" not in data.non_tensor_batch:
             missing.add("hyper_r1_action_records")
@@ -307,7 +311,10 @@ def compute_advantage(
                 "HyPER-R1 decision-credit fields are missing: "
                 + ", ".join(sorted(missing))
             )
-        from kbqa_r1.hyper_r1 import apply_grouped_decision_credit
+        from kbqa_r1.hyper_r1 import (
+            apply_grouped_decision_credit,
+            penalize_invalid_actions,
+        )
 
         advantages, compared_mask = apply_grouped_decision_credit(
             data.batch["advantages"],
@@ -319,6 +326,11 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["hyper_r1_compared_action_mask"] = compared_mask
+        data.batch["advantages"] = penalize_invalid_actions(
+            data.batch["advantages"],
+            data.batch["hyper_r1_invalid_action_mask"],
+            penalty=float(config.get("hyper_r1_invalid_action_penalty", 0.25)),
+        )
     return data
 
 
@@ -910,8 +922,16 @@ class RayPPOTrainer:
                 execution_counts = (
                     test_batch.batch["hyper_r1_execution_counts"].detach().cpu().tolist()
                 )
-                reward_extra_infos_dict["hyper_r1_execution_calls"].extend(
+                reward_extra_infos_dict["hyper_r1_execution_attempts"].extend(
                     float(value) for value in execution_counts
+                )
+            if "hyper_r1_premature_answer" in test_batch.batch:
+                reward_extra_infos_dict["hyper_r1_premature_answer"].extend(
+                    float(value)
+                    for value in test_batch.batch["hyper_r1_premature_answer"]
+                    .detach()
+                    .cpu()
+                    .tolist()
                 )
             if "hyper_r1_action_records" in test_batch.non_tensor_batch:
                 for records in test_batch.non_tensor_batch["hyper_r1_action_records"]:
@@ -1764,6 +1784,7 @@ class RayPPOTrainer:
                             required = {
                                 "hyper_r1_execution_counts",
                                 "hyper_r1_commit_valid",
+                                "hyper_r1_premature_answer",
                                 "response_mask",
                             }
                             missing = required.difference(batch.batch.keys())
@@ -1836,8 +1857,14 @@ class RayPPOTrainer:
                             metrics["hyper_r1/commit_valid_rate"] = float(
                                 batch.batch["hyper_r1_commit_valid"].float().mean().item()
                             )
-                            metrics["hyper_r1/mean_execution_calls"] = float(
+                            metrics["hyper_r1/mean_execution_attempts"] = float(
                                 batch.batch["hyper_r1_execution_counts"].float().mean().item()
+                            )
+                            metrics["hyper_r1/premature_answer_rate"] = float(
+                                batch.batch["hyper_r1_premature_answer"]
+                                .float()
+                                .mean()
+                                .item()
                             )
                             action_tokens = batch.batch["hyper_r1_action_ids"] > 0
                             compared_tokens = batch.batch[
@@ -1849,6 +1876,12 @@ class RayPPOTrainer:
                             metrics["hyper_r1/compared_action_token_rate"] = float(
                                 compared_tokens.sum().item()
                                 / max(1, action_tokens.sum().item())
+                            )
+                            metrics["hyper_r1/invalid_policy_token_rate"] = float(
+                                batch.batch["hyper_r1_invalid_action_mask"]
+                                .float()
+                                .mean()
+                                .item()
                             )
 
                     # update critic

@@ -192,19 +192,21 @@ class SExprBatchUtils:
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
 
-        return padded_tensor, padded_tensor_with_info
+        return padded_tensor, padded_tensor_with_info, sorted_indices
 
     def update_right_side(self, right_side: Dict, 
                           cur_responses: torch.Tensor,
                           cur_rollout_log_probs: torch.Tensor = None,
-                          next_obs_ids: torch.Tensor = None) -> Dict:
+                          next_obs_ids: torch.Tensor = None,
+                          cur_action_ids: torch.Tensor = None,
+                          cur_invalid_action_mask: torch.Tensor = None) -> Dict:
         """Update right side state.
         
         IMPORTANT: Also handles rollout_log_probs accumulation for mismatch metrics.
         rollout_log_probs should be updated in sync with responses.
         """
         if next_obs_ids is not None:
-            responses, responses_with_info_mask = self.info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, sorted_indices = self.info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
                     cur_responses,
@@ -212,7 +214,7 @@ class SExprBatchUtils:
                     pad_to_left=False
                 )
         else:
-            responses, responses_with_info_mask = self.info_masked_concatenate_with_padding(
+            responses, responses_with_info_mask, sorted_indices = self.info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
                     cur_responses,
@@ -220,11 +222,46 @@ class SExprBatchUtils:
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
+        response_lengths = self.tensor_fn.create_attention_mask(responses).sum(dim=1)
+        tail_truncated = response_lengths > self.config.max_prompt_length
+        if 'hyper_tail_truncated' in right_side:
+            tail_truncated = tail_truncated | right_side['hyper_tail_truncated'].to(
+                device=tail_truncated.device, dtype=torch.bool
+            )
         
         result = {
             'responses': responses[:, :max_len], 
             'responses_with_info_mask': responses_with_info_mask[:, :max_len]
         }
+        if 'hyper_tail_truncated' in right_side:
+            result['hyper_tail_truncated'] = tail_truncated
+
+        if cur_action_ids is not None:
+            previous = right_side.get(
+                'hyper_action_ids', torch.zeros_like(right_side['responses'])
+            )
+            pieces = [previous, cur_action_ids]
+            if next_obs_ids is not None:
+                pieces.append(torch.zeros_like(next_obs_ids))
+            accumulated = torch.cat(pieces, dim=1).gather(1, sorted_indices)
+            result['hyper_action_ids'] = accumulated[:, :max_len]
+        elif 'hyper_action_ids' in right_side:
+            result['hyper_action_ids'] = right_side['hyper_action_ids'][:, :max_len]
+
+        if cur_invalid_action_mask is not None:
+            previous = right_side.get(
+                'hyper_invalid_action_mask',
+                torch.zeros_like(right_side['responses'], dtype=torch.bool),
+            )
+            pieces = [previous, cur_invalid_action_mask.to(dtype=torch.bool)]
+            if next_obs_ids is not None:
+                pieces.append(torch.zeros_like(next_obs_ids, dtype=torch.bool))
+            accumulated = torch.cat(pieces, dim=1).gather(1, sorted_indices)
+            result['hyper_invalid_action_mask'] = accumulated[:, :max_len]
+        elif 'hyper_invalid_action_mask' in right_side:
+            result['hyper_invalid_action_mask'] = right_side[
+                'hyper_invalid_action_mask'
+            ][:, :max_len]
         
         # CRITICAL FIX: Update rollout_log_probs in sync with responses
         # rollout_log_probs correspond to response tokens only (not observations)
@@ -255,7 +292,10 @@ class SExprBatchUtils:
                     cur_turn_log_probs
                 ], dim=1)
             
-            # Apply the same truncation as responses
+            # Compact and truncate with the exact permutation used for response
+            # tokens. Otherwise PPO log probabilities drift away from actions
+            # after the first right-padded turn.
+            accumulated_log_probs = accumulated_log_probs.gather(1, sorted_indices)
             result['rollout_log_probs'] = accumulated_log_probs[:, :max_len]
             
             import logging

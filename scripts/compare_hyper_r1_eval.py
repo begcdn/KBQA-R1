@@ -50,16 +50,17 @@ def compare(baseline_rows: Iterable[dict], method_rows: Iterable[dict]) -> dict:
         method_f1 = [_f1(method[qid]) for qid in ids]
         differences = [right - left for left, right in zip(baseline_f1, method_f1)]
         low, high = paired_bootstrap(differences)
-        baseline_calls = [
-            _number(baseline[qid], "hyper_r1_execution_calls")
-            for qid in ids
-            if "hyper_r1_execution_calls" in baseline[qid]
-        ]
-        method_calls = [
-            _number(method[qid], "hyper_r1_execution_calls")
-            for qid in ids
-            if "hyper_r1_execution_calls" in method[qid]
-        ]
+        def execution_attempts(row):
+            if "hyper_r1_execution_attempts" in row:
+                return _number(row, "hyper_r1_execution_attempts")
+            if "hyper_r1_execution_calls" in row:
+                return _number(row, "hyper_r1_execution_calls")
+            return None
+
+        baseline_calls = [execution_attempts(baseline[qid]) for qid in ids]
+        baseline_calls = [value for value in baseline_calls if value is not None]
+        method_calls = [execution_attempts(method[qid]) for qid in ids]
+        method_calls = [value for value in method_calls if value is not None]
         return {
             "questions": len(ids),
             "baseline_f1": mean(baseline_f1),
@@ -68,8 +69,8 @@ def compare(baseline_rows: Iterable[dict], method_rows: Iterable[dict]) -> dict:
             "delta_f1_bootstrap_95": [low, high],
             "baseline_exact_match": mean(score == 1.0 for score in baseline_f1),
             "method_exact_match": mean(score == 1.0 for score in method_f1),
-            "baseline_execution_calls": mean(baseline_calls) if baseline_calls else None,
-            "method_execution_calls": mean(method_calls) if method_calls else None,
+            "baseline_execution_attempts": mean(baseline_calls) if baseline_calls else None,
+            "method_execution_attempts": mean(method_calls) if method_calls else None,
             "method_wins": sum(delta > 0 for delta in differences),
             "baseline_wins": sum(delta < 0 for delta in differences),
             "ties": sum(delta == 0 for delta in differences),

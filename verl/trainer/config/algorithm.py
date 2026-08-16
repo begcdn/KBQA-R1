@@ -110,5 +110,6 @@ class AlgoConfig(BaseConfig):
     hyper_r1_credit_weight: float = 1.0
     hyper_r1_budget_cost: float = 0.05
     hyper_r1_invalid_commit_penalty: float = 0.25
+    hyper_r1_invalid_action_penalty: float = 0.25
     fork_r1_enable: bool = False
     fork_r1_credit_weight: float = 1.0

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from kbqa_r1.answer_utils import extract_last_answer_values
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
@@ -96,6 +97,12 @@ class SExprLLMGenerationManager:
             raise ValueError("HyPER-R1 max frontier width cannot exceed max_active")
         self._hyper_action_records: Dict[int, List[dict]] = {}
         self._hyper_frontiers: Dict[int, List[dict]] = {}
+        self._hyper_turn_actions: Dict[Tuple[int, int], List[ActionResult]] = {}
+        self._hyper_turn_invalid_spans: Dict[
+            Tuple[int, int], List[Tuple[int, int]]
+        ] = {}
+        self._hyper_valid_answer_turns: Dict[int, int] = {}
+        self._hyper_premature_answers: set[int] = set()
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -336,8 +343,10 @@ class SExprLLMGenerationManager:
         active_before: int = 0,
         selected_before: str = "",
     ):
-        self._hyper_action_records.setdefault(sample_id, []).append(
+        records = self._hyper_action_records.setdefault(sample_id, [])
+        records.append(
             {
+                "action_index": len(records) + 1,
                 "turn": int(turn),
                 "action": action.action_type.value,
                 "node_id": node_id,
@@ -346,8 +355,185 @@ class SExprLLMGenerationManager:
                 "action_key": action_key,
                 "active_before": int(active_before),
                 "selected_before": str(selected_before or ""),
+                "token_span": action.token_span,
             }
         )
+
+    def _open_widen_signature(self, sample_id: int) -> Tuple[Tuple[object, ...], ...]:
+        active_ids = {
+            node.node_id for node in self.hyper_graph.active_nodes(sample_id)
+        }
+        signatures = []
+        for frontier in self._hyper_frontiers.get(sample_id, ()):
+            if not active_ids.intersection(frontier["node_ids"]):
+                continue
+            start = int(frontier["next_offset"])
+            end = int(frontier["max_width"])
+            if start >= end:
+                continue
+            ranked = frontier["decision"].frontier(end)
+            signatures.append(
+                (
+                    str(frontier["source"]),
+                    start,
+                    end,
+                    tuple(candidate.relation for candidate in ranked[start:end]),
+                )
+            )
+        return tuple(sorted(signatures, key=repr))
+
+    def _decision_state_key(self, sample_id: int, turn: int) -> str:
+        return self.hyper_graph.decision_state_key(
+            sample_id,
+            turn=turn,
+            legal_context=self._open_widen_signature(sample_id),
+        )
+
+    def _annotate_action_token_spans(
+        self, prediction: str, actions: List[ActionResult]
+    ) -> None:
+        encoded = self.tokenizer(
+            prediction,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            raise RuntimeError("HyPER-R1 requires tokenizer offset mappings for action credit")
+        for action in actions:
+            if action.source_span is None:
+                raise RuntimeError("HyPER-R1 parsed an action without a source span")
+            action.token_span = self._char_to_token_span(
+                action.source_span, offsets
+            )
+
+    @staticmethod
+    def _char_to_token_span(
+        char_span: Tuple[int, int], offsets
+    ) -> Tuple[int, int]:
+        char_start, char_end = char_span
+        covered = [
+            index
+            for index, (start, end) in enumerate(offsets)
+            if end > char_start and start < char_end
+        ]
+        if not covered:
+            raise RuntimeError(
+                "HyPER-R1 could not map a parsed action to generated tokens"
+            )
+        return covered[0], covered[-1] + 1
+
+    def _prepare_hyper_turn_actions(
+        self, prediction: str, sample_id: int, turn: int
+    ) -> List[ActionResult]:
+        """Parse once and retain exact spans for valid and malformed actions."""
+        actions = self.action_parser.parse_actions_from_text(prediction)
+        self._annotate_action_token_spans(prediction, actions)
+        self._hyper_turn_actions[(sample_id, int(turn))] = list(actions)
+
+        encoded = self.tokenizer(
+            prediction,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            raise RuntimeError("HyPER-R1 requires tokenizer offset mappings for action credit")
+        recognized = [action.source_span for action in actions if action.source_span]
+        invalid_spans: List[Tuple[int, int]] = []
+        for block in re.finditer(
+            r"<action>(.*?)</action>", prediction, re.IGNORECASE | re.DOTALL
+        ):
+            content_start = block.start(1)
+            block_end = block.end(1)
+            covered = sorted(
+                (max(content_start, start), min(block_end, end))
+                for start, end in recognized
+                if end > content_start and start < block_end
+            )
+            cursor = content_start
+            gaps: List[Tuple[int, int]] = []
+            for start, end in covered:
+                if start > cursor:
+                    gaps.append((cursor, start))
+                cursor = max(cursor, end)
+            if cursor < block_end:
+                gaps.append((cursor, block_end))
+            for start, end in gaps:
+                fragment = prediction[start:end]
+                if not fragment.strip():
+                    continue
+                leading = len(fragment) - len(fragment.lstrip())
+                trailing = len(fragment.rstrip())
+                invalid_spans.append(
+                    self._char_to_token_span(
+                        (start + leading, start + trailing), offsets
+                    )
+                )
+        self._hyper_turn_invalid_spans[(sample_id, int(turn))] = invalid_spans
+        return actions
+
+    def _turn_credit_masks(
+        self, responses: torch.Tensor, turn: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid = torch.zeros_like(responses, dtype=torch.long)
+        invalid = torch.zeros_like(responses, dtype=torch.bool)
+        pad_id = self.tokenizer.pad_token_id
+        for sample_id in range(responses.shape[0]):
+            positions = torch.nonzero(
+                responses[sample_id] != pad_id, as_tuple=False
+            ).flatten()
+            records = [
+                record
+                for record in self._hyper_action_records.get(sample_id, ())
+                if int(record["turn"]) == int(turn)
+            ]
+            valid_spans = {
+                tuple(record["token_span"])
+                for record in records
+                if record.get("token_span") is not None
+            }
+            for record in records:
+                span = record.get("token_span")
+                if span is None:
+                    raise RuntimeError(
+                        "HyPER-R1 recorded a valid action without generation-time offsets"
+                    )
+                start, end = span
+                if end > len(positions):
+                    raise RuntimeError("HyPER-R1 action span exceeds its generated turn")
+                valid[sample_id, positions[start:end]] = int(record["action_index"])
+            for action in self._hyper_turn_actions.get((sample_id, int(turn)), ()):
+                if action.token_span is None or tuple(action.token_span) in valid_spans:
+                    continue
+                start, end = action.token_span
+                if end <= len(positions):
+                    invalid[sample_id, positions[start:end]] = True
+            for start, end in self._hyper_turn_invalid_spans.get(
+                (sample_id, int(turn)), ()
+            ):
+                if end <= len(positions):
+                    invalid[sample_id, positions[start:end]] = True
+        return valid, invalid
+
+    def _mark_hyper_text_invalid(
+        self,
+        prediction: str,
+        sample_id: int,
+        turn: int,
+        char_span: Tuple[int, int],
+    ) -> None:
+        encoded = self.tokenizer(
+            prediction,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = encoded.get("offset_mapping")
+        if offsets is None:
+            raise RuntimeError("HyPER-R1 requires tokenizer offsets for protocol penalties")
+        self._hyper_turn_invalid_spans.setdefault(
+            (sample_id, int(turn)), []
+        ).append(self._char_to_token_span(char_span, offsets))
 
     def _execute_hyper_candidate(
         self,
@@ -360,6 +546,7 @@ class SExprLLMGenerationManager:
         provenance: str,
     ):
         """Execute one cached natural relation proposal without changing policy state."""
+        self.hyper_graph.record_execution_attempt(sample_id)
         alternative_state = append_intervened_join(
             decision, relation=candidate.relation
         )
@@ -406,7 +593,7 @@ class SExprLLMGenerationManager:
             graph_state = self.hyper_graph.state(sample_id)
             if graph_state.committed_id is not None:
                 raise ValueError("the hypothesis graph is already committed; return its answer")
-            state_key = self.hyper_graph.decision_state_key(sample_id, turn=turn)
+            state_key = self._decision_state_key(sample_id, turn)
             active_before = len(self.hyper_graph.active_nodes(sample_id))
             selected_before = graph_state.selected_id or ""
             action_key = self.hyper_graph.action_key(
@@ -469,7 +656,7 @@ class SExprLLMGenerationManager:
                 action_key = self.hyper_graph.action_key(
                     sample_id,
                     action.action_type.value,
-                    created,
+                    (),
                     details=(f"source:{source}", *exposed_relations),
                 )
                 self._record_hyper_action(
@@ -562,6 +749,7 @@ class SExprLLMGenerationManager:
                     right.function_state,
                     right.target_expression,
                 )
+                self.hyper_graph.record_execution_attempt(sample_id)
                 sexpr_result = self.sexpr_generator.generate_sexpr_from_strings(state, target)
                 if not sexpr_result.is_valid:
                     raise ValueError(sexpr_result.error_message)
@@ -669,8 +857,8 @@ class SExprLLMGenerationManager:
 
         # Exploring a leaf replaces it in the active frontier. Its historical
         # node remains in the graph for provenance and credit assignment.
-        state_key = self.hyper_graph.decision_state_key(
-            sample_id, turn=self.action_processor._fork_r1_current_turn
+        state_key = self._decision_state_key(
+            sample_id, self.action_processor._fork_r1_current_turn
         )
         active_before = len(self.hyper_graph.active_nodes(sample_id))
         selected_before = graph_state.selected_id or ""
@@ -784,56 +972,50 @@ class SExprLLMGenerationManager:
         if not self.hyper_r1_enable:
             return output
         responses = output.batch["responses"]
-        action_ids = torch.zeros_like(responses, dtype=torch.long)
+        action_ids = output.batch.pop(
+            "hyper_action_ids", torch.zeros_like(responses, dtype=torch.long)
+        )
+        invalid_action_mask = output.batch.pop(
+            "hyper_invalid_action_mask",
+            torch.zeros_like(responses, dtype=torch.bool),
+        ).to(dtype=torch.bool)
+        tail_truncated = output.batch.pop(
+            "hyper_tail_truncated",
+            torch.zeros(batch_size, dtype=torch.bool, device=responses.device),
+        ).to(dtype=torch.bool)
+        if bool(tail_truncated.any()):
+            raise RuntimeError(
+                "HyPER-R1 response truncation removed policy tokens; increase max_prompt_length"
+            )
         execution_counts = torch.zeros(batch_size, dtype=torch.float32, device=responses.device)
         commit_valid = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
+        premature_answer = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
         action_records = []
         graph_records = []
         for sample_id in range(batch_size):
             graph = self.hyper_graph.state(sample_id)
             graph_records.append(self.hyper_graph.to_dict(sample_id))
-            execution_counts[sample_id] = float(graph.execution_calls)
-            decoded = self.tokenizer.decode(
-                responses[sample_id].tolist(), skip_special_tokens=True
-            )
-            commit_valid[sample_id] = self.hyper_graph.answer_matches_commit(
-                sample_id, decoded
-            )
+            execution_counts[sample_id] = float(graph.execution_attempts)
+            commit_valid[sample_id] = sample_id in self._hyper_valid_answer_turns
+            premature_answer[sample_id] = sample_id in self._hyper_premature_answers
             records = list(self._hyper_action_records.get(sample_id, []))
             action_records.append(records)
-            for action_index, record in enumerate(records, 1):
-                raw_action = record.get("raw_action") or ""
-                if not raw_action:
-                    raise RuntimeError("HyPER-R1 recorded a graph action without source text")
-                row = responses[sample_id].tolist()
-                matched_span = None
-                for variant in (raw_action, " " + raw_action, "\n" + raw_action):
-                    token_ids = self.tokenizer(
-                        variant, add_special_tokens=False
-                    )["input_ids"]
-                    if not token_ids:
-                        continue
-                    width = len(token_ids)
-                    for start in range(len(row) - width + 1):
-                        end = start + width
-                        if (
-                            row[start:end] == list(token_ids)
-                            and not torch.any(action_ids[sample_id, start:end])
-                        ):
-                            matched_span = (start, end)
-                            break
-                    if matched_span is not None:
-                        break
-                if matched_span is None:
-                    raise RuntimeError(
-                        "HyPER-R1 could not align a graph action with response tokens: "
-                        + raw_action
-                    )
-                start, end = matched_span
-                action_ids[sample_id, start:end] = action_index
+            expected = {int(record["action_index"]) for record in records}
+            observed = {
+                int(value)
+                for value in torch.unique(action_ids[sample_id]).tolist()
+                if int(value) > 0
+            }
+            if expected != observed:
+                raise RuntimeError(
+                    "HyPER-R1 action-token alignment is incomplete: "
+                    f"expected={sorted(expected)} observed={sorted(observed)}"
+                )
         output.batch["hyper_r1_action_ids"] = action_ids
+        output.batch["hyper_r1_invalid_action_mask"] = invalid_action_mask
         output.batch["hyper_r1_execution_counts"] = execution_counts
         output.batch["hyper_r1_commit_valid"] = commit_valid
+        output.batch["hyper_r1_premature_answer"] = premature_answer
         output.non_tensor_batch["hyper_r1_action_records"] = np.array(
             action_records, dtype=object
         )
@@ -965,11 +1147,21 @@ class SExprLLMGenerationManager:
                 logger.info(f"[SEXPR] Sample {i}: Skipped (inactive)")
                 return (i, local_next_obs, True, False)
 
-            answer_match = re.search(r'<answer>(.*?)</answer>', pred, re.DOTALL)
-            if answer_match:
+            if self.hyper_r1_enable and self.config.enable_sexpr_mode:
+                self._prepare_hyper_turn_actions(pred, i, turn)
+
+            answer_values = extract_last_answer_values(pred)
+            if answer_values is not None:
                 if self.hyper_r1_enable:
+                    answer_match = list(
+                        re.finditer(r"<answer>.*?</answer>", pred, re.I | re.S)
+                    )[-1]
                     graph = self.hyper_graph.state(i)
                     if graph.committed_id is None:
+                        self._hyper_premature_answers.add(i)
+                        self._mark_hyper_text_invalid(
+                            pred, i, turn, answer_match.span()
+                        )
                         return (
                             i,
                             self._hyper_info(
@@ -980,7 +1172,12 @@ class SExprLLMGenerationManager:
                             False,
                             False,
                         )
-                    if not self.hyper_graph.answer_matches_commit(i, pred):
+                    if not self.hyper_graph.answer_values_match_commit(
+                        i, answer_values
+                    ):
+                        self._mark_hyper_text_invalid(
+                            pred, i, turn, answer_match.span()
+                        )
                         committed = self.hyper_graph.committed_node(i)
                         expected = ", ".join(committed.denotation) if committed else ""
                         return (
@@ -994,6 +1191,7 @@ class SExprLLMGenerationManager:
                             False,
                             False,
                         )
+                    self._hyper_valid_answer_turns[i] = int(turn)
                 logger.info(f"[SEXPR] Sample {i}: Completed (found answer)")
                 logger.info(f"[SEXPR] Sample {i}: prediction: {pred}")
                 # Clear the linear executor state. The hypothesis graph remains
@@ -1082,7 +1280,9 @@ class SExprLLMGenerationManager:
         self.action_processor.clear_sample_action_states(index)
         
         # Parse actions from prediction using <action></action> tags
-        actions = self.action_parser.parse_actions_from_text(prediction)
+        actions = self._hyper_turn_actions.get((index, int(turn)))
+        if actions is None:
+            actions = self.action_parser.parse_actions_from_text(prediction)
         
         # Log all S-Expression processing samples
         if actions:
@@ -1319,6 +1519,8 @@ class SExprLLMGenerationManager:
         
         # Execute S-Expression with enhanced logging for timeout detection
         logger.info(f"[SEXPR-EXEC] Sample {index}: About to execute S-Expression: {sexpr_result.sexpr}")
+        if self.hyper_r1_enable:
+            self.hyper_graph.record_execution_attempt(index)
         
         try:
             # Get function_state for debugging context
@@ -1704,6 +1906,10 @@ class SExprLLMGenerationManager:
                 self.hyper_graph.clear()
                 self._hyper_action_records.clear()
                 self._hyper_frontiers.clear()
+                self._hyper_turn_actions.clear()
+                self._hyper_turn_invalid_spans.clear()
+                self._hyper_valid_answer_turns.clear()
+                self._hyper_premature_answers.clear()
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
 
@@ -1730,6 +1936,12 @@ class SExprLLMGenerationManager:
         
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
+        if self.hyper_r1_enable:
+            original_right_side["hyper_action_ids"] = initial_input_ids[:, []]
+            original_right_side["hyper_invalid_action_mask"] = initial_input_ids[:, []].bool()
+            original_right_side["hyper_tail_truncated"] = torch.zeros(
+                batch_size, dtype=torch.bool, device=initial_input_ids.device
+            )
         
         active_mask = torch.ones(batch_size, dtype=torch.bool)
         active_num_list = [active_mask.sum().item()]
@@ -1867,6 +2079,12 @@ class SExprLLMGenerationManager:
             
             # Execute predictions (S-Expression or SPARQL)
             next_obs, dones = self.execute_predictions(responses_str, self.tokenizer.pad_token, active_mask, turn=turn)
+            cur_action_ids = None
+            cur_invalid_action_mask = None
+            if self.hyper_r1_enable:
+                cur_action_ids, cur_invalid_action_mask = self._turn_credit_masks(
+                    responses_ids, turn
+                )
             
             # Process observations
             next_obs_ids = self._process_next_obs(next_obs)
@@ -1884,7 +2102,9 @@ class SExprLLMGenerationManager:
                 original_right_side, 
                 responses_ids, 
                 cur_rollout_log_probs=cur_rollout_log_probs,
-                next_obs_ids=next_obs_ids
+                next_obs_ids=next_obs_ids,
+                cur_action_ids=cur_action_ids,
+                cur_invalid_action_mask=cur_invalid_action_mask,
             )
             
             # 只记录最后一轮的截断统计信息 (优化版本)
@@ -1965,8 +2185,22 @@ class SExprLLMGenerationManager:
                 cur_rollout_log_probs = full_batch_rollout_log_probs
                 logger.info(f"[MISMATCH FIX] Final turn: Extracted rollout_log_probs, active shape: {gen_output.batch['rollout_log_probs'].shape}, expanded: {cur_rollout_log_probs.shape}")
 
-            # Execute final predictions
-            _, dones = self.execute_predictions(responses_str, self.tokenizer.pad_token, active_mask, do_execution=False, turn=turn)
+            # The answer-only generation is a distinct turn from the last
+            # executable policy decision.
+            final_turn = self.config.max_turns
+            _, dones = self.execute_predictions(
+                responses_str,
+                self.tokenizer.pad_token,
+                active_mask,
+                do_execution=False,
+                turn=final_turn,
+            )
+            cur_action_ids = None
+            cur_invalid_action_mask = None
+            if self.hyper_r1_enable:
+                cur_action_ids, cur_invalid_action_mask = self._turn_credit_masks(
+                    responses_ids, final_turn
+                )
 
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
@@ -1976,7 +2210,9 @@ class SExprLLMGenerationManager:
             original_right_side = self.batch_utils.update_right_side(
                 original_right_side,
                 responses_ids,
-                cur_rollout_log_probs=cur_rollout_log_probs
+                cur_rollout_log_probs=cur_rollout_log_probs,
+                cur_action_ids=cur_action_ids,
+                cur_invalid_action_mask=cur_invalid_action_mask,
             )
         
             # Collect final turn dialogue data

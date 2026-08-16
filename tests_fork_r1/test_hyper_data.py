@@ -170,7 +170,7 @@ def test_builds_replayable_delayed_frontier_recovery():
         for message in sft["messages"]
         if message["role"] == "user" and "<hypothesis_graph>" in message["content"]
     ]
-    assert "nodes=3 executions=3" in graph_observations[0]
+    assert "nodes=3 execution_attempts=3" in graph_observations[0]
     assert "H3" not in graph_observations[0]
 
     assert len(demos) == 1
@@ -194,6 +194,88 @@ def test_recovery_does_not_emit_a_contradictory_direct_twin():
     demos = DemonstrationBuilder(fake_executor, candidates).build(row)
 
     assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+
+
+def test_three_hop_program_teaches_repeated_public_frontier_progress():
+    row = {
+        "ID": "three-hop",
+        "question": "Which answer follows all three intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+            "expression1 = JOIN('r.gold3', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if all(relation in text for relation in ("r.gold1", "r.gold2", "r.gold3")):
+            return ["m.answer"]
+        if "r.gold1" in text and "r.gold2" in text:
+            return ["m.second"]
+        if "r.gold1" in text:
+            return ["m.first"]
+        return ["m.alternative"]
+
+    def provider(query, state, join):
+        return [
+            RelationOption(join.relation, 0.95, 1),
+            RelationOption(f"r.alt_{join.index}_a", 0.85, 2),
+            RelationOption(f"r.alt_{join.index}_b", 0.75, 3),
+        ]
+
+    demo = DemonstrationBuilder(
+        executor, provider, max_turns=14
+    ).build(row)[0]
+
+    assert demo.family == "deep_frontier_progress"
+    assert demo.private_metadata["path_hops"] == 3
+    assert [step.action for step in demo.steps].count("Find_relation") == 3
+    assert [step.action for step in demo.steps].count("Select") == 2
+    assert demo.steps[-1].action == "Commit"
+    assert max(node.depth for node in demo.hypotheses.values()) == 2
+    assert DemonstrationValidator(executor, max_active=6).validate(demo) == []
+
+
+def test_four_hop_program_stays_within_the_training_turn_budget():
+    row = {
+        "ID": "four-hop",
+        "question": "Which answer follows all four intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+            "expression1 = JOIN('r.gold3', expression1)",
+            "expression1 = JOIN('r.gold4', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        gold_count = sum(f"r.gold{index}" in text for index in range(1, 5))
+        if gold_count == 4:
+            return ["m.answer"]
+        if gold_count:
+            return [f"m.prefix{gold_count}"]
+        return ["m.alternative"]
+
+    def provider(query, state, join):
+        return [
+            RelationOption(join.relation, 0.95, 1),
+            RelationOption(f"r.alt_{join.index}_a", 0.85, 2),
+            RelationOption(f"r.alt_{join.index}_b", 0.75, 3),
+        ]
+
+    demo = DemonstrationBuilder(executor, provider, max_turns=14).build(row)[0]
+
+    assert demo.private_metadata["path_hops"] == 4
+    assert len(demo.steps) + 1 <= 14
+    assert [step.action for step in demo.steps].count("Find_relation") == 4
+    assert max(node.depth for node in demo.hypotheses.values()) == 3
+    assert DemonstrationValidator(executor, max_active=6).validate(demo) == []
 
 
 def test_recovery_probe_uses_natural_frontier_without_hidden_gold_injection():
