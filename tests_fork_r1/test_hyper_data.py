@@ -1005,6 +1005,109 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
     assert DemonstrationValidator(two_root_executor, max_active=6).validate(conjunction) == []
 
 
+def test_builds_public_deep_conjunction_from_two_multihop_roots():
+    row = {
+        "ID": "deep-two-root",
+        "question": "Which item follows both two-hop branches?",
+        "function_list": [
+            "expression = START('m.left_root')",
+            "expression = JOIN('r.left1', expression)",
+            "expression = JOIN('r.left2', expression)",
+            "expression1 = START('m.right_root')",
+            "expression1 = JOIN('r.right1', expression1)",
+            "expression1 = JOIN('r.right2', expression1)",
+            "expression = AND(expression, expression1)",
+            "expression = STOP(expression)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def provider(query, state, join):
+        return [
+            RelationOption(join.relation, 0.9, 1),
+            RelationOption("r.alt", 0.8, 2),
+        ]
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "r.alt" in text:
+            return ["m.alt"]
+        if "AND(" in text:
+            return ["m.shared"]
+        if "r.left2" in text:
+            return ["m.left", "m.shared"]
+        if "r.right2" in text:
+            return ["m.right", "m.shared"]
+        if "r.left1" in text:
+            return ["m.left_prefix"]
+        if "r.right1" in text:
+            return ["m.right_prefix"]
+        return []
+
+    builder = DemonstrationBuilder(executor, provider, max_turns=14)
+    demos = builder.build(row)
+    deep = [demo for demo in demos if demo.family == "deep_conjunction_progress"]
+
+    assert len(deep) == 1
+    assert [step.action for step in deep[0].steps].count("Find_relation") == 4
+    assert [step.action for step in deep[0].steps][-2:] == ["Combine", "Commit"]
+    assert DemonstrationValidator(executor, max_active=6).validate(deep[0]) == []
+
+
+def test_deep_conjunction_can_continue_after_combining_branches():
+    row = {
+        "ID": "deep-two-root-tail",
+        "question": "Which answer follows the intersection and final relation?",
+        "function_list": [
+            "expression = START('m.left_root')",
+            "expression = JOIN('r.left1', expression)",
+            "expression = JOIN('r.left2', expression)",
+            "expression1 = START('m.right_root')",
+            "expression1 = JOIN('r.right1', expression1)",
+            "expression = AND(expression, expression1)",
+            "expression = JOIN('r.tail', expression)",
+            "expression = STOP(expression)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def provider(query, state, join):
+        return [
+            RelationOption(join.relation, 0.9, 1),
+            RelationOption("r.alt", 0.8, 2),
+        ]
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "r.alt" in text:
+            return ["m.alt"]
+        if "r.tail" in text:
+            return ["m.answer"]
+        if "AND(" in text:
+            return ["m.intermediate"]
+        if "r.left2" in text:
+            return ["m.left", "m.intermediate"]
+        if "r.right1" in text:
+            return ["m.right", "m.intermediate"]
+        if "r.left1" in text:
+            return ["m.left_prefix"]
+        return []
+
+    builder = DemonstrationBuilder(executor, provider, max_turns=14)
+    demos = builder.build(row)
+    deep = [demo for demo in demos if demo.family == "deep_conjunction_progress"]
+
+    assert len(deep) == 1
+    actions = [step.action for step in deep[0].steps]
+    combine_index = actions.index("Combine")
+    continuation = [
+        action for action in actions[combine_index + 1 :] if action != "Prune"
+    ]
+    assert continuation[:2] == ["Select", "Find_relation"]
+    assert actions[-1] == "Commit"
+    assert DemonstrationValidator(executor, max_active=6).validate(deep[0]) == []
+
+
 def test_builder_and_validator_share_execution_cache():
     row = {
         "ID": "cached",

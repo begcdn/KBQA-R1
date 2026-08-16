@@ -8,7 +8,7 @@ actions, denotations, or the committed answer.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import re
@@ -1416,7 +1416,14 @@ class DemonstrationBuilder:
         # than from a hidden multi-hop gold prefix.
         if any("JOIN(" in raw for raw in (*left_state, *right_state)):
             self.stats["conjunction_hidden_prefix"] += 1
-            return None
+            return self._build_deep_intersection_demo(
+                question_id=question_id,
+                question=question,
+                plan=plan,
+                combine=combine,
+                gold_answers=gold_answers,
+                terminal_branches=(left_join, right_join),
+            )
         left_action_source = _action_source(left_state, left_join.raw)
         right_action_source = _action_source(right_state, right_join.raw)
         same_frontier = left_state == right_state and left_action_source == right_action_source
@@ -1605,6 +1612,352 @@ class DemonstrationBuilder:
                 "conjunction_roots": len(frontiers),
             },
         )
+
+    def _build_deep_intersection_demo(
+        self,
+        *,
+        question_id: str,
+        question: str,
+        plan: GoldPlan,
+        combine: ProgramStatement,
+        gold_answers: Tuple[str, ...],
+        terminal_branches: Sequence[ProgramStatement],
+    ) -> Optional[HyperDemonstration]:
+        """Expose complete branch exploration before combining and continuing."""
+        branch_chains = [
+            self._join_chain_to_root(plan, terminal)
+            for terminal in terminal_branches
+        ]
+        if any(not chain for chain in branch_chains):
+            return None
+
+        query = question.strip()
+        hypotheses: Dict[str, ExecutedHypothesis] = {}
+        active: List[str] = []
+        steps: List[DemonstrationStep] = []
+        required_terminals: List[ExecutedHypothesis] = []
+        widen_sources: List[str] = []
+
+        def open_root_frontier(
+            join: ProgramStatement,
+            protected: Sequence[str],
+            branch_label: str,
+        ) -> Optional[ExecutedHypothesis]:
+            source = join.sources[0] if join.sources else _join_source(join.raw)
+            state_before = self._dependency_state(plan, source, before=join.index)
+            if any("JOIN(" in raw or "AND(" in raw for raw in state_before):
+                return None
+            options = list(self.candidate_provider(query, state_before, join))[
+                : self.max_frontier_width
+            ]
+            initial_options = options[: self.frontier_width]
+            required = next(
+                (option for option in options if option.relation == join.relation), None
+            )
+            self.stats["deep_conjunction_root_decisions"] += 1
+            if required is None:
+                self.stats["deep_conjunction_root_max_frontier_miss"] += 1
+                return None
+            self.stats["deep_conjunction_root_max_frontier_hit"] += 1
+            initial_relations = {option.relation for option in initial_options}
+            needs_widen = required.relation not in initial_relations
+            self.stats[
+                "deep_conjunction_root_proposal_miss"
+                if needs_widen else "deep_conjunction_root_proposal_hit"
+            ] += 1
+            if needs_widen:
+                self.stats["deep_conjunction_root_recovered_by_widen"] += 1
+            visible_options = options if needs_widen else initial_options
+            initial_created: List[str] = []
+            widened_created: List[str] = []
+            required_node = None
+            for option in visible_options:
+                statement = replace_join_relation(join.raw, option.relation)
+                state = state_before + [statement]
+                values = self._execute(state, join.target)
+                if values is None:
+                    continue
+                node_id = f"H{len(hypotheses)}"
+                node = ExecutedHypothesis(
+                    node_id,
+                    tuple(state),
+                    join.target,
+                    values,
+                    denotation_labels=self._display_pairs(values),
+                    relation=option.relation,
+                    role="continuation",
+                    provenance=(
+                        "policy_choice" if option.rank == 1 else "ranked_alternative",
+                    ),
+                )
+                hypotheses[node_id] = node
+                target_batch = (
+                    initial_created
+                    if option.relation in initial_relations
+                    else widened_created
+                )
+                target_batch.append(node_id)
+                if option.relation == join.relation:
+                    required_node = node
+            if required_node is None or len(initial_created) < 2:
+                return None
+            if not self._append_capacity_prunes(
+                steps,
+                hypotheses,
+                active,
+                maximum_active=self.max_active - len(initial_created),
+                protected=protected,
+            ):
+                return None
+            action_source = _action_source(state_before, join.raw)
+            steps.append(
+                DemonstrationStep(
+                    "Find_relation",
+                    (action_source,),
+                    tuple(active),
+                    tuple(initial_created),
+                    (f"open_deep_conjunction_{branch_label}_root",),
+                )
+            )
+            active.extend(initial_created)
+            if widened_created:
+                if not self._append_capacity_prunes(
+                    steps,
+                    hypotheses,
+                    active,
+                    maximum_active=self.max_active - len(widened_created),
+                    protected=protected,
+                ):
+                    return None
+                steps.append(
+                    DemonstrationStep(
+                        "Widen",
+                        (action_source,),
+                        tuple(active),
+                        tuple(widened_created),
+                        ("required_relation_missing_from_initial_frontier",),
+                    )
+                )
+                active.extend(widened_created)
+                widen_sources.append(action_source)
+            return required_node
+
+        def continue_chain(
+            current: ExecutedHypothesis,
+            remaining: Sequence[ProgramStatement],
+            protected: Sequence[str],
+            stat_scope: str,
+        ) -> Optional[ExecutedHypothesis]:
+            for continuation in remaining:
+                if not self._append_capacity_prunes(
+                    steps,
+                    hypotheses,
+                    active,
+                    maximum_active=self.max_active - self.frontier_width,
+                    protected=(*protected, current.hypothesis_id),
+                ):
+                    return None
+                steps.append(
+                    DemonstrationStep(
+                        "Select",
+                        (current.hypothesis_id,),
+                        tuple(active),
+                        (),
+                        (f"question_relation_match:{current.relation}",),
+                    )
+                )
+                initial_children, widened_children = (
+                    self._expand_terminal_frontier_batches(
+                        current,
+                        continuation,
+                        hypotheses,
+                        question,
+                        stat_scope=stat_scope,
+                    )
+                )
+                children = initial_children + widened_children
+                next_required = next(
+                    (
+                        hypotheses[node_id]
+                        for node_id in children
+                        if hypotheses[node_id].relation == continuation.relation
+                    ),
+                    None,
+                )
+                if next_required is None or len(initial_children) < 2:
+                    return None
+                before = tuple(active)
+                active.remove(current.hypothesis_id)
+                active.extend(initial_children)
+                steps.append(
+                    DemonstrationStep(
+                        "Find_relation",
+                        (current.target_expression,),
+                        before,
+                        tuple(initial_children),
+                        ("continue_required_branch",),
+                    )
+                )
+                if widened_children:
+                    if not self._append_capacity_prunes(
+                        steps,
+                        hypotheses,
+                        active,
+                        maximum_active=self.max_active - len(widened_children),
+                        protected=protected,
+                    ):
+                        return None
+                    steps.append(
+                        DemonstrationStep(
+                            "Widen",
+                            (current.target_expression,),
+                            tuple(active),
+                            tuple(widened_children),
+                            ("required_relation_missing_from_initial_frontier",),
+                        )
+                    )
+                    active.extend(widened_children)
+                    widen_sources.append(current.target_expression)
+                current = next_required
+            return current
+
+        for index, chain in enumerate(branch_chains):
+            label = "left" if index == 0 else "right"
+            protected = tuple(node.hypothesis_id for node in required_terminals)
+            current = open_root_frontier(chain[0], protected, label)
+            if current is None:
+                return None
+            current = continue_chain(
+                current,
+                chain[1:],
+                protected,
+                "deep_conjunction_continuation",
+            )
+            if current is None:
+                return None
+            hypotheses[current.hypothesis_id] = replace(
+                current, role="required_branch"
+            )
+            required_terminals.append(hypotheses[current.hypothesis_id])
+
+        left, right = required_terminals
+        combined_state, combined_target = combine_function_states(
+            left.function_state,
+            left.target_expression,
+            right.function_state,
+            right.target_expression,
+        )
+        combined_values = self._execute(combined_state, combined_target)
+        reference_state = self._dependency_state(
+            plan, combine.target, before=combine.index + 1
+        )
+        reference_values = self._execute(reference_state, combine.target)
+        if (
+            combined_values is None
+            or combined_values != reference_values
+            or combined_values
+            != normalize_values(set(left.denotation) & set(right.denotation))
+            or combined_values in {left.denotation, right.denotation}
+        ):
+            return None
+        combined = ExecutedHypothesis(
+            f"H{len(hypotheses)}",
+            tuple(combined_state),
+            combined_target,
+            combined_values,
+            denotation_labels=self._display_pairs(combined_values),
+            role="combined",
+            parent_id=left.hypothesis_id,
+            parent_ids=(left.hypothesis_id, right.hypothesis_id),
+            operation="combine",
+            depth=max(left.depth, right.depth) + 1,
+            provenance=(f"combined_with:{right.hypothesis_id}",),
+        )
+        hypotheses[combined.hypothesis_id] = combined
+        steps.append(
+            DemonstrationStep(
+                "Combine",
+                (left.hypothesis_id, right.hypothesis_id),
+                tuple(active),
+                created=(combined.hypothesis_id,),
+                rationale_facts=("both_branches_necessary",),
+            )
+        )
+        active.remove(left.hypothesis_id)
+        active.remove(right.hypothesis_id)
+        active.append(combined.hypothesis_id)
+
+        tail = self._linear_tail_after_combine(plan, combine)
+        final = continue_chain(
+            combined,
+            tail,
+            (),
+            "deep_conjunction_tail",
+        )
+        if final is None or final.denotation != gold_answers:
+            return None
+        steps.append(
+            DemonstrationStep(
+                "Commit",
+                (final.hypothesis_id,),
+                tuple(active),
+                (),
+                ("complete", "executable"),
+            )
+        )
+        self.stats["deep_conjunction_built"] += 1
+        return HyperDemonstration(
+            demo_id=f"{question_id}:and:{combine.index}:deep",
+            question_id=question_id,
+            question=question,
+            family="deep_conjunction_progress",
+            hypotheses=hypotheses,
+            steps=steps,
+            gold_answers=gold_answers,
+            private_metadata={
+                "decision_index": combine.index,
+                "retrieval_intent_source": "question",
+                "conjunction_roots": 2,
+                "widen_sources": widen_sources,
+                "path_hops": sum(len(chain) for chain in branch_chains)
+                + len(tail),
+            },
+        )
+
+    def _join_chain_to_root(
+        self, plan: GoldPlan, terminal: ProgramStatement
+    ) -> Tuple[ProgramStatement, ...]:
+        chain = [terminal]
+        current = terminal
+        while current.sources:
+            dependency = self._definition_before(
+                plan, current.sources[0], current.index
+            )
+            if dependency is None:
+                return ()
+            if dependency.kind == "start":
+                return tuple(reversed(chain))
+            if dependency.kind != "join":
+                return ()
+            chain.append(dependency)
+            current = dependency
+        return ()
+
+    @staticmethod
+    def _linear_tail_after_combine(
+        plan: GoldPlan, combine: ProgramStatement
+    ) -> Tuple[ProgramStatement, ...]:
+        tail = []
+        current_target = combine.target
+        for statement in plan.statements:
+            if statement.index <= combine.index:
+                continue
+            if statement.kind == "join" and statement.sources == (current_target,):
+                tail.append(statement)
+                current_target = statement.target
+            elif statement.kind == "and" and current_target in statement.sources:
+                break
+        return tuple(tail)
 
     def _definition_before(
         self, plan: GoldPlan, target: str, before: int
@@ -1926,7 +2279,7 @@ class DemonstrationValidator:
             if len(active) > self.max_active:
                 errors.append(f"active hypothesis budget exceeded: {len(active)}")
 
-        if demo.family == "conjunction":
+        if demo.family in {"conjunction", "deep_conjunction_progress"}:
             combined = next((node for node in demo.hypotheses.values() if node.role == "combined"), None)
             parents = [node for node in demo.hypotheses.values() if node.role == "required_branch"]
             if combined is None or len(parents) != 2:
@@ -1937,8 +2290,15 @@ class DemonstrationValidator:
                 set(parents[0].denotation) & set(parents[1].denotation)
             ):
                 errors.append("combined denotation is not the parent intersection")
-            if committed != (combined.hypothesis_id if combined else None):
-                errors.append("conjunction must commit its combined hypothesis")
+            if demo.family == "conjunction":
+                if committed != (combined.hypothesis_id if combined else None):
+                    errors.append("conjunction must commit its combined hypothesis")
+            elif combined is not None and committed is not None:
+                ancestor = demo.hypotheses[committed]
+                while ancestor.parent_id is not None and ancestor.hypothesis_id != combined.hypothesis_id:
+                    ancestor = demo.hypotheses[ancestor.parent_id]
+                if ancestor.hypothesis_id != combined.hypothesis_id:
+                    errors.append("deep conjunction must commit the combined branch or its descendant")
         return errors
 
 

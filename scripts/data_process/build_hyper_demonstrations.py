@@ -698,7 +698,10 @@ def main() -> None:
     deep_input_rows = sum(
         count for hop, count in rows_by_hop.items() if int(hop) >= 3
     )
-    deep_training_trajectories = families.get("deep_frontier_progress", 0)
+    deep_training_trajectories = (
+        families.get("deep_frontier_progress", 0)
+        + families.get("deep_conjunction_progress", 0)
+    )
     minimum_deep_trajectories = (
         min(deep_input_rows, max(100, math.ceil(0.10 * deep_input_rows)))
         if deep_input_rows else 0
@@ -714,7 +717,10 @@ def main() -> None:
             proposal_stats.get("proposal_recovered_by_widen", 0) == 0
             or families.get("adaptive_frontier_widen", 0) > 0
         ),
-        "contains_required_conjunction": families.get("conjunction", 0) > 0,
+        "contains_required_conjunction": (
+            families.get("conjunction", 0)
+            + families.get("deep_conjunction_progress", 0)
+        ) > 0,
         "deep_progress_has_training_mass": (
             deep_training_trajectories >= minimum_deep_trajectories
         ),
