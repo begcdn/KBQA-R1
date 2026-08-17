@@ -242,6 +242,105 @@ def test_operator_program_opens_comparison_branch_and_combines_it():
     assert trajectory_sft_record(demo)["extra_info"]["replay_verified"] is True
 
 
+def test_operator_program_elides_redundant_bare_type_before_count():
+    row = {
+        "ID": "count-with-redundant-type",
+        "question": "How many exhibition subjects are connected to the curator?",
+        "function_list": [
+            "expression = START('m.curator')",
+            "expression = JOIN('r.subjects', expression)",
+            "expression1 = START('exhibitions.exhibition_subject')",
+            "expression = AND(expression1, expression)",
+            "expression = COUNT(expression)",
+        ],
+        "answer": ["2"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "COUNT(" in text:
+            return ["2"]
+        if "AND(" in text or "r.subjects" in text:
+            return ["m.one", "m.two"]
+        if "r.alternative" in text:
+            return ["m.other"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.alternative", 0.9, 1),
+            RelationOption("r.subjects", 0.8, 2),
+        ]
+
+    builder = DemonstrationBuilder(executor, options)
+    demo = builder.build(row)[0]
+
+    assert [step.action for step in demo.steps] == [
+        "Find_relation",
+        "Select",
+        "Count",
+        "Commit",
+    ]
+    assert builder.stats["operator_program_redundant_bare_intersection"] == 1
+    assert DemonstrationValidator(executor).validate(demo) == []
+
+
+def test_operator_program_elides_redundant_bare_type_after_compare():
+    literal = "7.0^^http://www.w3.org/2001/XMLSchema#float"
+    row = {
+        "ID": "compare-with-redundant-type",
+        "question": "Which wind forces have waves at least 7.0 high?",
+        "function_list": [
+            f"expression = START('{literal}')",
+            "expression = CMP('ge', 'r.wave_height', expression)",
+            "expression1 = START('meteorology.beaufort_wind_force')",
+            "expression = AND(expression1, expression)",
+        ],
+        "answer": ["m.force10", "m.force11"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "CMP(" in text or "AND(" in text:
+            return ["m.force10", "m.force11"]
+        return []
+
+    builder = DemonstrationBuilder(executor, lambda *_args: [])
+    demo = builder.build(row)[0]
+
+    assert [step.action for step in demo.steps] == ["Compare", "Commit"]
+    assert builder.stats["operator_program_redundant_bare_intersection"] == 1
+    assert DemonstrationValidator(executor).validate(demo) == []
+
+
+def test_operator_program_rejects_nonredundant_bare_type_intersection():
+    literal = "7.0^^http://www.w3.org/2001/XMLSchema#float"
+    row = {
+        "ID": "compare-with-required-type",
+        "question": "Which wind force has waves at least 7.0 high?",
+        "function_list": [
+            f"expression = START('{literal}')",
+            "expression = CMP('ge', 'r.wave_height', expression)",
+            "expression1 = START('meteorology.beaufort_wind_force')",
+            "expression = AND(expression1, expression)",
+        ],
+        "answer": ["m.force10"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.force10"]
+        if "CMP(" in text:
+            return ["m.force10", "m.other_type"]
+        return []
+
+    builder = DemonstrationBuilder(executor, lambda *_args: [])
+
+    assert builder.build(row) == []
+    assert builder.stats["operator_program_nonredundant_bare_intersection"] == 1
+
+
 def test_operator_program_applies_order_and_time_to_the_selected_branch():
     row = {
         "ID": "ordered-time-program",

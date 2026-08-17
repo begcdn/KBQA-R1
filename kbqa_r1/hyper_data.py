@@ -853,6 +853,46 @@ class DemonstrationBuilder:
             if statement.kind == "and":
                 left = expression_nodes.get(statement.sources[0])
                 right = expression_nodes.get(statement.sources[1])
+                if (left is None) != (right is None):
+                    # GrailQA commonly intersects an executable branch with a
+                    # bare ontology START (for example, COUNT(items AND
+                    # exhibition_subject)). HyPER has no public action that
+                    # materializes a bare type branch. Elide it only when live
+                    # execution proves that the intersection is denotationally
+                    # identical to the executable branch; otherwise the row is
+                    # not representable by the runtime grammar and is rejected.
+                    missing_source = (
+                        statement.sources[0] if left is None else statement.sources[1]
+                    )
+                    preserved = right if left is None else left
+                    bare_start = start_states.get(missing_source)
+                    if preserved is None or bare_start is None:
+                        self.stats["operator_program_unrepresented_intersection"] += 1
+                        return None
+                    bare_state = [bare_start[0]]
+                    if left is None:
+                        combined_state, combined_target = combine_function_states(
+                            bare_state,
+                            missing_source,
+                            preserved.function_state,
+                            preserved.target_expression,
+                        )
+                    else:
+                        combined_state, combined_target = combine_function_states(
+                            preserved.function_state,
+                            preserved.target_expression,
+                            bare_state,
+                            missing_source,
+                        )
+                    combined_values = self._execute(combined_state, combined_target)
+                    if combined_values != preserved.denotation:
+                        self.stats[
+                            "operator_program_nonredundant_bare_intersection"
+                        ] += 1
+                        return None
+                    self.stats["operator_program_redundant_bare_intersection"] += 1
+                    expression_nodes[statement.target] = preserved
+                    continue
                 if (
                     left is None
                     or right is None
