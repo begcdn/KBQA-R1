@@ -577,7 +577,9 @@ class DemonstrationBuilder:
             return []
         intersection_demos: List[HyperDemonstration] = []
         semantic_branch_indexes = set()
-        if plan.operators or self._has_bare_type_intersection(plan):
+        terminal_type = self._terminal_type_constraint(plan)
+        has_bare_type = self._has_bare_type_intersection(plan)
+        if plan.operators or (has_bare_type and terminal_type is None):
             operator_demo = self._build_operator_program_demo(
                 question_id, question, plan, gold_answers
             )
@@ -612,6 +614,15 @@ class DemonstrationBuilder:
                 if demo is not None:
                     demos.append(demo)
             demos.extend(intersection_demos)
+        if terminal_type is not None and not plan.operators:
+            constrained_demos = []
+            for demo in demos:
+                constrained = self._append_terminal_type_constraint(
+                    demo, plan, gold_answers
+                )
+                if constrained is not None:
+                    constrained_demos.append(constrained)
+            demos = constrained_demos
         within_budget = []
         for demo in demos:
             if len(demo.hypotheses) > self.max_nodes:
@@ -1219,7 +1230,10 @@ class DemonstrationBuilder:
             default=None,
         )
 
-        terminal_gold = join.target == plan.target_expression and gold.denotation == gold_answers
+        terminal_gold = (
+            join.target == plan.target_expression
+            and self._matches_terminal_answers(plan, gold, gold_answers)
+        )
         if terminal_gold:
             steps.extend(
                 [
@@ -1236,6 +1250,7 @@ class DemonstrationBuilder:
                 return self._build_deep_progress_demo(
                     question_id=question_id,
                     question=question,
+                    plan=plan,
                     join=join,
                     following_joins=following_joins,
                     candidates=candidates,
@@ -1264,7 +1279,9 @@ class DemonstrationBuilder:
                         hypotheses[node_id]
                         for node_id in gold_children
                         if hypotheses[node_id].relation == next_join.relation
-                        and hypotheses[node_id].denotation == gold_answers
+                        and self._matches_terminal_answers(
+                            plan, hypotheses[node_id], gold_answers
+                        )
                     ),
                     None,
                 )
@@ -1332,6 +1349,7 @@ class DemonstrationBuilder:
                     direct = self._build_direct_progress_demo(
                         question_id,
                         question,
+                        plan,
                         join,
                         next_join,
                         candidates,
@@ -1375,6 +1393,7 @@ class DemonstrationBuilder:
                     direct = self._build_direct_progress_demo(
                         question_id,
                         question,
+                        plan,
                         join,
                         next_join,
                         candidates,
@@ -1411,6 +1430,7 @@ class DemonstrationBuilder:
                     direct = self._build_direct_progress_demo(
                         question_id,
                         question,
+                        plan,
                         join,
                         next_join,
                         candidates,
@@ -1461,7 +1481,9 @@ class DemonstrationBuilder:
                         hypotheses[node_id]
                         for node_id in gold_children
                         if hypotheses[node_id].relation == next_join.relation
-                        and hypotheses[node_id].denotation == gold_answers
+                        and self._matches_terminal_answers(
+                            plan, hypotheses[node_id], gold_answers
+                        )
                     ),
                     None,
                 )
@@ -1546,6 +1568,7 @@ class DemonstrationBuilder:
         *,
         question_id: str,
         question: str,
+        plan: GoldPlan,
         join: ProgramStatement,
         following_joins: Sequence[ProgramStatement],
         candidates: Sequence[Tuple[RelationOption, ExecutedHypothesis]],
@@ -1668,7 +1691,7 @@ class DemonstrationBuilder:
                 return None
             current_gold = next_gold
 
-        if current_gold.denotation != gold_answers:
+        if not self._matches_terminal_answers(plan, current_gold, gold_answers):
             self.stats["deep_progress_terminal_mismatch"] += 1
             return None
         steps.append(
@@ -1716,6 +1739,7 @@ class DemonstrationBuilder:
         self,
         question_id: str,
         question: str,
+        plan: GoldPlan,
         join: ProgramStatement,
         next_join: ProgramStatement,
         candidates: Sequence[
@@ -1753,7 +1777,9 @@ class DemonstrationBuilder:
                 hypotheses[node_id]
                 for node_id in gold_children
                 if hypotheses[node_id].relation == next_join.relation
-                and hypotheses[node_id].denotation == gold_answers
+                and self._matches_terminal_answers(
+                    plan, hypotheses[node_id], gold_answers
+                )
             ),
             None,
         )
@@ -2184,9 +2210,9 @@ class DemonstrationBuilder:
         )
         reference_values = self._execute(reference_state, combine.target)
         if (
-            reference_values != gold_answers
-            or combined_values != gold_answers
-            or combined_values != normalize_values(set(left.denotation) & set(right.denotation))
+            reference_values != combined_values
+            or combined_values
+            != normalize_values(set(left.denotation) & set(right.denotation))
             or combined_values in {left.denotation, right.denotation}
         ):
             return None
@@ -2198,6 +2224,8 @@ class DemonstrationBuilder:
             operation="combine", depth=max(left.depth, right.depth) + 1,
             provenance=(f"combined_with:{right.hypothesis_id}",),
         )
+        if not self._matches_terminal_answers(plan, combined, gold_answers):
+            return None
         hypotheses[combined.hypothesis_id] = combined
         steps = []
         active = []
@@ -2586,7 +2614,10 @@ class DemonstrationBuilder:
             (),
             "deep_conjunction_tail",
         )
-        if final is None or final.denotation != gold_answers:
+        if (
+            final is None
+            or not self._matches_terminal_answers(plan, final, gold_answers)
+        ):
             return None
         steps.append(
             DemonstrationStep(
@@ -2666,17 +2697,160 @@ class DemonstrationBuilder:
         )
 
     def _has_bare_type_intersection(self, plan: GoldPlan) -> bool:
-        for combine in plan.intersections:
-            for source in combine.sources:
-                definition = self._definition_before(plan, source, combine.index)
-                if (
-                    definition is not None
-                    and definition.kind == "start"
-                    and definition.arguments
-                    and _is_ontology_type(definition.arguments[0])
-                ):
-                    return True
-        return False
+        return any(
+            self._bare_type_for_intersection(plan, combine) is not None
+            for combine in plan.intersections
+        )
+
+    def _bare_type_for_intersection(
+        self, plan: GoldPlan, combine: ProgramStatement
+    ) -> Optional[str]:
+        types = []
+        for source in combine.sources:
+            definition = self._definition_before(plan, source, combine.index)
+            if (
+                definition is not None
+                and definition.kind == "start"
+                and definition.arguments
+                and _is_ontology_type(definition.arguments[0])
+            ):
+                types.append(definition.arguments[0])
+        return types[0] if len(types) == 1 else None
+
+    def _terminal_type_constraint(self, plan: GoldPlan) -> Optional[str]:
+        """Return one explicit answer type that follows the semantic path."""
+        non_stop = tuple(
+            statement for statement in plan.statements if statement.kind != "stop"
+        )
+        if not non_stop or non_stop[-1].kind != "and":
+            return None
+        terminal = non_stop[-1]
+        if terminal.target != plan.target_expression:
+            return None
+        return self._bare_type_for_intersection(plan, terminal)
+
+    @staticmethod
+    def _type_merge_state(
+        functions: Sequence[str], target: str, ontology_type: str
+    ) -> Tuple[Tuple[str, ...], str]:
+        expression_numbers = [
+            int(number)
+            for raw in functions
+            for number in re.findall(r"expression(\d+)", str(raw))
+        ]
+        type_expression = f"expression{max(expression_numbers, default=0) + 1}"
+        state = (
+            *tuple(str(raw) for raw in functions),
+            f"{type_expression} = START('{ontology_type}')",
+            f"{target} = AND({target}, {type_expression})",
+        )
+        return state, type_expression
+
+    def _terminal_values(
+        self,
+        plan: GoldPlan,
+        functions: Sequence[str],
+        target: str,
+        untyped_values: Tuple[str, ...],
+    ) -> Optional[Tuple[str, ...]]:
+        ontology_type = self._terminal_type_constraint(plan)
+        if ontology_type is None:
+            return untyped_values
+        state, _ = self._type_merge_state(functions, target, ontology_type)
+        return self._execute(state, target)
+
+    def _matches_terminal_answers(
+        self,
+        plan: GoldPlan,
+        node: ExecutedHypothesis,
+        gold_answers: Tuple[str, ...],
+    ) -> bool:
+        return (
+            self._terminal_values(
+                plan,
+                node.function_state,
+                node.target_expression,
+                node.denotation,
+            )
+            == gold_answers
+        )
+
+    def _append_terminal_type_constraint(
+        self,
+        demo: HyperDemonstration,
+        plan: GoldPlan,
+        gold_answers: Tuple[str, ...],
+    ) -> Optional[HyperDemonstration]:
+        ontology_type = self._terminal_type_constraint(plan)
+        if ontology_type is None:
+            return demo
+        if not demo.steps or demo.steps[-1].action != "Commit":
+            return None
+        commit = demo.steps[-1]
+        committed = demo.hypotheses.get(commit.arguments[0])
+        if committed is None or committed.hypothesis_id not in commit.visible_before:
+            return None
+        state, _ = self._type_merge_state(
+            committed.function_state,
+            committed.target_expression,
+            ontology_type,
+        )
+        values = self._execute(state, committed.target_expression)
+        if values != gold_answers:
+            self.stats["frontier_type_constraint_terminal_mismatch"] += 1
+            return None
+        if len(demo.hypotheses) >= self.max_nodes:
+            self.stats["trajectory_node_budget_miss"] += 1
+            return None
+        constrained_step_count = len(demo.steps) + 2
+        if constrained_step_count + 1 > self.max_turns:
+            self.stats["trajectory_turn_budget_miss"] += 1
+            return None
+
+        node_id = f"H{len(demo.hypotheses)}"
+        filtered = ExecutedHypothesis(
+            node_id,
+            state,
+            committed.target_expression,
+            values,
+            denotation_labels=self._display_pairs(values),
+            role="type_constrained",
+            parent_id=committed.hypothesis_id,
+            operation="merge",
+            depth=committed.depth + 1,
+            provenance=(f"ontology_type:{ontology_type}",),
+        )
+        demo.hypotheses[node_id] = filtered
+        active_before = tuple(commit.visible_before)
+        active_after = tuple(
+            item for item in active_before if item != committed.hypothesis_id
+        ) + (node_id,)
+        demo.steps[-1:] = [
+            DemonstrationStep(
+                "Select",
+                (committed.hypothesis_id,),
+                active_before,
+                (),
+                ("apply_required_ontology_type_constraint",),
+            ),
+            DemonstrationStep(
+                "Merge",
+                (committed.target_expression, ontology_type),
+                active_before,
+                (node_id,),
+                ("explicit_gold_type_constraint",),
+            ),
+            DemonstrationStep(
+                "Commit",
+                (node_id,),
+                active_after,
+                (),
+                ("complete", "executable"),
+            ),
+        ]
+        demo.private_metadata["ontology_type_constraints"] = [ontology_type]
+        self.stats["frontier_type_constraint"] += 1
+        return demo
 
     def _immediate_intersection_branches(
         self, plan: GoldPlan, combine: ProgramStatement
@@ -3115,15 +3289,14 @@ class DemonstrationValidator:
                 set(parents[0].denotation) & set(parents[1].denotation)
             ):
                 errors.append("combined denotation is not the parent intersection")
-            if demo.family == "conjunction":
-                if committed != (combined.hypothesis_id if combined else None):
-                    errors.append("conjunction must commit its combined hypothesis")
-            elif combined is not None and committed is not None:
+            if combined is not None and committed is not None:
                 ancestor = demo.hypotheses[committed]
                 while ancestor.parent_id is not None and ancestor.hypothesis_id != combined.hypothesis_id:
                     ancestor = demo.hypotheses[ancestor.parent_id]
                 if ancestor.hypothesis_id != combined.hypothesis_id:
-                    errors.append("deep conjunction must commit the combined branch or its descendant")
+                    errors.append(
+                        "conjunction must commit the combined branch or its descendant"
+                    )
         return errors
 
 

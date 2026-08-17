@@ -584,6 +584,54 @@ def test_three_hop_program_teaches_repeated_public_frontier_progress():
     assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
 
 
+def test_three_hop_program_applies_terminal_type_after_public_progress():
+    row = {
+        "ID": "typed-three-hop",
+        "question": "Which typed answer follows all three intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+            "expression1 = JOIN('r.gold3', expression1)",
+            "expression2 = START('answer.type')",
+            "expression1 = AND(expression1, expression2)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if all(relation in text for relation in ("r.gold1", "r.gold2", "r.gold3")):
+            return ["m.answer"] if "AND(" in text else ["m.answer", "m.other"]
+        if "r.gold1" in text and "r.gold2" in text:
+            return ["m.second"]
+        if "r.gold1" in text:
+            return ["m.first"]
+        return ["m.alternative"]
+
+    def provider(query, state, join):
+        return [
+            RelationOption(join.relation, 0.95, 1),
+            RelationOption(f"r.alt_{join.index}_a", 0.85, 2),
+            RelationOption(f"r.alt_{join.index}_b", 0.75, 3),
+        ]
+
+    demo = DemonstrationBuilder(executor, provider, max_turns=14).build(row)[0]
+
+    assert demo.family == "deep_frontier_progress"
+    assert [step.action for step in demo.steps].count("Find_relation") == 3
+    assert [step.action for step in demo.steps][-3:] == [
+        "Select",
+        "Merge",
+        "Commit",
+    ]
+    assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
+
+    over_budget = DemonstrationBuilder(executor, provider, max_turns=8)
+    assert over_budget.build(row) == []
+    assert over_budget.stats["trajectory_turn_budget_miss"] == 1
+
+
 def test_four_hop_program_stays_within_the_training_turn_budget():
     row = {
         "ID": "four-hop",
@@ -742,7 +790,8 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
 
     demos = DemonstrationBuilder(typed_executor, candidates).build(row)
 
-    assert [demo.family for demo in demos] == ["typed_program"]
+    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+    assert any(step.action == "Prune" for step in demos[0].steps)
     continuation_sources = [
         step.arguments[0]
         for step in demos[0].steps
@@ -755,6 +804,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
         "Merge",
         "Commit",
     ]
+    assert DemonstrationValidator(typed_executor).validate(demos[0]) == []
 
 
 def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer():
@@ -1125,7 +1175,13 @@ def test_builder_never_exposes_gold_types_as_candidate_entities():
 
     demo = DemonstrationBuilder(executor, options).build(row)[0]
 
-    assert demo.family == "typed_program"
+    assert demo.family == "frontier_commit"
+    assert [step.action for step in demo.steps] == [
+        "Find_relation",
+        "Select",
+        "Merge",
+        "Commit",
+    ]
     assert demo.private_metadata["candidate_entities"] == [("Topic", "m.topic")]
     rendered = trajectory_sft_record(demo)
     user_prompt = rendered["messages"][0]["content"]
@@ -1354,7 +1410,7 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
 
     builder = DemonstrationBuilder(two_root_executor, two_root_candidates)
     demos = builder.build(row)
-    typed = [demo for demo in demos if demo.family == "typed_program"]
+    typed = [demo for demo in demos if demo.family == "conjunction"]
 
     assert len(typed) == 1
     conjunction = typed[0]
@@ -1371,7 +1427,7 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
     assert DemonstrationValidator(two_root_executor, max_active=6).validate(conjunction) == []
 
 
-def test_builds_public_deep_conjunction_from_two_multihop_roots():
+def test_builds_typed_public_deep_conjunction_from_two_multihop_roots():
     row = {
         "ID": "deep-two-root",
         "question": "Which item follows both two-hop branches?",
@@ -1383,6 +1439,8 @@ def test_builds_public_deep_conjunction_from_two_multihop_roots():
             "expression1 = JOIN('r.right1', expression1)",
             "expression1 = JOIN('r.right2', expression1)",
             "expression = AND(expression, expression1)",
+            "expression2 = START('answer.type')",
+            "expression = AND(expression, expression2)",
             "expression = STOP(expression)",
         ],
         "answer": ["m.shared"],
@@ -1398,12 +1456,14 @@ def test_builds_public_deep_conjunction_from_two_multihop_roots():
         text = "\n".join(functions)
         if "r.alt" in text:
             return ["m.alt"]
-        if "AND(" in text:
+        if text.count("AND(") >= 2:
             return ["m.shared"]
+        if "AND(" in text:
+            return ["m.shared", "m.other"]
         if "r.left2" in text:
-            return ["m.left", "m.shared"]
+            return ["m.left", "m.shared", "m.other"]
         if "r.right2" in text:
-            return ["m.right", "m.shared"]
+            return ["m.right", "m.shared", "m.other"]
         if "r.left1" in text:
             return ["m.left_prefix"]
         if "r.right1" in text:
@@ -1416,7 +1476,12 @@ def test_builds_public_deep_conjunction_from_two_multihop_roots():
 
     assert len(deep) == 1
     assert [step.action for step in deep[0].steps].count("Find_relation") == 4
-    assert [step.action for step in deep[0].steps][-2:] == ["Combine", "Commit"]
+    assert [step.action for step in deep[0].steps][-4:] == [
+        "Combine",
+        "Select",
+        "Merge",
+        "Commit",
+    ]
     assert DemonstrationValidator(executor, max_active=6).validate(deep[0]) == []
 
 
