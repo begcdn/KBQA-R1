@@ -732,10 +732,11 @@ class RelationRetrieval:
     def rank_relations_no_threshold(self,
                                     gen_argument: str,
                                     candidate_relations: List[Tuple[str, str]],
-                                    topk: int = 20) -> List[RelationCandidate]:
+                                    topk: Optional[int] = 20) -> List[RelationCandidate]:
         """
         Rank candidate relations by similarity without applying a threshold.
-        Returns up to topk candidates sorted by score (desc).
+        Returns candidates sorted by score (desc). ``topk=None`` preserves the
+        complete structurally enumerated list for paged HyPER exploration.
         """
         if not candidate_relations:
             return []
@@ -786,6 +787,10 @@ class RelationRetrieval:
             ))
 
         ranked.sort(key=lambda x: x.score, reverse=True)
+        if topk is None:
+            return ranked
+        if topk < 1:
+            raise ValueError("topk must be positive or None")
         return ranked[:topk]
     
     def _simple_similarity(self, query: str, candidates: List[str]) -> List[float]:

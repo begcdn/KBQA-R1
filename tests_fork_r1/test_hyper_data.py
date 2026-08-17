@@ -71,13 +71,41 @@ def one_hop_candidates(query, state, join):
     ]
 
 
-def test_compile_rejects_unsupported_operator():
-    try:
-        compile_gold_plan(["expression1 = COUNT(expression0)"])
-    except IneligibleProgram as exc:
-        assert "unsupported operator" in str(exc)
-    else:
-        raise AssertionError("COUNT should not silently enter the first corpus")
+def test_compile_accepts_runtime_logical_operators():
+    plan = compile_gold_plan(
+        [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.values', expression1)",
+            "expression1 = ARG('ARGMAX', expression1, 'r.number')",
+            "expression1 = TC(expression1, 'r.from', 'NOW')",
+            "expression1 = COUNT(expression1)",
+        ]
+    )
+
+    assert [statement.kind for statement in plan.statements] == [
+        "start",
+        "join",
+        "order",
+        "time_constraint",
+        "count",
+    ]
+    assert [statement.arguments for statement in plan.operators] == [
+        ("ARGMAX", "expression1", "r.number"),
+        ("r.from", "NOW"),
+        ("expression1",),
+    ]
+
+
+def test_compile_accepts_comparison_branch():
+    plan = compile_gold_plan(
+        [
+            "expression1 = START('42^^http://www.w3.org/2001/XMLSchema#integer')",
+            "expression1 = CMP('ge', 'r.number', expression1)",
+        ]
+    )
+
+    assert plan.operators[0].kind == "compare"
+    assert plan.operators[0].arguments == ("ge", "r.number", "expression1")
 
 
 def test_compile_accepts_unnumbered_grailqa_expression_variable():
@@ -121,6 +149,184 @@ def test_compile_requires_stop_to_be_terminal():
         raise AssertionError("statements after STOP must be rejected")
 
 
+def test_operator_program_teaches_count_after_retained_relation_frontier():
+    row = {
+        "ID": "count-program",
+        "question": "How many items are connected to the topic?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.items', expression1)",
+            "expression1 = COUNT(expression1)",
+        ],
+        "answer": ["2"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "COUNT(" in text:
+            return ["2"]
+        if "r.items" in text:
+            return ["m.one", "m.two"]
+        if "r.alternative" in text:
+            return ["m.other"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.alternative", 0.9, 1),
+            RelationOption("r.items", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, options).build(row)[0]
+
+    assert demo.family == "operator_program"
+    assert [step.action for step in demo.steps] == [
+        "Find_relation",
+        "Select",
+        "Count",
+        "Commit",
+    ]
+    assert DemonstrationValidator(executor).validate(demo) == []
+    rendered = trajectory_sft_record(demo)
+    assistant = [
+        message["content"]
+        for message in rendered["messages"]
+        if message["role"] == "assistant"
+    ]
+    assert any("Count [ expression1 ]" in message for message in assistant)
+
+
+def test_operator_program_opens_comparison_branch_and_combines_it():
+    literal = "42^^http://www.w3.org/2001/XMLSchema#integer"
+    row = {
+        "ID": "comparison-program",
+        "question": "Which topic items have a score of at least 42?",
+        "function_list": [
+            f"expression1 = START('{literal}')",
+            "expression1 = CMP('ge', 'r.score', expression1)",
+            "expression2 = START('m.topic')",
+            "expression2 = JOIN('r.items', expression2)",
+            "expression3 = AND(expression1, expression2)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.shared"]
+        if "CMP(" in text:
+            return ["m.high", "m.shared"]
+        if "r.items" in text:
+            return ["m.shared", "m.topic_item"]
+        if "r.alternative" in text:
+            return ["m.other"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.items", 0.9, 1),
+            RelationOption("r.alternative", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, options).build(row)[0]
+
+    assert [step.action for step in demo.steps] == [
+        "Compare",
+        "Find_relation",
+        "Combine",
+        "Commit",
+    ]
+    assert demo.steps[0].arguments == ("ge", "r.score", literal)
+    assert DemonstrationValidator(executor).validate(demo) == []
+    assert trajectory_sft_record(demo)["extra_info"]["replay_verified"] is True
+
+
+def test_operator_program_applies_order_and_time_to_the_selected_branch():
+    row = {
+        "ID": "ordered-time-program",
+        "question": "Which connected item was latest among those active now?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.items', expression1)",
+            "expression1 = ARG('ARGMAX', expression1, 'r.date')",
+            "expression1 = TC(expression1, 'r.from', 'NOW')",
+        ],
+        "answer": ["m.latest"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "TC(" in text:
+            return ["m.latest"]
+        if "ARG(" in text:
+            return ["m.latest", "m.old"]
+        if "r.items" in text:
+            return ["m.latest", "m.old", "m.other"]
+        if "r.alternative" in text:
+            return ["m.unrelated"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.items", 0.9, 1),
+            RelationOption("r.alternative", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, options).build(row)[0]
+
+    assert [step.action for step in demo.steps] == [
+        "Find_relation",
+        "Select",
+        "Order",
+        "Select",
+        "Time_constraint",
+        "Commit",
+    ]
+    assert DemonstrationValidator(executor).validate(demo) == []
+
+
+def test_operator_program_is_rejected_when_runtime_node_budget_cannot_fit_it():
+    row = {
+        "ID": "operator-node-budget",
+        "question": "How many entities follow both relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.first', expression1)",
+            "expression1 = JOIN('r.second', expression1)",
+            "expression1 = COUNT(expression1)",
+        ],
+        "answer": ["2"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "COUNT(" in text:
+            return ["2"]
+        return ["m.one", "m.two"]
+
+    def six_options(query, state, join):
+        return [
+            RelationOption(
+                join.relation if index == 0 else f"r.alt_{join.index}_{index}",
+                1.0 - index / 10,
+                index + 1,
+            )
+            for index in range(6)
+        ]
+
+    builder = DemonstrationBuilder(
+        executor,
+        six_options,
+        max_active=12,
+        max_nodes=12,
+        frontier_width=6,
+    )
+
+    assert builder.build(row) == []
+    assert builder.stats["operator_program_node_budget_miss"] == 1
+
+
 def test_builds_replayable_delayed_frontier_recovery():
     row = {
         "ID": "q1",
@@ -148,7 +354,7 @@ def test_builds_replayable_delayed_frontier_recovery():
         for step in demo.steps
         if step.action == "Find_relation"
     )
-    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
     public = step_sft_records(demo)
     assert all("private_metadata" not in record for record in public)
@@ -260,7 +466,7 @@ def test_three_hop_program_teaches_repeated_public_frontier_progress():
     assert [step.action for step in demo.steps].count("Select") == 2
     assert demo.steps[-1].action == "Commit"
     assert max(node.depth for node in demo.hypotheses.values()) == 2
-    assert DemonstrationValidator(executor, max_active=6).validate(demo) == []
+    assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
 
 
 def test_four_hop_program_stays_within_the_training_turn_budget():
@@ -299,7 +505,7 @@ def test_four_hop_program_stays_within_the_training_turn_budget():
     assert len(demo.steps) + 1 <= 14
     assert [step.action for step in demo.steps].count("Find_relation") == 4
     assert max(node.depth for node in demo.hypotheses.values()) == 3
-    assert DemonstrationValidator(executor, max_active=6).validate(demo) == []
+    assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
 
 
 def test_recovery_probe_uses_natural_frontier_without_hidden_gold_injection():
@@ -479,13 +685,14 @@ def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
     }
 
     def wider_candidates(query, state, join):
+        alternatives = [
+            RelationOption(f"r.alt_{rank}", 1.0 - rank / 20, rank)
+            for rank in range(1, 13)
+        ]
         return [
-            RelationOption("r.alt1", 0.95, 1),
-            RelationOption("r.other1", 0.90, 2),
-            RelationOption("r.unrelated", 0.85, 3),
-            RelationOption("r.gold1", 0.80, 4),
-            RelationOption("r.extra1", 0.75, 5),
-            RelationOption("r.extra2", 0.70, 6),
+            *alternatives,
+            RelationOption("r.gold1", 0.30, 13),
+            RelationOption("r.extra14", 0.25, 14),
         ]
 
     builder = DemonstrationBuilder(fake_executor, wider_candidates)
@@ -493,14 +700,18 @@ def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
 
     assert demo.family == "adaptive_frontier_widen"
     assert [step.action for step in demo.steps] == [
-        "Find_relation", "Widen", "Commit"
+        "Find_relation", "Widen", "Widen", "Commit"
     ]
-    assert demo.private_metadata["gold_rank"] == 4
+    assert demo.private_metadata["gold_rank"] == 13
     assert demo.private_metadata["proposal_recall_at_frontier"] is False
-    assert demo.private_metadata["proposal_recall_at_max_frontier"] is True
+    assert demo.private_metadata["proposal_recall_within_budget"] is True
     assert demo.private_metadata["candidate_future_values"]["r.gold1"]["answer_exact"]
-    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
     rendered = trajectory_sft_record(demo)
+    rendered_text = str(rendered["messages"])
+    assert "exposed=6/14 next_page=6" in rendered_text
+    assert "exposed=12/14 next_page=2" in rendered_text
+    assert "exposed=14/14 next_page=none" in rendered_text
     assert any(
         "Widen [ m.topic ]" in message["content"]
         for message in rendered["messages"]
@@ -531,9 +742,11 @@ def test_widen_also_applies_to_a_selected_hypothesis_continuation():
             RelationOption("r.alt2", 0.95, 1),
             RelationOption("r.other2", 0.90, 2),
             RelationOption("r.third2", 0.85, 3),
-            RelationOption("r.gold2", 0.80, 4),
-            RelationOption("r.extra2", 0.75, 5),
-            RelationOption("r.last2", 0.70, 6),
+            RelationOption("r.extra2", 0.80, 4),
+            RelationOption("r.last2", 0.75, 5),
+            RelationOption("r.sixth2", 0.70, 6),
+            RelationOption("r.gold2", 0.65, 7),
+            RelationOption("r.eighth2", 0.60, 8),
         ]
 
     demo = DemonstrationBuilder(fake_executor, continuation_candidates).build(row)[0]
@@ -542,28 +755,12 @@ def test_widen_also_applies_to_a_selected_hypothesis_continuation():
     assert [step.action for step in demo.steps].count("Widen") == 1
     widen = next(step for step in demo.steps if step.action == "Widen")
     assert widen.arguments == ("expression1",)
-    assert len(widen.created) == 3
-    capacity_prunes = [step for step in demo.steps if step.action == "Prune"]
-    assert capacity_prunes
-    assert all(
-        any(
-            fact in {"frontier_capacity_eviction", "frontier_capacity_reservation"}
-            for fact in step.rationale_facts
-        )
-        for step in capacity_prunes
-        if any(demo.hypotheses[step.arguments[0]].denotation)
-    )
-    rendered = trajectory_sft_record(demo)
-    assert any(
-        "does not have enough room" in message["content"]
-        and "before expanding" in message["content"]
-        for message in rendered["messages"]
-        if message["role"] == "assistant"
-    )
-    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    assert len(widen.created) == 2
+    assert all(step.action != "Prune" for step in demo.steps)
+    assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
 
-def test_full_frontier_capacity_eviction_uses_pre_prune_state():
+def test_plausible_frontier_is_not_pruned_for_capacity():
     row = {
         "ID": "full-capacity-eviction",
         "question": "Which answer follows both intended relations?",
@@ -591,14 +788,12 @@ def test_full_frontier_capacity_eviction_uses_pre_prune_state():
         ]
 
     demo = DemonstrationBuilder(fake_executor, full_frontier_candidates).build(row)[0]
-    evictions = [
-        step
+    assert all(
+        "frontier_capacity_eviction" not in step.rationale_facts
+        and "frontier_capacity_reservation" not in step.rationale_facts
         for step in demo.steps
-        if "frontier_capacity_eviction" in step.rationale_facts
-    ]
-    assert evictions
-    assert all(len(step.visible_before) == 6 for step in evictions)
-    assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
+    )
+    assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
 
 def test_capacity_eviction_is_rejected_when_frontier_is_not_full():

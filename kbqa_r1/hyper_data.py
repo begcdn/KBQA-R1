@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 
 from .hyper_prompt import build_hyper_prompt
 from .hyper_r1 import combine_function_states, relation_path, serialize_frontier
+from .relation_paging import relation_page, serialize_relation_page_state
 
 
 _EXPRESSION = r"expression\d*"
@@ -23,6 +24,16 @@ _ASSIGNMENT = re.compile(rf"^\s*({_EXPRESSION})\s*=\s*(.+?)\s*$")
 _START = re.compile(r"^START\('(.+)'\)$")
 _JOIN = re.compile(rf"^JOIN\('(.+)'\s*,\s*({_EXPRESSION}|'[^']+')\)$")
 _AND = re.compile(rf"^AND\(({_EXPRESSION})\s*,\s*({_EXPRESSION})\)$")
+_ARG = re.compile(
+    rf"^ARG\('([^']+)'\s*,\s*({_EXPRESSION})\s*,\s*'([^']+)'\)$"
+)
+_CMP = re.compile(
+    rf"^CMP\('([^']+)'\s*,\s*'([^']+)'\s*,\s*({_EXPRESSION})\)$"
+)
+_TC = re.compile(
+    rf"^TC\(({_EXPRESSION})\s*,\s*'([^']+)'\s*,\s*'([^']+)'\)$"
+)
+_COUNT = re.compile(rf"^COUNT\(({_EXPRESSION})\)$")
 _STOP = re.compile(rf"^STOP\(({_EXPRESSION})\)$")
 
 
@@ -62,6 +73,7 @@ class ProgramStatement:
     sources: Tuple[str, ...]
     relation: Optional[str]
     raw: str
+    arguments: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,14 @@ class GoldPlan:
     def intersections(self) -> Tuple[ProgramStatement, ...]:
         return tuple(statement for statement in self.statements if statement.kind == "and")
 
+    @property
+    def operators(self) -> Tuple[ProgramStatement, ...]:
+        return tuple(
+            statement
+            for statement in self.statements
+            if statement.kind in {"order", "compare", "time_constraint", "count"}
+        )
+
 
 class IneligibleProgram(ValueError):
     pass
@@ -88,7 +108,7 @@ class ProgramExecutionError(RuntimeError):
 
 
 def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
-    """Compile START/JOIN/AND/STOP into runtime-compatible expression names."""
+    """Compile the released runtime grammar into canonical expression names."""
     raw_functions = [str(value).strip() for value in function_list]
     has_bare_expression = any(
         re.search(r"\bexpression\b", raw) for raw in raw_functions
@@ -121,12 +141,16 @@ def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
         start = _START.match(rhs)
         join = _JOIN.match(rhs)
         combine = _AND.match(rhs)
+        order = _ARG.match(rhs)
+        compare = _CMP.match(rhs)
+        time_constraint = _TC.match(rhs)
+        count = _COUNT.match(rhs)
         stop = _STOP.match(rhs)
         if start:
             entity = start.group(1)
             canonical_raw = f"{target} = START('{entity}')"
             statement = ProgramStatement(
-                index, target, "start", (), None, canonical_raw
+                index, target, "start", (), None, canonical_raw, (entity,)
             )
         elif join:
             relation, source = join.groups()
@@ -144,7 +168,13 @@ def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
                 f"{target} = JOIN('{relation}', {canonical_source})"
             )
             statement = ProgramStatement(
-                index, target, "join", sources, relation, canonical_raw
+                index,
+                target,
+                "join",
+                sources,
+                relation,
+                canonical_raw,
+                (relation, canonical_source),
             )
         elif combine:
             source_names = combine.groups()
@@ -156,7 +186,81 @@ def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
             sources = tuple(expression_name(source) for source in source_names)
             canonical_raw = f"{target} = AND({sources[0]}, {sources[1]})"
             statement = ProgramStatement(
-                index, target, "and", sources, None, canonical_raw
+                index, target, "and", sources, None, canonical_raw, sources
+            )
+        elif order:
+            mode, source, relation = order.groups()
+            if source not in defined:
+                raise IneligibleProgram(
+                    f"statement {index} references undefined {[source]}"
+                )
+            canonical_source = expression_name(source)
+            canonical_raw = (
+                f"{target} = ARG('{mode}', {canonical_source}, '{relation}')"
+            )
+            statement = ProgramStatement(
+                index,
+                target,
+                "order",
+                (canonical_source,),
+                relation,
+                canonical_raw,
+                (mode, canonical_source, relation),
+            )
+        elif compare:
+            mode, relation, source = compare.groups()
+            if source not in defined:
+                raise IneligibleProgram(
+                    f"statement {index} references undefined {[source]}"
+                )
+            canonical_source = expression_name(source)
+            canonical_raw = (
+                f"{target} = CMP('{mode}', '{relation}', {canonical_source})"
+            )
+            statement = ProgramStatement(
+                index,
+                target,
+                "compare",
+                (canonical_source,),
+                relation,
+                canonical_raw,
+                (mode, relation, canonical_source),
+            )
+        elif time_constraint:
+            source, relation, time = time_constraint.groups()
+            if source not in defined:
+                raise IneligibleProgram(
+                    f"statement {index} references undefined {[source]}"
+                )
+            canonical_source = expression_name(source)
+            canonical_raw = (
+                f"{target} = TC({canonical_source}, '{relation}', '{time}')"
+            )
+            statement = ProgramStatement(
+                index,
+                target,
+                "time_constraint",
+                (canonical_source,),
+                relation,
+                canonical_raw,
+                (relation, time),
+            )
+        elif count:
+            source = count.group(1)
+            if source not in defined:
+                raise IneligibleProgram(
+                    f"statement {index} references undefined {[source]}"
+                )
+            canonical_source = expression_name(source)
+            canonical_raw = f"{target} = COUNT({canonical_source})"
+            statement = ProgramStatement(
+                index,
+                target,
+                "count",
+                (canonical_source,),
+                None,
+                canonical_raw,
+                (canonical_source,),
             )
         elif stop:
             source = stop.group(1)
@@ -194,6 +298,14 @@ class RelationOption:
 
 
 @dataclass(frozen=True)
+class ExecutedRelationPage:
+    node_ids: Tuple[str, ...]
+    start: int
+    stop: int
+    total: int
+
+
+@dataclass(frozen=True)
 class ExecutedHypothesis:
     hypothesis_id: str
     function_state: Tuple[str, ...]
@@ -216,6 +328,7 @@ class DemonstrationStep:
     visible_before: Tuple[str, ...]
     created: Tuple[str, ...] = ()
     rationale_facts: Tuple[str, ...] = ()
+    relation_page: Tuple[int, int, int] = ()
 
 
 @dataclass
@@ -324,25 +437,23 @@ class DemonstrationBuilder:
         self,
         executor: ProgramExecutor,
         candidate_provider: CandidateProvider,
-        max_active: int = 6,
-        frontier_width: int = 3,
-        max_frontier_width: int = 6,
-        max_turns: int = 10,
+        max_active: int = 24,
+        max_nodes: int = 24,
+        frontier_width: int = 6,
+        max_turns: int = 16,
         entity_display_provider: Optional[EntityDisplayProvider] = None,
     ):
         if frontier_width < 2:
             raise ValueError("frontier_width must permit alternatives")
         if max_active < frontier_width * 2:
             raise ValueError("max_active must hold two complete relation frontiers")
-        if max_frontier_width < frontier_width:
-            raise ValueError("max_frontier_width cannot be smaller than frontier_width")
-        if max_frontier_width > max_active:
-            raise ValueError("max_frontier_width cannot exceed max_active")
+        if max_nodes < max_active:
+            raise ValueError("max_nodes must be at least max_active")
         self.executor = executor
         self.candidate_provider = candidate_provider
         self.max_active = int(max_active)
+        self.max_nodes = int(max_nodes)
         self.frontier_width = int(frontier_width)
-        self.max_frontier_width = int(max_frontier_width)
         self.max_turns = int(max_turns)
         self.entity_display_provider = entity_display_provider
         self._display_cache: Dict[str, str] = {}
@@ -390,6 +501,53 @@ class DemonstrationBuilder:
         self.stats["execution_cache_miss"] += 1
         return result
 
+    def _pages_through_required_relation(
+        self,
+        options: Sequence[RelationOption],
+        required_relation: str,
+    ) -> Tuple[Tuple[Tuple[RelationOption, ...], ...], Optional[RelationOption]]:
+        """Expose complete pages until the required relation becomes visible.
+
+        Gold selects how many pages a teacher demonstration needs, but never
+        changes their contents or ordering. At inference the policy obtains the
+        same pages through repeated Widen actions.
+        """
+        pages, required = self._pages_through_required_relations(
+            options, (required_relation,)
+        )
+        return pages, required.get(required_relation)
+
+    def _pages_through_required_relations(
+        self,
+        options: Sequence[RelationOption],
+        required_relations: Sequence[str],
+    ) -> Tuple[
+        Tuple[Tuple[RelationOption, ...], ...], Dict[str, RelationOption]
+    ]:
+        """Return stable pages through the last of several required relations."""
+        ranked = tuple(options)
+        positions: Dict[str, int] = {}
+        required: Dict[str, RelationOption] = {}
+        wanted = {str(relation) for relation in required_relations}
+        for index, option in enumerate(ranked):
+            if option.relation in wanted and option.relation not in positions:
+                positions[option.relation] = index
+                required[option.relation] = option
+        if set(positions) != wanted:
+            return (), {}
+
+        last_page = max(positions.values()) // self.frontier_width
+        pages = []
+        for page_index in range(last_page + 1):
+            page = relation_page(
+                ranked,
+                offset=page_index * self.frontier_width,
+                page_size=self.frontier_width,
+            )
+            if page.items:
+                pages.append(page.items)
+        return tuple(pages), required
+
     def build(self, row: Mapping[str, Any]) -> List[HyperDemonstration]:
         question = str(row.get("question") or row.get("original_question") or "").strip()
         question_id = str(row.get("ID") or row.get("id") or _digest(question))
@@ -412,37 +570,46 @@ class DemonstrationBuilder:
             return []
         intersection_demos: List[HyperDemonstration] = []
         semantic_branch_indexes = set()
-        for combine in plan.intersections:
-            semantic_branch_indexes.update(
-                self._semantic_intersection_join_indexes(plan, combine)
+        if plan.operators:
+            operator_demo = self._build_operator_program_demo(
+                question_id, question, plan, gold_answers
             )
-            demo = self._build_intersection_demo(
-                question_id, question, plan, combine, gold_answers
-            )
-            if demo is None:
-                continue
-            intersection_demos.append(demo)
+            demos = [operator_demo] if operator_demo is not None else []
+        else:
+            for combine in plan.intersections:
+                semantic_branch_indexes.update(
+                    self._semantic_intersection_join_indexes(plan, combine)
+                )
+                demo = self._build_intersection_demo(
+                    question_id, question, plan, combine, gold_answers
+                )
+                if demo is None:
+                    continue
+                intersection_demos.append(demo)
 
-        demos: List[HyperDemonstration] = []
-        joins = list(plan.joins)
-        for position, join in enumerate(joins):
-            if join.index in semantic_branch_indexes:
-                continue
-            next_join = joins[position + 1] if position + 1 < len(joins) else None
-            demo = self._build_relation_demo(
-                question_id,
-                question,
-                plan,
-                join,
-                next_join,
-                gold_answers,
-                following_joins=tuple(joins[position + 1 :]),
-            )
-            if demo is not None:
-                demos.append(demo)
-        demos.extend(intersection_demos)
+            demos = []
+            joins = list(plan.joins)
+            for position, join in enumerate(joins):
+                if join.index in semantic_branch_indexes:
+                    continue
+                next_join = joins[position + 1] if position + 1 < len(joins) else None
+                demo = self._build_relation_demo(
+                    question_id,
+                    question,
+                    plan,
+                    join,
+                    next_join,
+                    gold_answers,
+                    following_joins=tuple(joins[position + 1 :]),
+                )
+                if demo is not None:
+                    demos.append(demo)
+            demos.extend(intersection_demos)
         within_budget = []
         for demo in demos:
+            if len(demo.hypotheses) > self.max_nodes:
+                self.stats["trajectory_node_budget_miss"] += 1
+                continue
             # Every graph action occupies one model turn and the committed
             # answer occupies a final turn of its own.
             if len(demo.steps) + 1 > self.max_turns:
@@ -457,7 +624,9 @@ class DemonstrationBuilder:
             demo.private_metadata["candidate_entity_order"] = "stable_question_hash"
             demo.private_metadata["base_prompt"] = base_prompt
             demo.private_metadata["max_active"] = self.max_active
-            demo.private_metadata["max_frontier_width"] = self.max_frontier_width
+            demo.private_metadata["max_nodes"] = self.max_nodes
+            demo.private_metadata["relation_page_size"] = self.frontier_width
+            demo.private_metadata["relation_rank_cutoff"] = None
             demo.private_metadata["max_turns"] = self.max_turns
         return demos
 
@@ -478,6 +647,361 @@ class DemonstrationBuilder:
             "answer_exact": answers == gold_answers,
             "answer_f1": answer_set_f1(answers or (), gold_answers),
         }
+
+    def _build_operator_program_demo(
+        self,
+        question_id: str,
+        question: str,
+        plan: GoldPlan,
+        gold_answers: Tuple[str, ...],
+    ) -> Optional[HyperDemonstration]:
+        """Replay one complete operator-bearing program through public actions."""
+        hypotheses: Dict[str, ExecutedHypothesis] = {}
+        steps: List[DemonstrationStep] = []
+        active: List[str] = []
+        expression_nodes: Dict[str, ExecutedHypothesis] = {}
+        start_states: Dict[str, Tuple[str, str]] = {}
+        widen_sources: List[str] = []
+        proposal_relations: List[str] = []
+
+        def add_node(
+            state: Sequence[str],
+            target: str,
+            values: Tuple[str, ...],
+            *,
+            parent: Optional[ExecutedHypothesis] = None,
+            parents: Sequence[ExecutedHypothesis] = (),
+            relation: Optional[str] = None,
+            role: str = "operator_progress",
+            operation: str,
+            provenance: Sequence[str] = (),
+        ) -> Optional[ExecutedHypothesis]:
+            if len(hypotheses) >= self.max_nodes:
+                self.stats["operator_program_node_budget_miss"] += 1
+                return None
+            node_id = f"H{len(hypotheses)}"
+            node = ExecutedHypothesis(
+                node_id,
+                tuple(state),
+                target,
+                values,
+                denotation_labels=self._display_pairs(values),
+                relation=relation,
+                role=role,
+                parent_id=parent.hypothesis_id if parent is not None else None,
+                parent_ids=tuple(item.hypothesis_id for item in parents),
+                operation=operation,
+                depth=(max((item.depth for item in parents), default=-1) + 1)
+                if parents
+                else (parent.depth + 1 if parent is not None else 0),
+                provenance=tuple(provenance),
+            )
+            hypotheses[node_id] = node
+            return node
+
+        def select_parent(parent: ExecutedHypothesis, rationale: str) -> bool:
+            if parent.hypothesis_id not in active or not parent.denotation:
+                return False
+            steps.append(
+                DemonstrationStep(
+                    "Select",
+                    (parent.hypothesis_id,),
+                    tuple(active),
+                    (),
+                    (rationale,),
+                )
+            )
+            return True
+
+        for statement in plan.statements:
+            if statement.kind == "start":
+                start_states[statement.target] = (
+                    statement.raw,
+                    statement.arguments[0],
+                )
+                continue
+            if statement.kind == "stop":
+                continue
+
+            if statement.kind == "join":
+                source_expression = statement.sources[0] if statement.sources else None
+                parent = expression_nodes.get(source_expression or "")
+                if parent is not None:
+                    if not select_parent(parent, "continue_required_program_branch"):
+                        return None
+                    state_before = list(parent.function_state)
+                    action_source = parent.target_expression
+                else:
+                    if source_expression is not None:
+                        start = start_states.get(source_expression)
+                        if start is None:
+                            return None
+                        state_before = [start[0]]
+                    else:
+                        state_before = []
+                    action_source = _action_source(state_before, statement.raw)
+
+                ranked = list(
+                    self.candidate_provider(question.strip(), state_before, statement)
+                )
+                pages, required = self._pages_through_required_relation(
+                    ranked, statement.relation or ""
+                )
+                self.stats["operator_program_relation_decisions"] += 1
+                if required is None:
+                    self.stats["operator_program_proposal_miss"] += 1
+                    return None
+                if sum(len(page) for page in pages) > self.max_active:
+                    self.stats["operator_program_within_budget_miss"] += 1
+                    return None
+                self.stats["operator_program_within_budget_hit"] += 1
+                if len(pages) == 1:
+                    self.stats["operator_program_proposal_hit"] += 1
+                else:
+                    self.stats["operator_program_proposal_miss"] += 1
+                    self.stats["operator_program_recovered_by_widen"] += 1
+                if required.rank == 1:
+                    self.stats["operator_program_top1_hit"] += 1
+                proposal_relations.extend(option.relation for option in ranked)
+
+                created_pages: List[Tuple[str, ...]] = []
+                required_node: Optional[ExecutedHypothesis] = None
+                for page in pages:
+                    page_nodes = []
+                    for option in page:
+                        raw = replace_join_relation(statement.raw, option.relation)
+                        state = [*state_before, raw]
+                        values = self._execute(state, statement.target)
+                        if values is None:
+                            continue
+                        node = add_node(
+                            state,
+                            statement.target,
+                            values,
+                            parent=parent,
+                            relation=option.relation,
+                            role=(
+                                "required_program_branch"
+                                if option.relation == statement.relation
+                                else "alternative"
+                            ),
+                            operation="expand",
+                            provenance=(
+                                "policy_choice"
+                                if option.rank == 1
+                                else "ranked_alternative",
+                            ),
+                        )
+                        if node is None:
+                            return None
+                        page_nodes.append(node.hypothesis_id)
+                        if option.relation == statement.relation:
+                            required_node = node
+                    created_pages.append(tuple(page_nodes))
+
+                if (
+                    required_node is None
+                    or not required_node.denotation
+                    or not created_pages
+                    or len(created_pages[0]) < 2
+                ):
+                    return None
+                before = tuple(active)
+                if parent is not None:
+                    active.remove(parent.hypothesis_id)
+                if len(active) + sum(len(page) for page in created_pages) > self.max_active:
+                    self.stats["operator_program_active_budget_miss"] += 1
+                    return None
+                active.extend(created_pages[0])
+                first_bounds = relation_page(
+                    ranked, offset=0, page_size=self.frontier_width
+                )
+                steps.append(
+                    DemonstrationStep(
+                        "Find_relation",
+                        (action_source,),
+                        before,
+                        created_pages[0],
+                        ("open_operator_program_frontier",),
+                        (first_bounds.start, first_bounds.stop, first_bounds.total),
+                    )
+                )
+                for page_index, created in enumerate(created_pages[1:], start=1):
+                    bounds = relation_page(
+                        ranked,
+                        offset=page_index * self.frontier_width,
+                        page_size=self.frontier_width,
+                    )
+                    steps.append(
+                        DemonstrationStep(
+                            "Widen",
+                            (action_source,),
+                            tuple(active),
+                            created,
+                            (
+                                "required_relation_missing_from_visible_pages",
+                                f"relation_page:{page_index + 1}",
+                            ),
+                            (bounds.start, bounds.stop, bounds.total),
+                        )
+                    )
+                    active.extend(created)
+                    widen_sources.append(action_source)
+                expression_nodes[statement.target] = required_node
+                continue
+
+            if statement.kind == "and":
+                left = expression_nodes.get(statement.sources[0])
+                right = expression_nodes.get(statement.sources[1])
+                if (
+                    left is None
+                    or right is None
+                    or left.hypothesis_id not in active
+                    or right.hypothesis_id not in active
+                    or left.hypothesis_id == right.hypothesis_id
+                ):
+                    return None
+                combined_state, combined_target = combine_function_states(
+                    left.function_state,
+                    left.target_expression,
+                    right.function_state,
+                    right.target_expression,
+                )
+                values = self._execute(combined_state, combined_target)
+                if values is None:
+                    return None
+                combined = add_node(
+                    combined_state,
+                    combined_target,
+                    values,
+                    parents=(left, right),
+                    role="combined",
+                    operation="combine",
+                    provenance=(f"combined_with:{right.hypothesis_id}",),
+                )
+                if combined is None:
+                    return None
+                steps.append(
+                    DemonstrationStep(
+                        "Combine",
+                        (left.hypothesis_id, right.hypothesis_id),
+                        tuple(active),
+                        (combined.hypothesis_id,),
+                        ("both_branches_required_by_gold_program",),
+                    )
+                )
+                active.remove(left.hypothesis_id)
+                active.remove(right.hypothesis_id)
+                active.append(combined.hypothesis_id)
+                expression_nodes[statement.target] = combined
+                continue
+
+            source = statement.sources[0]
+            parent = expression_nodes.get(source)
+            root_operator = parent is None and statement.kind in {"compare", "order"}
+            if root_operator:
+                start = start_states.get(source)
+                if start is None:
+                    return None
+                if statement.kind == "order" and (
+                    start[1].startswith("m.") or start[1].startswith("g.")
+                ):
+                    return None
+                state_before = [start[0]]
+                target = source
+            else:
+                if parent is None or not select_parent(
+                    parent, "apply_required_logical_operator"
+                ):
+                    return None
+                state_before = list(parent.function_state)
+                target = parent.target_expression
+
+            if statement.kind == "order":
+                mode, _, relation = statement.arguments
+                runtime_raw = f"{target} = ARG('{mode}', {target}, '{relation}')"
+                action = "Order"
+                action_arguments = (mode, target if parent is not None else start[1], relation)
+            elif statement.kind == "compare":
+                mode, relation, _ = statement.arguments
+                runtime_raw = f"{target} = CMP('{mode}', '{relation}', {target})"
+                action = "Compare"
+                action_arguments = (mode, relation, start_states[source][1])
+            elif statement.kind == "time_constraint":
+                relation, time = statement.arguments
+                runtime_raw = f"{target} = TC({target}, '{relation}', '{time}')"
+                action = "Time_constraint"
+                action_arguments = (relation, time)
+            elif statement.kind == "count":
+                runtime_raw = f"{target} = COUNT({target})"
+                action = "Count"
+                action_arguments = (target,)
+            else:
+                return None
+
+            state = [*state_before, runtime_raw]
+            values = self._execute(state, target)
+            if values is None:
+                return None
+            node = add_node(
+                state,
+                target,
+                values,
+                parent=parent,
+                operation=action.lower(),
+                provenance=("gold_program_operator",),
+            )
+            if node is None:
+                return None
+            before = tuple(active)
+            if parent is not None:
+                active.remove(parent.hypothesis_id)
+            if len(active) >= self.max_active:
+                return None
+            active.append(node.hypothesis_id)
+            steps.append(
+                DemonstrationStep(
+                    action,
+                    action_arguments,
+                    before,
+                    (node.hypothesis_id,),
+                    (f"gold_program_operator:{statement.kind}",),
+                )
+            )
+            expression_nodes[statement.target] = node
+            expression_nodes[source] = node
+
+        final = expression_nodes.get(plan.target_expression)
+        if final is None or final.denotation != gold_answers:
+            self.stats["operator_program_terminal_mismatch"] += 1
+            return None
+        steps.append(
+            DemonstrationStep(
+                "Commit",
+                (final.hypothesis_id,),
+                tuple(active),
+                (),
+                ("complete", "executable"),
+            )
+        )
+        self.stats["operator_program_built"] += 1
+        return HyperDemonstration(
+            demo_id=f"{question_id}:operator:{_digest(plan.executable_functions)}",
+            question_id=question_id,
+            question=question,
+            family="operator_program",
+            hypotheses=hypotheses,
+            steps=steps,
+            gold_answers=gold_answers,
+            private_metadata={
+                "retrieval_intent_source": "question",
+                "logical_operators": [statement.kind for statement in plan.operators],
+                "proposal_relations": proposal_relations,
+                "proposal_recall_within_budget": True,
+                "widen_sources": widen_sources,
+                "path_hops": len(plan.joins),
+            },
+        )
 
     def _build_relation_demo(
         self,
@@ -500,24 +1024,25 @@ class DemonstrationBuilder:
         # Gold labels may judge the resulting frontier, but must not shape the
         # semantic request that the student has to reproduce at inference.
         query = question.strip()
-        ranked_options = list(self.candidate_provider(query, state_before, join))[
-            : self.max_frontier_width
-        ]
-        initial_options = ranked_options[: self.frontier_width]
-        gold_option = next(
-            (option for option in ranked_options if option.relation == join.relation), None
+        ranked_options = list(self.candidate_provider(query, state_before, join))
+        pages, gold_option = self._pages_through_required_relation(
+            ranked_options, join.relation
         )
         if gold_option is None:
-            self.stats["proposal_max_frontier_miss"] += 1
+            self.stats["proposal_structural_or_ranking_miss"] += 1
             self.stats["proposal_miss"] += 1
             return None
-        self.stats["proposal_max_frontier_hit"] += 1
+        if sum(len(page) for page in pages) > self.max_active:
+            self.stats["proposal_within_budget_miss"] += 1
+            return None
+        self.stats["proposal_within_budget_hit"] += 1
+        initial_options = pages[0]
         initial_relations = {option.relation for option in initial_options}
-        needs_widen = gold_option.relation not in initial_relations
+        needs_widen = len(pages) > 1
         if needs_widen:
             self.stats["proposal_miss"] += 1
             self.stats["proposal_recovered_by_widen"] += 1
-            options = ranked_options
+            options = tuple(option for page in pages for option in page)
         else:
             self.stats["proposal_hit"] += 1
             options = initial_options
@@ -552,15 +1077,20 @@ class DemonstrationBuilder:
         gold_entry = next(
             (item for item in candidates if item[0].relation == join.relation), None
         )
-        initial_created = tuple(
-            node.hypothesis_id
-            for option, node in candidates
-            if option.relation in initial_relations
+        node_by_relation = {
+            option.relation: node.hypothesis_id for option, node in candidates
+        }
+        created_pages = tuple(
+            tuple(
+                node_by_relation[option.relation]
+                for option in page
+                if option.relation in node_by_relation
+            )
+            for page in pages
         )
+        initial_created = created_pages[0]
         widened_created = tuple(
-            node.hypothesis_id
-            for option, node in candidates
-            if option.relation not in initial_relations
+            node_id for page in created_pages[1:] for node_id in page
         )
         if (
             gold_entry is None
@@ -570,24 +1100,35 @@ class DemonstrationBuilder:
             return None
 
         hypotheses = {item[1].hypothesis_id: item[1] for item in candidates}
-        created = initial_created + widened_created
+        created = tuple(node_id for page in created_pages for node_id in page)
         source = _action_source(state_before, join.raw)
         steps = [
             DemonstrationStep(
                 "Find_relation", (source,), (), initial_created,
                 ("open_ranked_frontier",),
+                (0, len(pages[0]), len(ranked_options)),
             )
         ]
-        if needs_widen:
+        visible = list(initial_created)
+        for page_number, page_created in enumerate(created_pages[1:], start=2):
             steps.append(
                 DemonstrationStep(
                     "Widen",
                     (source,),
-                    initial_created,
-                    widened_created,
-                    ("required_relation_missing_from_initial_frontier",),
+                    tuple(visible),
+                    page_created,
+                    (
+                        "required_relation_missing_from_visible_pages",
+                        f"relation_page:{page_number}",
+                    ),
+                    (
+                        (page_number - 1) * self.frontier_width,
+                        min(page_number * self.frontier_width, len(ranked_options)),
+                        len(ranked_options),
+                    ),
                 )
             )
+            visible.extend(page_created)
         gold = gold_entry[1]
         candidate_future_values = {
             option.relation: self._candidate_future_value(
@@ -634,13 +1175,16 @@ class DemonstrationBuilder:
             if not _is_immediate_linear_terminal(plan, join, next_join):
                 return None
             if needs_widen:
-                gold_children = self._expand_terminal_frontier(
+                gold_page = self._expand_terminal_frontier(
                     gold,
                     next_join,
                     hypotheses,
                     question,
                     stat_scope="continuation",
                 )
+                if gold_page is None:
+                    return None
+                gold_children = list(gold_page.node_ids)
                 final_gold = next(
                     (
                         hypotheses[node_id]
@@ -657,41 +1201,9 @@ class DemonstrationBuilder:
                     0,
                     len(active) - 1 + len(gold_children) - self.max_active,
                 )
-                rank_by_relation = {
-                    option.relation: option.rank for option, _ in candidates
-                }
-                prunable = sorted(
-                    (
-                        hypotheses[node_id]
-                        for node_id in active
-                        if node_id != gold.hypothesis_id
-                    ),
-                    key=lambda node: (
-                        bool(node.denotation),
-                        -rank_by_relation.get(node.relation, 0),
-                    ),
-                )
-                for victim in prunable[:required_prunes]:
-                    before = tuple(active)
-                    active.remove(victim.hypothesis_id)
-                    rationale = (
-                        ("empty_execution",)
-                        if not victim.denotation
-                        else (
-                            ("frontier_capacity_eviction",)
-                            if len(before) == self.max_active
-                            else ("frontier_capacity_reservation",)
-                        )
-                    )
-                    steps.append(
-                        DemonstrationStep(
-                            "Prune",
-                            (victim.hypothesis_id,),
-                            before,
-                            (),
-                            rationale,
-                        )
-                    )
+                if required_prunes:
+                    self.stats["trajectory_node_budget_miss"] += 1
+                    return None
                 steps.append(
                     DemonstrationStep(
                         "Select",
@@ -714,6 +1226,7 @@ class DemonstrationBuilder:
                             before_expansion,
                             tuple(gold_children),
                             ("continue_widened_branch",),
+                            (gold_page.start, gold_page.stop, gold_page.total),
                         ),
                         DemonstrationStep(
                             "Commit",
@@ -751,6 +1264,7 @@ class DemonstrationBuilder:
                         gold_answers,
                         gold_option,
                         best_alternative_score,
+                        len(ranked_options),
                     )
                     if direct is not None:
                         direct.private_metadata["candidate_future_values"] = candidate_future_values
@@ -765,7 +1279,7 @@ class DemonstrationBuilder:
                     )
                 )
                 active = list(created)
-                wrong_children = self._expand_terminal_frontier(
+                wrong_page = self._expand_terminal_frontier(
                     wrong,
                     next_join,
                     hypotheses,
@@ -773,6 +1287,7 @@ class DemonstrationBuilder:
                     stat_scope="recovery_probe",
                     require_required_relation=False,
                 )
+                wrong_children = list(wrong_page.node_ids) if wrong_page else []
                 top_probe = next(
                     (
                         hypotheses[node_id]
@@ -792,6 +1307,7 @@ class DemonstrationBuilder:
                         gold_answers,
                         gold_option,
                         best_alternative_score,
+                        len(ranked_options),
                     )
                     if direct is not None:
                         direct.private_metadata["candidate_future_values"] = candidate_future_values
@@ -802,6 +1318,10 @@ class DemonstrationBuilder:
                     DemonstrationStep(
                         "Find_relation", (wrong.target_expression,), created,
                         tuple(wrong_children), ("test_top_ranked_continuation",),
+                        (
+                            (wrong_page.start, wrong_page.stop, wrong_page.total)
+                            if wrong_page else ()
+                        ),
                     )
                 )
                 semantic_mismatch = bool(top_probe.denotation)
@@ -823,6 +1343,7 @@ class DemonstrationBuilder:
                         gold_answers,
                         gold_option,
                         best_alternative_score,
+                        len(ranked_options),
                     )
                     if direct is not None:
                         direct.private_metadata["candidate_future_values"] = candidate_future_values
@@ -851,13 +1372,16 @@ class DemonstrationBuilder:
                         ("return_after_top_probe_failed",),
                     )
                 )
-                gold_children = self._expand_terminal_frontier(
+                gold_page = self._expand_terminal_frontier(
                     gold,
                     next_join,
                     hypotheses,
                     question,
                     stat_scope="continuation",
                 )
+                if gold_page is None:
+                    return None
+                gold_children = list(gold_page.node_ids)
                 final_gold = next(
                     (
                         hypotheses[node_id]
@@ -882,6 +1406,7 @@ class DemonstrationBuilder:
                             before_gold_expansion,
                             tuple(gold_children),
                             ("continue_preserved_alternative",),
+                            (gold_page.start, gold_page.stop, gold_page.total),
                         ),
                         DemonstrationStep(
                             "Commit", (final_gold.hypothesis_id,), tuple(active), (),
@@ -917,7 +1442,7 @@ class DemonstrationBuilder:
                 ),
                 "proposal_relations": [option.relation for option, _ in candidates],
                 "proposal_recall_at_frontier": not needs_widen,
-                "proposal_recall_at_max_frontier": True,
+                "proposal_recall_within_budget": True,
                 "candidate_future_values": candidate_future_values,
                 "widen_sources": [source] if needs_widen else [],
                 "retrieval_intent_source": "question",
@@ -935,45 +1460,11 @@ class DemonstrationBuilder:
         maximum_active: int,
         protected: Sequence[str] = (),
     ) -> bool:
-        """Free visible frontier slots using only public capacity evidence."""
-        protected_ids = set(protected)
-        while len(active) > maximum_active:
-            candidates = [
-                hypotheses[node_id]
-                for node_id in active
-                if node_id not in protected_ids
-            ]
-            if not candidates:
-                return False
-            victim = min(
-                candidates,
-                key=lambda node: (
-                    bool(node.denotation),
-                    "policy_choice" in node.provenance,
-                    -node.depth,
-                    node.hypothesis_id,
-                ),
-            )
-            before = tuple(active)
-            active.remove(victim.hypothesis_id)
-            rationale = (
-                ("empty_execution",)
-                if not victim.denotation
-                else (
-                    ("frontier_capacity_eviction",)
-                    if len(before) == self.max_active
-                    else ("frontier_capacity_reservation",)
-                )
-            )
-            steps.append(
-                DemonstrationStep(
-                    "Prune",
-                    (victim.hypothesis_id,),
-                    before,
-                    (),
-                    rationale,
-                )
-            )
+        """Reject traces that need confidence-based deletion to fit the budget."""
+        del steps, hypotheses, protected
+        if len(active) > maximum_active:
+            self.stats["trajectory_node_budget_miss"] += 1
+            return False
         return True
 
     def _build_deep_progress_demo(
@@ -1030,14 +1521,22 @@ class DemonstrationBuilder:
                     (f"question_relation_match:{current_gold.relation}",),
                 )
             )
-            initial_children, widened_children = self._expand_terminal_frontier_batches(
+            child_pages = self._expand_terminal_frontier_batches(
                 current_gold,
                 continuation,
                 hypotheses,
                 question,
                 stat_scope="deep_continuation",
             )
-            all_children = initial_children + widened_children
+            if not child_pages:
+                self.stats["deep_progress_miss"] += 1
+                return None
+            initial_page = child_pages[0]
+            initial_children = list(initial_page.node_ids)
+            widened_pages = child_pages[1:]
+            all_children = [
+                node_id for page in child_pages for node_id in page.node_ids
+            ]
             next_gold = next(
                 (
                     hypotheses[node_id]
@@ -1060,9 +1559,11 @@ class DemonstrationBuilder:
                     before_expansion,
                     tuple(initial_children),
                     ("continue_supported_branch",),
+                    (initial_page.start, initial_page.stop, initial_page.total),
                 )
             )
-            if widened_children:
+            for page_number, widened_page in enumerate(widened_pages, start=2):
+                widened_children = list(widened_page.node_ids)
                 if not self._append_capacity_prunes(
                     steps,
                     hypotheses,
@@ -1076,7 +1577,15 @@ class DemonstrationBuilder:
                         (current_gold.target_expression,),
                         tuple(active),
                         tuple(widened_children),
-                        ("required_relation_missing_from_initial_frontier",),
+                        (
+                            "required_relation_missing_from_visible_pages",
+                            f"relation_page:{page_number}",
+                        ),
+                        (
+                            widened_page.start,
+                            widened_page.stop,
+                            widened_page.total,
+                        ),
                     )
                 )
                 active.extend(widened_children)
@@ -1119,7 +1628,7 @@ class DemonstrationBuilder:
                 ),
                 "proposal_relations": [option.relation for option, _ in candidates],
                 "proposal_recall_at_frontier": not needs_initial_widen,
-                "proposal_recall_at_max_frontier": True,
+                "proposal_recall_within_budget": True,
                 "candidate_future_values": dict(candidate_future_values),
                 "widen_sources": widen_sources,
                 "retrieval_intent_source": "question",
@@ -1141,6 +1650,7 @@ class DemonstrationBuilder:
         gold_answers: Tuple[str, ...],
         gold_option: RelationOption,
         best_alternative_score: Optional[float],
+        ranked_relation_total: int,
     ) -> Optional[HyperDemonstration]:
         """Build ordinary two-hop progress from the same natural frontier."""
         hypotheses = {item[1].hypothesis_id: item[1] for item in candidates}
@@ -1148,14 +1658,22 @@ class DemonstrationBuilder:
         gold = next(
             item[1] for item in candidates if item[0].relation == join.relation
         )
-        initial_children, widened_children = self._expand_terminal_frontier_batches(
+        child_pages = self._expand_terminal_frontier_batches(
             gold,
             next_join,
             hypotheses,
             question,
             stat_scope="continuation",
         )
-        gold_children = initial_children + widened_children
+        if not child_pages:
+            self.stats["direct_progress_miss"] += 1
+            return None
+        initial_page = child_pages[0]
+        initial_children = list(initial_page.node_ids)
+        widened_pages = child_pages[1:]
+        gold_children = [
+            node_id for page in child_pages for node_id in page.node_ids
+        ]
         final_gold = next(
             (
                 hypotheses[node_id]
@@ -1173,6 +1691,11 @@ class DemonstrationBuilder:
             DemonstrationStep(
                 "Find_relation", (source,), (), created,
                 ("open_ranked_frontier",),
+                (
+                    0,
+                    min(self.frontier_width, ranked_relation_total),
+                    ranked_relation_total,
+                ),
             ),
             DemonstrationStep(
                 "Select",
@@ -1186,48 +1709,37 @@ class DemonstrationBuilder:
                 created,
                 tuple(initial_children),
                 ("continue_supported_branch",),
+                (initial_page.start, initial_page.stop, initial_page.total),
             ),
         ]
         active = [node_id for node_id in created if node_id != gold.hypothesis_id]
         active.extend(initial_children)
         family = "direct_frontier_progress"
         widen_sources = []
-        if widened_children:
-            required_prunes = max(
-                0, len(active) + len(widened_children) - self.max_active
-            )
-            prunable = sorted(
-                (hypotheses[node_id] for node_id in active),
-                key=lambda node: (
-                    bool(node.denotation),
-                    -node.depth,
-                    node.hypothesis_id,
-                ),
-            )
-            for victim in prunable[:required_prunes]:
-                before = tuple(active)
-                active.remove(victim.hypothesis_id)
-                rationale = (
-                    ("empty_execution",)
-                    if not victim.denotation
-                    else (
-                        ("frontier_capacity_eviction",)
-                        if len(before) == self.max_active
-                        else ("frontier_capacity_reservation",)
-                    )
-                )
-                steps.append(
-                    DemonstrationStep(
-                        "Prune", (victim.hypothesis_id,), before, (), rationale,
-                    )
-                )
+        for page_number, widened_page in enumerate(widened_pages, start=2):
+            widened_children = list(widened_page.node_ids)
+            if not self._append_capacity_prunes(
+                steps,
+                hypotheses,
+                active,
+                maximum_active=self.max_active - len(widened_children),
+            ):
+                return None
             steps.append(
                 DemonstrationStep(
                     "Widen",
                     (gold.target_expression,),
                     tuple(active),
                     tuple(widened_children),
-                    ("required_relation_missing_from_initial_frontier",),
+                    (
+                        "required_relation_missing_from_visible_pages",
+                        f"relation_page:{page_number}",
+                    ),
+                    (
+                        widened_page.start,
+                        widened_page.stop,
+                        widened_page.total,
+                    ),
                 )
             )
             active.extend(widened_children)
@@ -1269,7 +1781,7 @@ class DemonstrationBuilder:
                     option.relation for option, _ in candidates
                 ],
                 "proposal_recall_at_frontier": True,
-                "proposal_recall_at_max_frontier": True,
+                "proposal_recall_within_budget": True,
                 "widen_sources": widen_sources,
                 "retrieval_intent_source": "question",
                 "probe_relation": None,
@@ -1284,23 +1796,24 @@ class DemonstrationBuilder:
         hypotheses: Dict[str, ExecutedHypothesis],
         question: str,
         stat_scope: str,
-    ) -> Tuple[List[str], List[str]]:
-        """Execute initial and optional widened batches from one relation ranking."""
+    ) -> List[ExecutedRelationPage]:
+        """Execute stable relation pages through the required continuation."""
         options = list(
             self.candidate_provider(question.strip(), parent.function_state, join)
-        )[: self.max_frontier_width]
-        initial_options = options[: self.frontier_width]
-        required = next(
-            (option for option in options if option.relation == join.relation), None
+        )
+        pages, required = self._pages_through_required_relation(
+            options, join.relation
         )
         self.stats[f"{stat_scope}_decisions"] += 1
         if required is None:
             self.stats[f"{stat_scope}_proposal_miss"] += 1
-            self.stats[f"{stat_scope}_max_frontier_miss"] += 1
-            return [], []
-        self.stats[f"{stat_scope}_max_frontier_hit"] += 1
-        initial_relations = {option.relation for option in initial_options}
-        if required.relation in initial_relations:
+            self.stats[f"{stat_scope}_structural_or_ranking_miss"] += 1
+            return []
+        if sum(len(page) for page in pages) > self.max_active:
+            self.stats[f"{stat_scope}_within_budget_miss"] += 1
+            return []
+        self.stats[f"{stat_scope}_within_budget_hit"] += 1
+        if len(pages) == 1:
             self.stats[f"{stat_scope}_proposal_hit"] += 1
         else:
             self.stats[f"{stat_scope}_proposal_miss"] += 1
@@ -1309,39 +1822,42 @@ class DemonstrationBuilder:
         if required.rank == 1:
             self.stats[f"{stat_scope}_top1_hit"] += 1
 
-        visible_options = (
-            initial_options if required.relation in initial_relations else options
-        )
-        initial_children: List[str] = []
-        widened_children: List[str] = []
-        for option in visible_options:
-            statement = replace_join_relation(join.raw, option.relation)
-            state = list(parent.function_state) + [statement]
-            values = self._execute(state, join.target)
-            if values is None:
-                continue
-            node_id = f"H{len(hypotheses)}"
-            hypotheses[node_id] = ExecutedHypothesis(
-                node_id,
-                tuple(state),
-                join.target,
-                values,
-                denotation_labels=self._display_pairs(values),
-                relation=option.relation,
-                role="continuation",
-                parent_id=parent.hypothesis_id,
-                depth=parent.depth + 1,
-                provenance=(
-                    "policy_choice" if option.rank == 1 else "ranked_alternative",
-                ),
+        child_pages: List[ExecutedRelationPage] = []
+        for page_index, page in enumerate(pages):
+            children: List[str] = []
+            for option in page:
+                statement = replace_join_relation(join.raw, option.relation)
+                state = list(parent.function_state) + [statement]
+                values = self._execute(state, join.target)
+                if values is None:
+                    continue
+                node_id = f"H{len(hypotheses)}"
+                hypotheses[node_id] = ExecutedHypothesis(
+                    node_id,
+                    tuple(state),
+                    join.target,
+                    values,
+                    denotation_labels=self._display_pairs(values),
+                    relation=option.relation,
+                    role="continuation",
+                    parent_id=parent.hypothesis_id,
+                    depth=parent.depth + 1,
+                    provenance=(
+                        "policy_choice" if option.rank == 1 else "ranked_alternative",
+                    ),
+                )
+                children.append(node_id)
+            bounds = relation_page(
+                options,
+                offset=page_index * self.frontier_width,
+                page_size=self.frontier_width,
             )
-            target_batch = (
-                initial_children
-                if option.relation in initial_relations
-                else widened_children
+            child_pages.append(
+                ExecutedRelationPage(
+                    tuple(children), bounds.start, bounds.stop, bounds.total
+                )
             )
-            target_batch.append(node_id)
-        return initial_children, widened_children
+        return child_pages
 
     def _expand_terminal_frontier(
         self,
@@ -1351,12 +1867,14 @@ class DemonstrationBuilder:
         question: str,
         stat_scope: str,
         require_required_relation: bool = True,
-    ) -> List[str]:
-        options = list(
+    ) -> Optional[ExecutedRelationPage]:
+        ranked_options = list(
             self.candidate_provider(question.strip(), parent.function_state, join)
-        )[
-            : self.frontier_width
-        ]
+        )
+        page = relation_page(
+            ranked_options, offset=0, page_size=self.frontier_width
+        )
+        options = page.items
         self.stats[f"{stat_scope}_decisions"] += 1
         if require_required_relation:
             required = next(
@@ -1364,7 +1882,7 @@ class DemonstrationBuilder:
             )
             if required is None:
                 self.stats[f"{stat_scope}_proposal_miss"] += 1
-                return []
+                return None
             self.stats[f"{stat_scope}_proposal_hit"] += 1
             self.stats[f"{stat_scope}_gold_rank_{required.rank}"] += 1
             if required.rank == 1:
@@ -1394,7 +1912,9 @@ class DemonstrationBuilder:
                 ),
             )
             children.append(node_id)
-        return children
+        return ExecutedRelationPage(
+            tuple(children), page.start, page.stop, page.total
+        )
 
     def _build_intersection_demo(
         self,
@@ -1435,47 +1955,72 @@ class DemonstrationBuilder:
         hypotheses: Dict[str, ExecutedHypothesis] = {}
         frontiers = []
         if same_frontier:
-            options = list(self.candidate_provider(query, left_state, left_join))[
-                : self.frontier_width
-            ]
-            relation_set = {option.relation for option in options}
-            if not {left_join.relation, right_join.relation}.issubset(relation_set):
+            options = list(self.candidate_provider(query, left_state, left_join))
+            pages, required = self._pages_through_required_relations(
+                options, (left_join.relation, right_join.relation)
+            )
+            if not pages:
                 self.stats["conjunction_proposal_miss"] += 1
                 return None
+            if sum(len(page) for page in pages) > self.max_active:
+                self.stats["conjunction_within_budget_miss"] += 1
+                return None
             relation_nodes = {}
-            created = []
-            for option in options:
-                statement = replace_join_relation(left_join.raw, option.relation)
-                state = left_state + [statement]
-                values = self._execute(state, left_join.target)
-                if values is None:
-                    continue
-                node = ExecutedHypothesis(
-                    f"H{len(hypotheses)}",
-                    tuple(state),
-                    left_join.target,
-                    values,
-                    denotation_labels=self._display_pairs(values),
-                    relation=option.relation,
-                    role=(
-                        "required_branch"
-                        if option.relation in {left_join.relation, right_join.relation}
-                        else "alternative"
-                    ),
-                    provenance=(
-                        "policy_choice" if option.rank == 1 else "ranked_alternative",
-                    ),
-                )
-                hypotheses[node.hypothesis_id] = node
-                relation_nodes[option.relation] = node
-                created.append(node.hypothesis_id)
+            created_pages = []
+            for page in pages:
+                created = []
+                for option in page:
+                    statement = replace_join_relation(left_join.raw, option.relation)
+                    state = left_state + [statement]
+                    values = self._execute(state, left_join.target)
+                    if values is None:
+                        continue
+                    node = ExecutedHypothesis(
+                        f"H{len(hypotheses)}",
+                        tuple(state),
+                        left_join.target,
+                        values,
+                        denotation_labels=self._display_pairs(values),
+                        relation=option.relation,
+                        role=(
+                            "required_branch"
+                            if option.relation
+                            in {left_join.relation, right_join.relation}
+                            else "alternative"
+                        ),
+                        provenance=(
+                            "policy_choice"
+                            if option.rank == 1
+                            else "ranked_alternative",
+                        ),
+                    )
+                    hypotheses[node.hypothesis_id] = node
+                    relation_nodes[option.relation] = node
+                    created.append(node.hypothesis_id)
+                created_pages.append(tuple(created))
             left = relation_nodes.get(left_join.relation)
             right = relation_nodes.get(right_join.relation)
             ranks = {
-                "left": next(option.rank for option in options if option.relation == left_join.relation),
-                "right": next(option.rank for option in options if option.relation == right_join.relation),
+                "left": required[left_join.relation].rank,
+                "right": required[right_join.relation].rank,
             }
-            frontiers.append((left_action_source, tuple(created)))
+            frontiers.append(
+                (
+                    left_action_source,
+                    tuple(
+                        ExecutedRelationPage(
+                            node_ids=created,
+                            start=page_index * self.frontier_width,
+                            stop=min(
+                                (page_index + 1) * self.frontier_width,
+                                len(options),
+                            ),
+                            total=len(options),
+                        )
+                        for page_index, created in enumerate(created_pages)
+                    ),
+                )
+            )
         else:
             required_nodes = []
             ranks = {}
@@ -1483,47 +2028,70 @@ class DemonstrationBuilder:
                 ("left", left_state, left_action_source, left_join),
                 ("right", right_state, right_action_source, right_join),
             ):
-                options = list(self.candidate_provider(query, state_before, join))[
-                    : self.frontier_width
-                ]
-                required = next(
-                    (option for option in options if option.relation == join.relation), None
+                options = list(self.candidate_provider(query, state_before, join))
+                pages, required = self._pages_through_required_relation(
+                    options, join.relation
                 )
                 if required is None:
                     self.stats["conjunction_proposal_miss"] += 1
                     return None
+                if sum(len(page) for page in pages) > self.max_active:
+                    self.stats["conjunction_within_budget_miss"] += 1
+                    return None
                 ranks[label] = required.rank
-                created = []
+                created_pages = []
                 required_node = None
-                for option in options:
-                    statement = replace_join_relation(join.raw, option.relation)
-                    state = state_before + [statement]
-                    values = self._execute(state, join.target)
-                    if values is None:
-                        continue
-                    node = ExecutedHypothesis(
-                        f"H{len(hypotheses)}",
-                        tuple(state),
-                        join.target,
-                        values,
-                        denotation_labels=self._display_pairs(values),
-                        relation=option.relation,
-                        role=(
-                            "required_branch"
-                            if option.relation == join.relation else "alternative"
-                        ),
-                        provenance=(
-                            "policy_choice" if option.rank == 1 else "ranked_alternative",
-                        ),
-                    )
-                    hypotheses[node.hypothesis_id] = node
-                    created.append(node.hypothesis_id)
-                    if option.relation == join.relation:
-                        required_node = node
+                for page in pages:
+                    created = []
+                    for option in page:
+                        statement = replace_join_relation(join.raw, option.relation)
+                        state = state_before + [statement]
+                        values = self._execute(state, join.target)
+                        if values is None:
+                            continue
+                        node = ExecutedHypothesis(
+                            f"H{len(hypotheses)}",
+                            tuple(state),
+                            join.target,
+                            values,
+                            denotation_labels=self._display_pairs(values),
+                            relation=option.relation,
+                            role=(
+                                "required_branch"
+                                if option.relation == join.relation
+                                else "alternative"
+                            ),
+                            provenance=(
+                                "policy_choice"
+                                if option.rank == 1
+                                else "ranked_alternative",
+                            ),
+                        )
+                        hypotheses[node.hypothesis_id] = node
+                        created.append(node.hypothesis_id)
+                        if option.relation == join.relation:
+                            required_node = node
+                    created_pages.append(tuple(created))
                 if required_node is None:
                     return None
                 required_nodes.append(required_node)
-                frontiers.append((action_source, tuple(created)))
+                frontiers.append(
+                    (
+                        action_source,
+                        tuple(
+                            ExecutedRelationPage(
+                                node_ids=created,
+                                start=page_index * self.frontier_width,
+                                stop=min(
+                                    (page_index + 1) * self.frontier_width,
+                                    len(options),
+                                ),
+                                total=len(options),
+                            )
+                            for page_index, created in enumerate(created_pages)
+                        ),
+                    )
+                )
             left, right = required_nodes
 
         if left is None or right is None:
@@ -1559,21 +2127,45 @@ class DemonstrationBuilder:
         hypotheses[combined.hypothesis_id] = combined
         steps = []
         active = []
-        for index, (action_source, created) in enumerate(frontiers):
+        if sum(
+            len(page.node_ids) for _, pages in frontiers for page in pages
+        ) > self.max_active:
+            self.stats["conjunction_within_budget_miss"] += 1
+            return None
+        for index, (action_source, pages) in enumerate(frontiers):
+            initial_page = pages[0]
+            initial_created = initial_page.node_ids
             steps.append(
                 DemonstrationStep(
                     "Find_relation",
                     (action_source,),
                     tuple(active),
-                    created,
+                    initial_created,
                     (
                         "open_shared_conjunction_frontier"
                         if len(frontiers) == 1
                         else f"open_conjunction_branch_{index + 1}"
                     ,),
+                    (initial_page.start, initial_page.stop, initial_page.total),
                 )
             )
-            active.extend(created)
+            active.extend(initial_created)
+            for page_number, page in enumerate(pages[1:], start=2):
+                created = page.node_ids
+                steps.append(
+                    DemonstrationStep(
+                        "Widen",
+                        (action_source,),
+                        tuple(active),
+                        created,
+                        (
+                            "required_relation_missing_from_visible_pages",
+                            f"relation_page:{page_number}",
+                        ),
+                        (page.start, page.stop, page.total),
+                    )
+                )
+                active.extend(created)
         steps.extend(
             [
                 DemonstrationStep(
@@ -1647,58 +2239,56 @@ class DemonstrationBuilder:
             state_before = self._dependency_state(plan, source, before=join.index)
             if any("JOIN(" in raw or "AND(" in raw for raw in state_before):
                 return None
-            options = list(self.candidate_provider(query, state_before, join))[
-                : self.max_frontier_width
-            ]
-            initial_options = options[: self.frontier_width]
-            required = next(
-                (option for option in options if option.relation == join.relation), None
+            options = list(self.candidate_provider(query, state_before, join))
+            pages, required = self._pages_through_required_relation(
+                options, join.relation
             )
             self.stats["deep_conjunction_root_decisions"] += 1
             if required is None:
-                self.stats["deep_conjunction_root_max_frontier_miss"] += 1
+                self.stats["deep_conjunction_root_structural_or_ranking_miss"] += 1
                 return None
-            self.stats["deep_conjunction_root_max_frontier_hit"] += 1
+            if sum(len(page) for page in pages) > self.max_active:
+                self.stats["deep_conjunction_root_within_budget_miss"] += 1
+                return None
+            self.stats["deep_conjunction_root_within_budget_hit"] += 1
+            initial_options = pages[0]
             initial_relations = {option.relation for option in initial_options}
-            needs_widen = required.relation not in initial_relations
+            needs_widen = len(pages) > 1
             self.stats[
                 "deep_conjunction_root_proposal_miss"
                 if needs_widen else "deep_conjunction_root_proposal_hit"
             ] += 1
             if needs_widen:
                 self.stats["deep_conjunction_root_recovered_by_widen"] += 1
-            visible_options = options if needs_widen else initial_options
-            initial_created: List[str] = []
-            widened_created: List[str] = []
+            created_pages: List[List[str]] = [[] for _ in pages]
             required_node = None
-            for option in visible_options:
-                statement = replace_join_relation(join.raw, option.relation)
-                state = state_before + [statement]
-                values = self._execute(state, join.target)
-                if values is None:
-                    continue
-                node_id = f"H{len(hypotheses)}"
-                node = ExecutedHypothesis(
-                    node_id,
-                    tuple(state),
-                    join.target,
-                    values,
-                    denotation_labels=self._display_pairs(values),
-                    relation=option.relation,
-                    role="continuation",
-                    provenance=(
-                        "policy_choice" if option.rank == 1 else "ranked_alternative",
-                    ),
-                )
-                hypotheses[node_id] = node
-                target_batch = (
-                    initial_created
-                    if option.relation in initial_relations
-                    else widened_created
-                )
-                target_batch.append(node_id)
-                if option.relation == join.relation:
-                    required_node = node
+            for page_index, page in enumerate(pages):
+                for option in page:
+                    statement = replace_join_relation(join.raw, option.relation)
+                    state = state_before + [statement]
+                    values = self._execute(state, join.target)
+                    if values is None:
+                        continue
+                    node_id = f"H{len(hypotheses)}"
+                    node = ExecutedHypothesis(
+                        node_id,
+                        tuple(state),
+                        join.target,
+                        values,
+                        denotation_labels=self._display_pairs(values),
+                        relation=option.relation,
+                        role="continuation",
+                        provenance=(
+                            "policy_choice"
+                            if option.rank == 1
+                            else "ranked_alternative",
+                        ),
+                    )
+                    hypotheses[node_id] = node
+                    created_pages[page_index].append(node_id)
+                    if option.relation == join.relation:
+                        required_node = node
+            initial_created = created_pages[0]
             if required_node is None or len(initial_created) < 2:
                 return None
             if not self._append_capacity_prunes(
@@ -1717,10 +2307,13 @@ class DemonstrationBuilder:
                     tuple(active),
                     tuple(initial_created),
                     (f"open_deep_conjunction_{branch_label}_root",),
+                    (0, min(self.frontier_width, len(options)), len(options)),
                 )
             )
             active.extend(initial_created)
-            if widened_created:
+            for page_number, widened_created in enumerate(
+                created_pages[1:], start=2
+            ):
                 if not self._append_capacity_prunes(
                     steps,
                     hypotheses,
@@ -1735,7 +2328,15 @@ class DemonstrationBuilder:
                         (action_source,),
                         tuple(active),
                         tuple(widened_created),
-                        ("required_relation_missing_from_initial_frontier",),
+                        (
+                            "required_relation_missing_from_visible_pages",
+                            f"relation_page:{page_number}",
+                        ),
+                        (
+                            (page_number - 1) * self.frontier_width,
+                            min(page_number * self.frontier_width, len(options)),
+                            len(options),
+                        ),
                     )
                 )
                 active.extend(widened_created)
@@ -1766,16 +2367,21 @@ class DemonstrationBuilder:
                         (f"question_relation_match:{current.relation}",),
                     )
                 )
-                initial_children, widened_children = (
-                    self._expand_terminal_frontier_batches(
-                        current,
-                        continuation,
-                        hypotheses,
-                        question,
-                        stat_scope=stat_scope,
-                    )
+                child_pages = self._expand_terminal_frontier_batches(
+                    current,
+                    continuation,
+                    hypotheses,
+                    question,
+                    stat_scope=stat_scope,
                 )
-                children = initial_children + widened_children
+                if not child_pages:
+                    return None
+                initial_page = child_pages[0]
+                initial_children = list(initial_page.node_ids)
+                widened_pages = child_pages[1:]
+                children = [
+                    node_id for page in child_pages for node_id in page.node_ids
+                ]
                 next_required = next(
                     (
                         hypotheses[node_id]
@@ -1796,9 +2402,13 @@ class DemonstrationBuilder:
                         before,
                         tuple(initial_children),
                         ("continue_required_branch",),
+                        (initial_page.start, initial_page.stop, initial_page.total),
                     )
                 )
-                if widened_children:
+                for page_number, widened_page in enumerate(
+                    widened_pages, start=2
+                ):
+                    widened_children = list(widened_page.node_ids)
                     if not self._append_capacity_prunes(
                         steps,
                         hypotheses,
@@ -1813,7 +2423,15 @@ class DemonstrationBuilder:
                             (current.target_expression,),
                             tuple(active),
                             tuple(widened_children),
-                            ("required_relation_missing_from_initial_frontier",),
+                            (
+                                "required_relation_missing_from_visible_pages",
+                                f"relation_page:{page_number}",
+                            ),
+                            (
+                                widened_page.start,
+                                widened_page.stop,
+                                widened_page.total,
+                            ),
                         )
                     )
                     active.extend(widened_children)
@@ -2097,10 +2715,16 @@ def _has_public_prune_reason(
     active_count: Optional[int] = None,
     max_active: Optional[int] = None,
 ) -> bool:
-    if "frontier_capacity_eviction" in step.rationale_facts:
-        return active_count is not None and max_active is not None and active_count == max_active
-    if "frontier_capacity_reservation" in step.rationale_facts:
-        return active_count is not None and max_active is not None and active_count < max_active
+    del active_count, max_active
+    capacity_facts = {
+        "frontier_capacity_eviction",
+        "frontier_capacity_reservation",
+    }.intersection(step.rationale_facts)
+    if capacity_facts:
+        # Historical v5 exports used capacity as a pruning rationale. Keep
+        # those artifacts readable, but never admit that behavior into the
+        # paged relation contract used by new SFT, RL, and inference runs.
+        return "relation_page_size" not in demo.private_metadata
     return (
         _has_visible_path_mismatch(demo, step, node)
     )
@@ -2112,7 +2736,7 @@ class DemonstrationValidator:
     def __init__(
         self,
         executor: ProgramExecutor,
-        max_active: int = 6,
+        max_active: int = 24,
         execution_cache: Optional[
             Dict[Tuple[Tuple[str, ...], str], Optional[Tuple[str, ...]]]
         ] = None,
@@ -2147,6 +2771,13 @@ class DemonstrationValidator:
         active = set(demo.steps[0].visible_before if demo.steps else ())
         committed = None
         selected = None
+        relation_page_size = int(
+            demo.private_metadata.get("relation_page_size", 6)
+        )
+        max_nodes = int(demo.private_metadata.get("max_nodes", 24))
+        paged_contract = "relation_page_size" in demo.private_metadata
+        frontiers: List[Dict[str, Any]] = []
+        known_nodes = set(active)
         for step in demo.steps:
             hypothesis_arguments = (
                 step.arguments if step.action in {"Prune", "Select", "Combine", "Commit"} else ()
@@ -2164,6 +2795,11 @@ class DemonstrationValidator:
             if unknown_created:
                 errors.append(f"{step.action}: unknown created hypotheses {unknown_created}")
                 continue
+            if len(known_nodes.union(step.created)) > max_nodes:
+                errors.append(
+                    f"{step.action}: executed-node budget would exceed {max_nodes}"
+                )
+            known_nodes.update(step.created)
             if set(step.visible_before) != active:
                 errors.append(
                     f"{step.action}: visible state {sorted(step.visible_before)} "
@@ -2210,16 +2846,60 @@ class DemonstrationValidator:
                     errors.append("Widen must occur before Select")
                 if not active:
                     errors.append("Widen requires an open active frontier")
-                if step.arguments[0] not in demo.private_metadata.get("widen_sources", ()):
-                    errors.append(f"Widen source {step.arguments[0]} is not an open frontier")
                 if not step.created:
                     errors.append("Widen must create at least one additional hypothesis")
+                if paged_contract and len(step.relation_page) != 3:
+                    errors.append("Widen must expose an explicit relation page cursor")
+                elif step.relation_page:
+                    start, stop, total = step.relation_page
+                    frontier = next(
+                        (
+                            item
+                            for item in reversed(frontiers)
+                            if item["source"] == step.arguments[0]
+                            and item["exposed"] == start
+                            and set(item["node_ids"]).intersection(active)
+                        ),
+                        None,
+                    )
+                    if frontier is None:
+                        errors.append(
+                            f"Widen source {step.arguments[0]} does not continue "
+                            "an open stable relation page"
+                        )
+                    elif frontier["total"] != total:
+                        errors.append("Widen changed the ranked relation-list size")
+                    elif stop <= start or stop - start > relation_page_size or stop > total:
+                        errors.append("Widen exposed an invalid relation page span")
+                    else:
+                        frontier["exposed"] = stop
+                        frontier["node_ids"].extend(step.created)
                 active.update(step.created)
             elif step.action == "Find_relation":
                 if len(step.arguments) != 1:
                     errors.append(
                         "Find_relation must expose only its source; relation ranking is environment-owned"
                     )
+                if paged_contract and len(step.relation_page) != 3:
+                    errors.append("Find_relation must expose an explicit relation page cursor")
+                elif step.relation_page:
+                    start, stop, total = step.relation_page
+                    if (
+                        start != 0
+                        or stop <= 0
+                        or stop > total
+                        or stop > relation_page_size
+                    ):
+                        errors.append("Find_relation exposed an invalid first relation page")
+                    else:
+                        frontiers.append(
+                            {
+                                "source": step.arguments[0],
+                                "node_ids": list(step.created),
+                                "exposed": stop,
+                                "total": total,
+                            }
+                        )
                 candidate_sources = {
                     str(entity[-1])
                     for entity in demo.private_metadata.get("candidate_entities", ())
@@ -2248,23 +2928,49 @@ class DemonstrationValidator:
                 left, right = step.arguments
                 if left == right:
                     errors.append("Combine requires distinct hypotheses")
-                required = {
-                    node.hypothesis_id
-                    for node in demo.hypotheses.values()
-                    if node.role == "required_branch"
-                }
-                if {left, right} != required:
-                    errors.append(
-                        f"Combine parents {sorted((left, right))} do not match "
-                        f"required branches {sorted(required)}"
-                    )
                 if left not in active or right not in active:
                     errors.append("Combine requires two active parents")
                 active.difference_update((left, right))
                 if len(step.created) != 1:
                     errors.append("Combine must create exactly one hypothesis")
                 else:
-                    active.add(step.created[0])
+                    combined = demo.hypotheses[step.created[0]]
+                    if set(combined.parent_ids) != {left, right}:
+                        errors.append(
+                            f"Combine parents {sorted((left, right))} do not match "
+                            f"required branches {sorted(combined.parent_ids)}"
+                        )
+                    active.add(combined.hypothesis_id)
+                selected = None
+            elif step.action in {"Order", "Compare", "Time_constraint", "Count"}:
+                expected_arguments = {
+                    "Order": 3,
+                    "Compare": 3,
+                    "Time_constraint": 2,
+                    "Count": 1,
+                }
+                if len(step.arguments) != expected_arguments[step.action]:
+                    errors.append(
+                        f"{step.action} requires {expected_arguments[step.action]} arguments"
+                    )
+                if len(step.created) != 1:
+                    errors.append(f"{step.action} must create exactly one hypothesis")
+                else:
+                    child = demo.hypotheses[step.created[0]]
+                    if selected is not None:
+                        if selected not in active:
+                            errors.append(f"{step.action} expands inactive {selected}")
+                        if child.parent_id != selected:
+                            errors.append(
+                                f"{step.action} child {child.hypothesis_id} has wrong parent"
+                            )
+                        active.discard(selected)
+                    elif step.action not in {"Order", "Compare"}:
+                        errors.append(f"{step.action} requires Select")
+                    elif child.parent_id is not None:
+                        errors.append(f"root {step.action} must not have a parent")
+                    active.add(child.hypothesis_id)
+                selected = None
             elif step.action == "Commit":
                 node = demo.hypotheses[step.arguments[0]]
                 if step.arguments[0] not in active:
@@ -2366,7 +3072,7 @@ def _public_graph(
         active_ids=active,
         selected_id=selected,
         committed_id=committed,
-        max_active=int(demo.private_metadata.get("max_active", 6)),
+        max_active=int(demo.private_metadata.get("max_active", 24)),
         node_count=len(known),
         execution_calls=executions,
     )
@@ -2386,12 +3092,24 @@ def _action_text(step: DemonstrationStep) -> str:
     elif step.action == "Widen":
         body = f"Widen [ {step.arguments[0]} ]"
         thought = (
-            "The initial frontier does not cover the question, so I will inspect the next "
-            "ranked batch before selecting a path."
+            "The visible relation pages do not cover the question, so I will inspect "
+            "the next ranked page before selecting a path."
         )
     elif step.action == "Combine":
         body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
         thought = "Both active branches express required parts of the question."
+    elif step.action in {"Order", "Compare"}:
+        body = f"{step.action} [ {' | '.join(step.arguments)} ]"
+        thought = (
+            "The retained executable branch now needs the logical operation "
+            "specified by the question."
+        )
+    elif step.action == "Time_constraint":
+        body = f"Time_constraint [ {step.arguments[0]} | {step.arguments[1]} ]"
+        thought = "I will apply the question's time condition to the retained branch."
+    elif step.action == "Count":
+        body = f"Count [ {step.arguments[0]} ]"
+        thought = "The question asks for the number of results in this retained branch."
     else:
         body = f"{step.action} [ {step.arguments[0]} ]"
         thoughts = {
@@ -2444,6 +3162,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
     committed_id: Optional[str] = None
     known = set(active)
     executions = 0
+    open_frontiers: List[Dict[str, Any]] = []
     if active:
         messages.append(
             {
@@ -2473,6 +3192,18 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             executions += len(step.created)
             selected = None
             event = "Executed the requested relation frontier."
+            if step.relation_page:
+                start, stop, total = step.relation_page
+                if start != 0:
+                    raise ValueError("Find_relation must expose the first relation page")
+                open_frontiers.append(
+                    {
+                        "source": step.arguments[0],
+                        "node_ids": list(step.created),
+                        "exposed": stop,
+                        "total": total,
+                    }
+                )
         elif step.action == "Widen":
             active.extend(step.created)
             known.update(step.created)
@@ -2481,6 +3212,21 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 f"Widened the frontier from {step.arguments[0]} with "
                 f"{len(step.created)} additional executable hypotheses."
             )
+            if step.relation_page:
+                start, stop, total = step.relation_page
+                frontier = next(
+                    (
+                        item
+                        for item in reversed(open_frontiers)
+                        if item["source"] == step.arguments[0]
+                        and item["exposed"] == start
+                    ),
+                    None,
+                )
+                if frontier is None or frontier["total"] != total:
+                    raise ValueError("Widen does not continue an open stable relation page")
+                frontier["node_ids"].extend(step.created)
+                frontier["exposed"] = stop
         elif step.action == "Select":
             selected = step.arguments[0]
             event = (
@@ -2494,7 +3240,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 step,
                 node,
                 len(active),
-                int(demo.private_metadata.get("max_active", 6)),
+                int(demo.private_metadata.get("max_active", 24)),
             ):
                 raise ValueError(
                     f"trajectory {demo.demo_id} prunes a nonempty branch without public evidence"
@@ -2512,6 +3258,18 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 f"Combined {step.arguments[0]} and {step.arguments[1]} into "
                 f"{step.created[0]}."
             )
+        elif step.action in {"Order", "Compare", "Time_constraint", "Count"}:
+            if len(step.created) != 1:
+                raise ValueError(f"{step.action} must create one executable hypothesis")
+            if selected is not None:
+                active.remove(selected)
+            elif step.action not in {"Order", "Compare"}:
+                raise ValueError(f"{step.action} requires a selected hypothesis")
+            active.extend(step.created)
+            known.update(step.created)
+            executions += 1
+            selected = None
+            event = f"Executed {step.action} into {step.created[0]}."
         elif step.action == "Commit":
             active = [step.arguments[0]]
             committed_id = step.arguments[0]
@@ -2535,6 +3293,30 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         committed=(committed_id if step.action == "Commit" else None),
                         executions=executions,
                         known_ids=known,
+                    )
+                    + (
+                        "\n"
+                        + "\n".join(
+                            serialize_relation_page_state(
+                                str(frontier["source"]),
+                                exposed=int(frontier["exposed"]),
+                                total=int(frontier["total"]),
+                                page_size=int(
+                                    demo.private_metadata.get(
+                                        "relation_page_size", 6
+                                    )
+                                ),
+                            )
+                            for frontier in open_frontiers
+                            if committed_id is None
+                            and set(frontier["node_ids"]).intersection(active)
+                        )
+                        if any(
+                            committed_id is None
+                            and set(frontier["node_ids"]).intersection(active)
+                            for frontier in open_frontiers
+                        )
+                        else ""
                     )
                     + "\n</information>"
                 ),

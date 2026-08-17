@@ -10,6 +10,7 @@ from collections import Counter, defaultdict
 from typing import Any, Dict, List, Tuple
 
 from ..fork_r1 import ForkDecision, build_fork_decision
+from ..hyper_prompt import extract_hyper_question
 from ..sexpr.action_parser import ActionResult, ActionType
 from ..sexpr.constants import COMPARISON_MODE_MAPPING
 from ..sexpr.limit import name_relation_list, tc_time_list
@@ -1282,6 +1283,32 @@ class SExprActionProcessor:
         self._maybe_debug_break(sample_id, "find_relation")
         if not action.arguments:
             return action
+
+        if self.hyper_frontier_width is not None:
+            if len(action.arguments) != 1:
+                action.is_valid = False
+                action.error_message = (
+                    "HyPER-R1 Find_relation requires exactly one source argument; "
+                    "the environment owns relation ranking"
+                )
+                return action
+            if sample_id is None:
+                action.is_valid = False
+                action.error_message = "HyPER-R1 Find_relation requires a sample id"
+                return action
+            try:
+                question = extract_hyper_question(
+                    self.state_manager.get_sample_prompt(sample_id)
+                )
+            except ValueError as exc:
+                action.is_valid = False
+                action.error_message = str(exc)
+                return action
+            # Keep the released executor's internal two-argument form while
+            # ensuring that the student supplies only the source. The ranking
+            # query is the immutable benchmark question used by corpus
+            # construction, never model-generated relation text.
+            action.arguments = [action.arguments[0], question]
         
         if len(action.arguments) == 2:
             # New format: [entity | relation_description]
@@ -1384,11 +1411,12 @@ class SExprActionProcessor:
                 source_hint = 'name'
 
             if self.hyper_frontier_width is not None:
-                # This is the exact frontier builder used by offline HyPER data.
+                # HyPER ranks every structurally legal local relation. The
+                # shared paging contract decides what is exposed per turn.
                 selected_relations = self.relation_retrieval.rank_relations_no_threshold(
                     relation_description,
                     candidate_relations,
-                    topk=max(20, self.hyper_frontier_width),
+                    topk=None,
                 )
                 self.relation_retrieval.last_similarity_scores = [
                     float(candidate.score) for candidate in selected_relations

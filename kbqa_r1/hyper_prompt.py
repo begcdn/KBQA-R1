@@ -12,15 +12,16 @@ HYPER_R1_INSTRUCTIONS = """
 HyPER-R1 executable hypothesis graph:
 - These instructions replace the legacy two-argument Find_relation format. Never write a relation name or free-text relation intent; relation proposals belong to the environment.
 - `Find_relation [ source ]` asks the environment to rank relations from the immutable question and that exact executable state. The environment executes a small frontier and returns H-numbered alternatives.
-- `Widen [ source ]` asks for the next ranked batch from the same open frontier when the visible candidates do not cover the question. Widen before Select, and prune first if the active frontier lacks room.
+- `Widen [ source ]` asks for the next ranked page from the same open frontier when the visible candidates do not cover the question. It is repeatable while another page exists and must occur before Select.
 - When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
-- Use `Prune [ Hn ]` for visible path or execution contradictions. A lower-ranked nonempty branch may be removed for capacity only when the active frontier is full, or before an expansion or widening whose incoming candidates would exceed capacity. An empty result is direct negative evidence; a merely different nonempty answer is not.
+- Use `Prune [ Hn ]` only for a visible path or execution contradiction. An empty result is direct negative evidence; low rank, low confidence, and a merely different nonempty answer are not contradiction certificates.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
+- The existing executable logical actions remain available: `Order [ mode | expression_or_type | relation ]`, `Compare [ mode | relation | value ]`, `Time_constraint [ relation | time ]`, and `Count [ expression ]`. Select an existing hypothesis before applying a continuation operator; Compare and ontology-rooted Order may open an independent branch that can later be combined.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
 - Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
-- The active frontier is bounded. Widen only when the extra evidence is needed, and prune visibly unsupported hypotheses before exploring when it is full.
+- The executed-node and action budgets are fixed. Widen only when the extra evidence is needed; never manufacture room by deleting a still-plausible branch.
 Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. After Commit, perform no more graph actions and copy the committed values exactly into <answer>.
 """.rstrip()
 

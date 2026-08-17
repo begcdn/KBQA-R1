@@ -401,14 +401,11 @@ hyper_r1:
   # Enable graph-state rollouts.
   enable: false
 
-  # Maximum number of alternatives visible to the policy.
-  max_active: 6
+  # Uniform executed-hypothesis budget; plausible alternatives are retained.
+  max_active: 24
 
-  # Natural ranked relations executed for each exploration decision.
-  frontier_width: 3
-
-  # Maximum ranked frontier exposed after an explicit Widen action.
-  max_frontier_width: 6
+  # Relations per stable page. Widen repeatedly exposes later pages.
+  frontier_width: 6
 
   # Explicit ranker shared by demonstration building and runtime retrieval.
   relation_model: null

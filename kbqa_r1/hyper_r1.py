@@ -211,9 +211,8 @@ def serialize_frontier(
         )
     lines.append(
         "Actions: Select, Find_relation [ source ], Widen [ source ], Combine, Prune, or Commit. "
-        "Prune for visible path or execution contradictions, or evict a lower-ranked nonempty "
-        "branch only when the active frontier is full and room is required for a higher-priority continuation; "
-        "before an expansion or widening, remove a lower-ranked branch only when its incoming candidates would exceed capacity."
+        "Widen exposes the next stable ranked page. Prune only for a visible path or "
+        "execution contradiction; low rank or limited capacity is not a contradiction."
     )
     lines.append("</hypothesis_graph>")
     return "\n".join(lines)
@@ -320,7 +319,7 @@ def combine_function_states(
 class HypothesisGraph:
     """Owns persistent executable alternatives for all samples in a rollout."""
 
-    def __init__(self, max_active: int = 6, max_nodes: int = 24):
+    def __init__(self, max_active: int = 24, max_nodes: int = 24):
         if max_active < 2:
             raise ValueError("HyPER-R1 requires at least two active hypotheses")
         if max_nodes < max_active:
@@ -505,7 +504,7 @@ class HypothesisGraph:
             return "Select an active hypothesis before any executable continuation."
         if not active and graph.nodes and graph.selected_id is None:
             return "No active hypothesis can be continued."
-        if not graph.nodes and not opens_frontier:
+        if not graph.nodes and not opens_frontier and not opens_new_root:
             return "Begin the executable frontier with Find_relation."
         if opens_frontier:
             active_after = len(active) - (1 if graph.selected_id is not None else 0)
@@ -514,8 +513,8 @@ class HypothesisGraph:
                 or not self.has_capacity(sample_id, frontier_width)
             ):
                 return (
-                    "The full relation frontier does not fit. Prune an unsupported "
-                    "hypothesis before exploring; no partial frontier was executed."
+                    "The next complete relation page does not fit the remaining "
+                    "uniform node budget; no partial page was executed."
                 )
         elif not self.has_capacity(sample_id):
             return "The executed-node budget is exhausted; Commit an active hypothesis."

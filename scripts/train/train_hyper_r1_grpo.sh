@@ -61,16 +61,15 @@ export DATASET_TYPE DATA_DIR TRAIN_FILE VAL_FILE
 export MODEL_PATH=${MODEL_PATH:-"${HYPER_SFT_MODEL}"}
 
 export hyper_r1_enable=true
-export hyper_r1_max_active=${hyper_r1_max_active:-6}
+export hyper_r1_max_active=${hyper_r1_max_active:-24}
 export hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
-export hyper_r1_frontier_width=${hyper_r1_frontier_width:-3}
-export hyper_r1_max_frontier_width=${hyper_r1_max_frontier_width:-6}
+export hyper_r1_frontier_width=${hyper_r1_frontier_width:-6}
 export hyper_r1_relation_model=${hyper_r1_relation_model:-"${HYPER_RELATION_MODEL}"}
 export hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 export hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 export hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
 export hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
-export max_turns=${max_turns:-14}
+export max_turns=${max_turns:-16}
 # The released format bonus validates the old linear S-expression protocol.
 # HyPER's structured actions are enforced by the environment itself, so that
 # bonus would reward the wrong syntax.

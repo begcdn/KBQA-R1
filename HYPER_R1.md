@@ -9,15 +9,14 @@ covers the complete question.
 
 ## Executable protocol
 
-1. `Find_relation [ source ]` asks the environment to execute the normal top-3
-   question-conditioned relation proposals from one exact graph state. Gold relations are never
-   inserted into this frontier. Unlike the released single-path resolver,
-   HyPER-R1 does not reject low-similarity top candidates at a fixed threshold;
-   uncertainty is represented by the bounded executable frontier itself.
-2. `Widen [ source ]` exposes ranks 4--6 from that same cached natural ranking
-   when the first batch does not cover the question. It is a policy decision,
-   not automatic top-k inflation, and it incurs the same execution cost as other
-   explored hypotheses.
+1. `Find_relation [ source ]` structurally enumerates every legal local relation,
+   ranks that complete list from the immutable question and exact executable
+   state, and executes its first stable page of six. Gold relations are never
+   inserted and similarity scores never delete candidates.
+2. `Widen [ source ]` repeatedly exposes the next six relations from the same
+   cached ordering. It is a policy decision, not automatic top-k inflation, and
+   it incurs the same execution cost as other explored hypotheses. The only
+   practical cutoff is the shared rollout node budget.
 3. `Select [ Hn ]` chooses the next hypothesis to investigate without deleting
    its siblings.
 4. A subsequent `Find_relation` replaces that selected leaf with its executable
@@ -26,21 +25,27 @@ covers the complete question.
    path or execution evidence contradicts it. The environment never silently
    prunes a low-scoring hypothesis for the policy.
 6. `Combine [ Hn | Hm ]` executes the intersection of two retained branches.
-7. `Commit [ Hn ]` is valid only for a nonempty active executable hypothesis.
+7. The released executable logical actions remain part of the policy grammar:
+   `Order`, `Compare`, `Time_constraint`, and `Count`. They transform a selected
+   branch; comparison and ontology-order constraints may open an independent
+   branch for later combination.
+8. `Commit [ Hn ]` is valid only for a nonempty active executable hypothesis.
 
-The default frontier starts with three proposals and can widen to six, with at
-most six active hypotheses and
-at most twenty-four executed nodes. Rollouts allow ten model turns so the
-longest retained recovery demonstration can still Commit and answer.
+The default page contains six proposals. At most twenty-four hypotheses may be
+active or executed during a rollout, and rollouts allow sixteen model turns.
+Low rank and lack of capacity are not valid reasons to prune a plausible branch;
+a trace that cannot fit this uniform budget is rejected from supervision.
 
 ## Training data
 
 The behavior-cloning corpus is built only from training-set gold programs.
 Candidate sets come from the same relation retriever used at inference, and all
-hypotheses and final answers are replayed through Freebase. Examples are
-rejected when the natural top-6 misses a required relation; top-3 misses that are
-recovered by natural ranks 4--6 become `Widen` demonstrations. Misses are
-reported rather than repaired with gold injection.
+hypotheses and final answers are replayed through Freebase. The complete
+structurally legal relation list is ranked identically during data construction
+and inference. Teachers expose stable pages only through the page containing a
+required relation. Examples are rejected when a required relation is
+structurally absent or cannot be reached within the same 24-node and 16-turn
+budget. Misses are reported rather than repaired with gold injection.
 
 The proposal query contains only the immutable question and the visible
 executable state. Gold programs choose and verify teacher actions but never add
@@ -63,12 +68,15 @@ The retained trajectory families teach distinct policy behavior:
   alternative, and finish correctly;
 - `semantic_frontier_recovery`: recover when a plausible branch remains
   nonempty but its visible relation path conflicts with the question;
-- `adaptive_frontier_widen`: request a second ranked batch only when the first
-  three proposals omit a required relation, then manage the bounded active set
-  and finish from the recovered hypothesis;
+- `adaptive_frontier_widen`: request later stable relation pages when the first
+  page omits a required relation, then finish from the recovered hypothesis;
 - `conjunction`: retrieve two necessary branches in one natural frontier,
   combine the branches, and commit the executed intersection while unrelated
   plausible candidates remain available.
+- `operator_program`: replay a complete operator-bearing program through the
+  same public actions used at inference, retaining relation alternatives,
+  applying `Order`, `Compare`, `Time_constraint`, or `Count`, combining branches
+  where required, and committing only after exact answer replay succeeds.
 
 Each complete student-visible observation has one teacher action. Recovery
 examples are not paired with direct-progress twins from the identical frontier;
@@ -82,7 +90,9 @@ easy one-hop commits cannot erase the method-specific behavior. Exported
 reports also block expensive SFT unless readable evidence covers at least 95%
 of displayed MIDs, no identical observation has conflicting teacher actions,
 and the verified corpus contains at least 500 recovery trajectories (or 10% of
-a still larger multi-hop corpus). Answer-equivalent alternatives are measured
+a still larger multi-hop corpus). If the input contains logical operators, the
+export also requires every observed runtime operator kind to survive into the
+training split. Answer-equivalent alternatives are measured
 at every executed frontier and at Commit; equality of denotation alone never
 turns a semantically different path into a positive teacher action. Questions
 with more than 100 answers are omitted from SFT to prevent answer copying from
@@ -115,10 +125,10 @@ bash scripts/train/train_hyper_r1_grpo.sh
 ```
 
 The scientific comparison is the complete method against the released
-single-state KBQA-R1 policy under the same model, data, graph backend, and
-execution budget. Required diagnostics are candidate recall, answer F1/EM,
-successful recovery after a non-gold first choice, conjunction accuracy,
-execution calls, frontier size, and invalid/premature commits.
-An always-top-6 control is required: HyPER-R1 only earns its adaptive-search
-claim if it matches or improves answer quality with fewer executions than that
-fixed wider frontier.
+single-state KBQA-R1 policy and a fixed beam control under the same model, data,
+graph backend, relation ordering, and scored-expansion budget. Required
+diagnostics are structural candidate recall, answer F1/EM, successful recovery
+after a non-gold first choice, conjunction/operator accuracy, execution calls,
+frontier size, and invalid or premature commits. HyPER-R1 earns its claim only
+if learned retention and delayed commitment improve answers beyond merely
+executing a wider fixed set of relations.

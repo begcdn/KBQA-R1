@@ -328,9 +328,8 @@ class LiveProgramExecutor:
 
 
 class LiveCandidateProvider:
-    def __init__(self, retrieval: Any, topk: int = 20):
+    def __init__(self, retrieval: Any):
         self.retrieval = retrieval
-        self.topk = int(topk)
         self._rank_lock = threading.Lock()
 
     def __call__(
@@ -346,7 +345,7 @@ class LiveCandidateProvider:
         # ranks the returned vocabularies, so serialize only this short GPU call.
         with self._rank_lock:
             ranked = self.retrieval.rank_relations_no_threshold(
-                question, candidates, topk=self.topk
+                question, candidates, topk=None
             )
         return [
             RelationOption(candidate.relation_id, float(candidate.score), rank)
@@ -371,11 +370,10 @@ def main() -> None:
         "--max-input-rows", type=int, default=0,
         help="Maximum input questions; 0 processes the complete training split",
     )
-    parser.add_argument("--relation-topk", type=int, default=20)
-    parser.add_argument("--frontier-width", type=int, default=3)
-    parser.add_argument("--max-frontier-width", type=int, default=6)
-    parser.add_argument("--max-active", type=int, default=6)
-    parser.add_argument("--max-turns", type=int, default=14)
+    parser.add_argument("--frontier-width", type=int, default=6)
+    parser.add_argument("--max-active", type=int, default=24)
+    parser.add_argument("--max-nodes", type=int, default=24)
+    parser.add_argument("--max-turns", type=int, default=16)
     parser.add_argument(
         "--workers",
         type=int,
@@ -398,7 +396,7 @@ def main() -> None:
     executor = LiveProgramExecutor(config, display_provider)
     retrieval = RelationRetrieval(
         relation_config={
-            "relation_topk": args.relation_topk,
+            "relation_topk": args.frontier_width,
             "relation_threshold": 0.0,
             "entity_topk": 1,
             "entity_threshold": 0.5,
@@ -408,15 +406,15 @@ def main() -> None:
         dataset="grailqa",
         similarity_model_path=args.relation_model,
     )
-    provider = LiveCandidateProvider(retrieval, args.relation_topk)
+    provider = LiveCandidateProvider(retrieval)
 
     def build_row(row):
         builder = DemonstrationBuilder(
             executor,
             provider,
             max_active=args.max_active,
+            max_nodes=args.max_nodes,
             frontier_width=args.frontier_width,
-            max_frontier_width=args.max_frontier_width,
             max_turns=args.max_turns,
             entity_display_provider=display_provider,
         )
@@ -455,6 +453,24 @@ def main() -> None:
 
     prepared = list(prepared_rows())
     eligible = [row for _, row, error in prepared if row is not None and error is None]
+    operator_tokens = {
+        "order": "ARG(",
+        "compare": "CMP(",
+        "time_constraint": "TC(",
+        "count": "COUNT(",
+    }
+
+    def row_operator_kinds(row):
+        functions = "\n".join(str(item) for item in row.get("function_list", ()))
+        return {
+            kind for kind, token in operator_tokens.items() if token in functions
+        }
+
+    eligible_operator_rows = sum(bool(row_operator_kinds(row)) for row in eligible)
+    eligible_operator_kinds = Counter(
+        kind for row in eligible for kind in row_operator_kinds(row)
+    )
+    accepted_operator_rows = 0
     result_iterator = iter(())
     pool = None
     if eligible:
@@ -489,6 +505,9 @@ def main() -> None:
             accepted_this_row = True
         if accepted_this_row:
             accepted_rows_by_hop[str(hop_count)] += 1
+            accepted_operator_rows += int(
+                any(demo.family == "operator_program" for demo in candidates)
+            )
         if row_number % 100 == 0:
             print(f"processed={row_number} qualified={len(qualified)}")
     if pool is not None:
@@ -579,6 +598,12 @@ def main() -> None:
     families = Counter(demo.family for demo in train_demonstrations)
     validation_families = Counter(demo.family for demo in validation_demonstrations)
     qualified_families = Counter(demo.family for demo in unique_qualified)
+    training_operator_kinds = Counter(
+        kind
+        for demo in train_demonstrations
+        if demo.family == "operator_program"
+        for kind in demo.private_metadata.get("logical_operators", ())
+    )
     gold_ranks = Counter(
         str(demo.private_metadata["gold_rank"])
         for demo in train_demonstrations
@@ -607,8 +632,8 @@ def main() -> None:
         proposal_stats.get("proposal_hit", 0) / relation_total
         if relation_total else None
     )
-    relation_max_recall = (
-        proposal_stats.get("proposal_max_frontier_hit", 0) / relation_total
+    relation_within_budget_recall = (
+        proposal_stats.get("proposal_within_budget_hit", 0) / relation_total
         if relation_total else None
     )
     relation_top1 = (
@@ -721,6 +746,10 @@ def main() -> None:
             families.get("conjunction", 0)
             + families.get("deep_conjunction_progress", 0)
         ) > 0,
+        "runtime_operator_grammar_covered": (
+            not eligible_operator_kinds
+            or set(eligible_operator_kinds).issubset(training_operator_kinds)
+        ),
         "deep_progress_has_training_mass": (
             deep_training_trajectories >= minimum_deep_trajectories
         ),
@@ -738,7 +767,7 @@ def main() -> None:
         ),
     }
     report = {
-        "quality_schema": "hyper_r1_v6_depth_aware",
+        "quality_schema": "hyper_r1_v7_paged_operators",
         "input": args.input,
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
@@ -752,6 +781,16 @@ def main() -> None:
         "families": dict(sorted(families.items())),
         "validation_families": dict(sorted(validation_families.items())),
         "qualified_families_before_balancing": dict(sorted(qualified_families.items())),
+        "operator_coverage": {
+            "eligible_rows": eligible_operator_rows,
+            "accepted_rows": accepted_operator_rows,
+            "accepted_row_rate": (
+                accepted_operator_rows / eligible_operator_rows
+                if eligible_operator_rows else None
+            ),
+            "eligible_kinds": dict(sorted(eligible_operator_kinds.items())),
+            "training_kinds": dict(sorted(training_operator_kinds.items())),
+        },
         "gold_rank_in_selected_teacher_frontiers": dict(sorted(gold_ranks.items())),
         "gold_rank_by_family": family_difficulty,
         "find_relation_source_types": dict(sorted(source_types.items())),
@@ -759,8 +798,10 @@ def main() -> None:
             runtime_incompatible_expression_sources
         ),
         "frontier_width": args.frontier_width,
-        "max_frontier_width": args.max_frontier_width,
+        "relation_page_size": args.frontier_width,
+        "relation_rank_cutoff": None,
         "max_active": args.max_active,
+        "max_nodes": args.max_nodes,
         "max_turns": args.max_turns,
         "graph_query_workers": args.workers,
         "maximum_selected_trajectory_turns": max(
@@ -781,10 +822,10 @@ def main() -> None:
             "relation_at_frontier": (
                 relation_recall
             ),
-            "relation_at_max_frontier": relation_max_recall,
+            "relation_within_node_budget": relation_within_budget_recall,
             "recovered_by_widen": (
-                relation_max_recall - relation_recall
-                if relation_max_recall is not None and relation_recall is not None
+                relation_within_budget_recall - relation_recall
+                if relation_within_budget_recall is not None and relation_recall is not None
                 else None
             ),
             "relation_top1": relation_top1,

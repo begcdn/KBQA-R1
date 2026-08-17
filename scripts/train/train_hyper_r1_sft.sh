@@ -19,9 +19,27 @@ import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-if report.get("quality_schema") != "hyper_r1_v6_depth_aware":
+if report.get("quality_schema") != "hyper_r1_v7_paged_operators":
     raise SystemExit(
-        "HyPER-R1 corpus report predates the depth-aware quality gate; rebuild it."
+        "HyPER-R1 corpus predates exhaustive relation paging and runtime operators; "
+        "rebuild it."
+    )
+expected_contract = {
+    "relation_page_size": 6,
+    "relation_rank_cutoff": None,
+    "max_active": 24,
+    "max_nodes": 24,
+    "max_turns": 16,
+}
+contract_mismatches = {
+    key: {"expected": expected, "actual": report.get(key)}
+    for key, expected in expected_contract.items()
+    if report.get(key) != expected
+}
+if contract_mismatches:
+    raise SystemExit(
+        "HyPER-R1 corpus does not match the training/inference contract: "
+        + json.dumps(contract_mismatches, sort_keys=True)
     )
 quality = report.get("quality_assessment", {})
 if not quality.get("structurally_ready_for_sft", False):

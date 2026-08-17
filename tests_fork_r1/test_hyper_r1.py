@@ -130,7 +130,7 @@ def test_commit_requires_nonempty_active_hypothesis():
     ).lower()
 
 
-def test_executable_continuation_requires_select_and_full_frontier_capacity():
+def test_executable_continuation_requires_select_and_a_complete_page_budget():
     graph = HypothesisGraph(max_active=4, max_nodes=8)
     first = add(graph, "r.first", ["m.first"])
     add(graph, "r.second", ["m.second"])
@@ -140,7 +140,7 @@ def test_executable_continuation_requires_select_and_full_frontier_capacity():
     )
     graph.select(0, first.node_id)
     assert graph.execution_error(0, opens_frontier=False, frontier_width=2) is None
-    assert "full relation frontier" in graph.execution_error(
+    assert "complete relation page" in graph.execution_error(
         0, opens_frontier=True, frontier_width=4
     )
 
@@ -178,6 +178,24 @@ def test_new_candidate_root_can_open_while_other_hypotheses_stay_active():
     assert "supplied candidate" in graph.relation_source_error(
         0, "m.invented", ["m.first_topic", "m.second_topic"]
     )
+
+
+def test_independent_logical_constraint_can_open_as_a_new_root():
+    graph = HypothesisGraph(max_active=6, max_nodes=12)
+
+    assert graph.execution_error(
+        0,
+        opens_frontier=False,
+        frontier_width=3,
+        opens_new_root=True,
+    ) is None
+    add(graph, "r.first", ["m.first"])
+    assert graph.execution_error(
+        0,
+        opens_frontier=False,
+        frontier_width=3,
+        opens_new_root=True,
+    ) is None
 
 
 def test_non_frontier_execution_cannot_escape_exhausted_node_budget():

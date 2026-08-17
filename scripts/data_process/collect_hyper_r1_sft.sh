@@ -23,8 +23,7 @@ exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --max-demonstrations "${MAX_DEMONSTRATIONS}" \
   --max-input-rows "${MAX_INPUT_ROWS}" \
   --workers "${HYPER_BUILD_WORKERS}" \
-  --relation-topk 20 \
-  --frontier-width 3 \
-  --max-frontier-width 6 \
-  --max-active 6 \
-  --max-turns 14
+  --frontier-width 6 \
+  --max-active 24 \
+  --max-nodes 24 \
+  --max-turns 16

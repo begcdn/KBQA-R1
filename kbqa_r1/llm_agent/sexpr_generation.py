@@ -20,7 +20,10 @@ from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               result_denotation_values,
                               result_display_labels,
                               required_hyper_relation_model)
-from kbqa_r1.hyper_prompt import extract_hyper_question
+from kbqa_r1.relation_paging import (
+    relation_page,
+    serialize_relation_page_state,
+)
 
 # Import S-Expression components
 from ..sexpr import (ActionParser, FunctionBuilder, SExprExecutor,
@@ -78,23 +81,16 @@ class SExprLLMGenerationManager:
         self.hyper_r1_enable = bool(getattr(config, "hyper_r1_enable", False))
         self.hyper_relation_model = required_hyper_relation_model(config)
         self.hyper_graph = HypothesisGraph(
-            max_active=int(getattr(config, "hyper_r1_max_active", 6)),
+            max_active=int(getattr(config, "hyper_r1_max_active", 24)),
             max_nodes=int(getattr(config, "hyper_r1_max_nodes", 24)),
         )
         self.hyper_frontier_width = int(
-            getattr(config, "hyper_r1_frontier_width", 3)
+            getattr(config, "hyper_r1_frontier_width", 6)
         )
         if self.hyper_frontier_width < 2:
             raise ValueError("HyPER-R1 frontier width must be at least two")
         if self.hyper_frontier_width > self.hyper_graph.max_active:
             raise ValueError("HyPER-R1 frontier width cannot exceed max_active")
-        self.hyper_max_frontier_width = int(
-            getattr(config, "hyper_r1_max_frontier_width", 6)
-        )
-        if self.hyper_max_frontier_width < self.hyper_frontier_width:
-            raise ValueError("HyPER-R1 max frontier width cannot be smaller than its initial width")
-        if self.hyper_max_frontier_width > self.hyper_graph.max_active:
-            raise ValueError("HyPER-R1 max frontier width cannot exceed max_active")
         self._hyper_action_records: Dict[int, List[dict]] = {}
         self._hyper_frontiers: Dict[int, List[dict]] = {}
         self._hyper_turn_actions: Dict[Tuple[int, int], List[ActionResult]] = {}
@@ -140,7 +136,7 @@ class SExprLLMGenerationManager:
             relation_config = None
             if self.hyper_r1_enable:
                 relation_config = {
-                    "relation_topk": self.hyper_max_frontier_width,
+                    "relation_topk": self.hyper_frontier_width,
                     "relation_threshold": 0.0,
                     "entity_topk": 1,
                     "entity_threshold": 0.5,
@@ -299,11 +295,13 @@ class SExprLLMGenerationManager:
         )
 
     def _hyper_info(self, sample_id: int, message: str, is_final_turn: bool) -> str:
+        page_state = self._open_relation_page_state(sample_id)
         content = (
             "<information>\n"
             + message
             + "\n"
             + self.hyper_graph.serialize(sample_id)
+            + ("\n" + page_state if page_state else "")
             + "\n</information>"
         )
         # Reproduce the exact chat-template boundary used by trajectory SFT:
@@ -330,6 +328,27 @@ class SExprLLMGenerationManager:
             # raw-observation behavior, but supported model runs use the exact
             # template path above.
             return self.result_processor._add_guidance_prompt(content, is_final_turn)
+
+    def _open_relation_page_state(self, sample_id: int) -> str:
+        """Expose page cursors without revealing unseen relation labels."""
+        active_ids = {
+            node.node_id for node in self.hyper_graph.active_nodes(sample_id)
+        }
+        states = []
+        for frontier in self._hyper_frontiers.get(sample_id, ()):
+            if not active_ids.intersection(frontier["node_ids"]):
+                continue
+            total = len(frontier["decision"].ranked_relations)
+            exposed = min(int(frontier["next_offset"]), total)
+            states.append(
+                serialize_relation_page_state(
+                    str(frontier["source"]),
+                    exposed=exposed,
+                    total=total,
+                    page_size=self.hyper_frontier_width,
+                )
+            )
+        return "\n".join(states)
 
     def _record_hyper_action(
         self,
@@ -368,16 +387,23 @@ class SExprLLMGenerationManager:
             if not active_ids.intersection(frontier["node_ids"]):
                 continue
             start = int(frontier["next_offset"])
-            end = int(frontier["max_width"])
-            if start >= end:
+            ranked = frontier["decision"].frontier(
+                len(frontier["decision"].ranked_relations)
+            )
+            page = relation_page(
+                ranked,
+                offset=start,
+                page_size=self.hyper_frontier_width,
+            )
+            if not page.items:
                 continue
-            ranked = frontier["decision"].frontier(end)
             signatures.append(
                 (
                     str(frontier["source"]),
-                    start,
-                    end,
-                    tuple(candidate.relation for candidate in ranked[start:end]),
+                    page.start,
+                    page.stop,
+                    page.total,
+                    tuple(candidate.relation for candidate in page.items),
                 )
             )
         return tuple(sorted(signatures, key=repr))
@@ -611,20 +637,27 @@ class SExprLLMGenerationManager:
                         item
                         for item in reversed(self._hyper_frontiers.get(sample_id, ()))
                         if item["source"] == source
-                        and item["next_offset"] < item["max_width"]
+                        and item["next_offset"] < len(item["decision"].ranked_relations)
                         and active_ids.intersection(item["node_ids"])
                     ),
                     None,
                 )
                 if frontier is None:
                     raise ValueError(f"no open frontier from {source} has further ranked proposals")
-                ranked = frontier["decision"].frontier(frontier["max_width"])
-                batch = ranked[frontier["next_offset"] : frontier["max_width"]]
+                ranked = frontier["decision"].frontier(
+                    len(frontier["decision"].ranked_relations)
+                )
+                page = relation_page(
+                    ranked,
+                    offset=frontier["next_offset"],
+                    page_size=self.hyper_frontier_width,
+                )
+                batch = page.items
                 if not batch:
                     raise ValueError(f"frontier from {source} is already fully exposed")
                 if self.hyper_graph.available_active_slots(sample_id) < len(batch):
                     raise ValueError(
-                        f"Widen needs {len(batch)} free active slots; prune visible mismatches first"
+                        f"Widen needs {len(batch)} slots but the uniform node budget is exhausted"
                     )
                 if not self.hyper_graph.has_capacity(sample_id, len(batch)):
                     raise ValueError("the executed-node budget cannot hold the widened frontier")
@@ -652,7 +685,7 @@ class SExprLLMGenerationManager:
                         effective_id = node.equivalent_to or node.node_id
                         created.append(effective_id)
                         frontier["node_ids"].append(effective_id)
-                frontier["next_offset"] = frontier["max_width"]
+                frontier["next_offset"] = page.stop
                 action_key = self.hyper_graph.action_key(
                     sample_id,
                     action.action_type.value,
@@ -673,7 +706,8 @@ class SExprLLMGenerationManager:
                     sample_id,
                     (
                         f"Widened the frontier from {source} with {len(created)} "
-                        "additional executable hypotheses."
+                        f"additional executable hypotheses (relations "
+                        f"{page.start + 1}-{page.stop} of {page.total})."
                     ),
                     is_final_turn,
                 )
@@ -946,19 +980,16 @@ class SExprLLMGenerationManager:
                     candidate.relation,
                     sample_id,
                 )
-        max_frontier = decision.frontier(self.hyper_max_frontier_width)
-        if len(max_frontier) > len(frontier):
-            self._hyper_frontiers.setdefault(sample_id, []).append(
-                {
-                    "source": str(decision.entity_argument),
-                    "decision": decision,
-                    "parent_id": parent_id,
-                    "contrast_group": contrast_group,
-                    "node_ids": opened_node_ids,
-                    "next_offset": len(frontier),
-                    "max_width": len(max_frontier),
-                }
-            )
+        self._hyper_frontiers.setdefault(sample_id, []).append(
+            {
+                "source": str(decision.entity_argument),
+                "decision": decision,
+                "parent_id": parent_id,
+                "contrast_group": contrast_group,
+                "node_ids": opened_node_ids,
+                "next_offset": len(frontier),
+            }
+        )
         # Opening a frontier does not select its top-1 member. The next
         # expansion must be preceded by an explicit policy Select action.
 
@@ -1332,15 +1363,17 @@ class SExprLLMGenerationManager:
                         "HyPER-R1 relation retrieval is environment-owned; use Find_relation [ source ].",
                         is_final_turn,
                     )
-                try:
-                    question = extract_hyper_question(
-                        self.state_manager.get_sample_prompt(index)
+            opens_operator_root = bool(
+                graph_state.selected_id is None
+                and (
+                    actions[0].action_type == ActionType.COMPARE
+                    or (
+                        actions[0].action_type == ActionType.ORDER
+                        and len(actions[0].arguments) >= 2
+                        and not str(actions[0].arguments[1]).startswith("expression")
                     )
-                except ValueError as exc:
-                    return self._hyper_info(index, str(exc), is_final_turn)
-                # Preserve raw_action for policy credit while supplying the
-                # immutable question to the legacy retrieval implementation.
-                relation_action.arguments = [relation_action.arguments[0], question]
+                )
+            )
             execution_error = self.hyper_graph.execution_error(
                 index,
                 opens_frontier=bool(relation_actions),
@@ -1354,7 +1387,7 @@ class SExprLLMGenerationManager:
                         for entity in self.state_manager.get_sample_entities(index)
                         if entity
                     }
-                ),
+                ) or opens_operator_root,
             )
             if execution_error:
                 return self._hyper_info(index, execution_error, is_final_turn)
