@@ -32,7 +32,9 @@ class ODBCConfig:
     connection_timeout: int = 15  # ODBC connection-level timeout
     
     # Retry settings
-    max_retries: int = 1
+    # Data construction must not discard a valid program because one Virtuoso
+    # request hit a transient communications timeout.
+    max_retries: int = 3
     retry_delay: float = 1.0  # Base retry delay for exponential backoff
     
     # Experiment tracking parameters
@@ -58,8 +60,10 @@ class ODBCConfig:
             max_pool_size=int(os.getenv('FREEBASE_ODBC_MAX_POOL_SIZE', str(cls.max_pool_size))),
             query_timeout=int(os.getenv('FREEBASE_ODBC_TIMEOUT', str(cls.query_timeout))),
             max_concurrent=int(os.getenv('FREEBASE_ODBC_MAX_CONCURRENT', str(cls.max_concurrent))),
+            max_retries=int(os.getenv('FREEBASE_ODBC_MAX_RETRIES', str(cls.max_retries))),
+            retry_delay=float(os.getenv('FREEBASE_ODBC_RETRY_DELAY', str(cls.retry_delay))),
             experiment_name=os.getenv('EXPERIMENT_NAME', cls.experiment_name),
         )
 
 # Global configuration instance
-DEFAULT_CONFIG = ODBCConfig.from_env() 
+DEFAULT_CONFIG = ODBCConfig.from_env()
