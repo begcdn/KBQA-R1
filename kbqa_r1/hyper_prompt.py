@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 import re
 
 
@@ -13,7 +13,7 @@ HyPER-R1 executable hypothesis graph:
 - These instructions replace the legacy two-argument Find_relation format. Never write a relation name or free-text relation intent; relation proposals belong to the environment.
 - `Find_relation [ source ]` asks the environment to rank relations from the immutable question and that exact executable state. The environment executes a small frontier and returns H-numbered alternatives.
 - `Widen [ source ]` asks for the next ranked page from the same open frontier when the visible candidates do not cover the question. It is repeatable while another page exists and must occur before Select.
-- When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
+- When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity or candidate literal while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
 - Use `Prune [ Hn ]` only for a visible path or execution contradiction. An empty result is direct negative evidence; low rank, low confidence, and a merely different nonempty answer are not contradiction certificates.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
@@ -49,6 +49,7 @@ def build_hyper_prompt(
     question: str,
     candidate_entities: Sequence[Sequence[str]] = (),
     base_prompt: str = "",
+    candidate_literals: Sequence[Sequence[str]] = (),
 ) -> str:
     """Build the same student-visible protocol used by SFT and RL datasets."""
     entities = []
@@ -59,6 +60,14 @@ def build_hyper_prompt(
         entity_id = str(entity[-1])
         entities.append(f"'{name}' ({entity_id})")
     entity_text = ", ".join(entities) or "none"
+    literals = []
+    for literal in candidate_literals:
+        if not literal:
+            continue
+        surface = str(literal[0]) if len(literal) > 1 else str(literal[-1])
+        literal_id = str(literal[-1])
+        literals.append(f"'{surface}' ({literal_id})")
+    literal_text = ", ".join(literals) or "none"
     if base_prompt:
         candidate_line = f"Candidate Entities: [{entity_text}]"
         if re.search(r"(?m)^Candidate Entities:\s*.*$", base_prompt):
@@ -75,12 +84,28 @@ def build_hyper_prompt(
                 base_prompt,
                 count=1,
             )
+        literal_line = f"Candidate Literals: [{literal_text}]"
+        if re.search(r"(?m)^Candidate Literals:\s*.*$", base_prompt):
+            base_prompt = re.sub(
+                r"(?m)^Candidate Literals:\s*.*$",
+                lambda _match: literal_line,
+                base_prompt,
+                count=1,
+            )
+        else:
+            base_prompt = re.sub(
+                r"(?m)^(Question:\s*)",
+                lambda match: literal_line + "\n" + match.group(1),
+                base_prompt,
+                count=1,
+            )
         return append_hyper_instructions(base_prompt)
     prompt = (
         "You are an expert assistant for querying Freebase with executable actions.\n"
         "Find_relation [ source ] opens a question-conditioned relation frontier; "
-        "source must be one of the candidate entity IDs or a selected expression.\n"
+        "source must be a supplied candidate entity, candidate literal, or selected expression.\n"
         f"Candidate Entities: [{entity_text}]\n"
+        f"Candidate Literals: [{literal_text}]\n"
         f"Question: {question}"
     )
     return append_hyper_instructions(prompt)
@@ -97,14 +122,110 @@ def dataset_candidate_entities(row: Dict[str, Any]) -> Sequence[Sequence[str]]:
     return ground_truth.get("candidate_entities") or ()
 
 
+_XSD = "http://www.w3.org/2001/XMLSchema#"
+_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def question_candidate_literals(question: str) -> List[Tuple[str, str]]:
+    """Return executable literal sources derived only from question text."""
+    text = str(question)
+    occupied: List[Tuple[int, int]] = []
+    values: List[Tuple[str, str]] = []
+
+    def add(match: re.Match, lexical: str, datatype: str) -> None:
+        occupied.append(match.span())
+        canonical = f"{lexical}^^{_XSD}{datatype}"
+        if canonical not in {value for _, value in values}:
+            values.append((match.group(0), canonical))
+
+    datetime_pattern = re.compile(
+        r"(?<!\w)(\d{4}-\d{2}-\d{2})[tT](\d{2}:\d{2}:\d{2})([zZ]|[+-]\d{2}:\d{2})(?!\w)"
+    )
+    for match in datetime_pattern.finditer(text):
+        lexical = f"{match.group(1)}T{match.group(2)}{match.group(3).upper()}"
+        add(match, lexical, "dateTime")
+
+    for match in re.finditer(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?![\dTt])", text):
+        add(match, match.group(0), "date")
+
+    for match in re.finditer(r"(?<!\d)(\d{1,2})/(\d{1,2})/(\d{4})(?!\d)", text):
+        month, day, year = map(int, match.groups())
+        add(match, f"{year:04d}-{month:02d}-{day:02d}", "date")
+
+    month_names = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    month_pattern = re.compile(
+        rf"(?i)(?<!\w)({month_names})\.?\s+(?:the\s+)?"
+        r"(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(-?\d{1,4})(?!\d)"
+    )
+    for match in month_pattern.finditer(text):
+        month = _MONTHS[match.group(1).lower()]
+        day = int(match.group(2))
+        year = int(match.group(3))
+        add(match, f"{year:04d}-{month:02d}-{day:02d}", "date")
+
+    for match in re.finditer(r"(?<!\d)(-?\d{3,4})-(\d{2})(?!-?\d)", text):
+        if any(start <= match.start() < stop for start, stop in occupied):
+            continue
+        add(match, match.group(0), "gYearMonth")
+
+    number_pattern = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
+    for match in number_pattern.finditer(text):
+        if any(start <= match.start() < stop for start, stop in occupied):
+            continue
+        lexical = match.group(0)
+        if "." in lexical:
+            add(match, lexical, "float")
+            continue
+        add(match, lexical, "integer")
+        if 3 <= len(lexical.lstrip("-")) <= 4:
+            canonical = f"{lexical}^^{_XSD}gYear"
+            if canonical not in {value for _, value in values}:
+                values.append((match.group(0), canonical))
+    return values
+
+
 def augment_dataset_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Add the protocol to common KBQA-R1 RL and SFT parquet schemas."""
     result = deepcopy(row)
     entities = dataset_candidate_entities(result)
+    extra = result.get("extra_info") if isinstance(result.get("extra_info"), dict) else {}
+    original_question = str(extra.get("original_question", ""))
 
     def augment_content(content: str) -> str:
-        if entities:
-            return build_hyper_prompt("", entities, str(content))
+        question = original_question
+        if not question:
+            match = re.search(r"(?m)^Question:\s*(.+)$", str(content))
+            question = match.group(1).strip() if match else ""
+        literals = question_candidate_literals(question)
+        if entities or literals:
+            return build_hyper_prompt(
+                question, entities, str(content), candidate_literals=literals
+            )
         return append_hyper_instructions(content)
 
     prompt = result.get("prompt")

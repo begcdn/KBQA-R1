@@ -2,6 +2,7 @@ from kbqa_r1.hyper_prompt import (
     augment_dataset_row,
     dataset_candidate_entities,
     extract_hyper_question,
+    question_candidate_literals,
 )
 
 
@@ -55,3 +56,43 @@ def test_candidate_entities_fall_back_to_reward_metadata():
     }
 
     assert dataset_candidate_entities(row) == entities
+
+
+def test_question_literals_are_public_and_deterministic():
+    literals = question_candidate_literals(
+        "What recipe takes at most 120.0 minutes and uses 1.5 of the ingredient?"
+    )
+
+    assert literals == [
+        ("120.0", "120.0^^http://www.w3.org/2001/XMLSchema#float"),
+        ("1.5", "1.5^^http://www.w3.org/2001/XMLSchema#float"),
+    ]
+
+
+def test_question_literals_normalize_dates_without_gold_programs():
+    literals = dict(
+        question_candidate_literals(
+            "Which events occurred on 07/01/1970 or Feb. the 10th, 2008?"
+        )
+    )
+
+    assert literals["07/01/1970"].endswith("#date")
+    assert literals["07/01/1970"].startswith("1970-07-01^^")
+    assert literals["Feb. the 10th, 2008"].startswith("2008-02-10^^")
+
+
+def test_augment_prompt_exposes_question_literals_as_sources():
+    row = {
+        "prompt": [{
+            "role": "user",
+            "content": "Candidate Entities: []\nQuestion: Which recipe uses 1.5 units?",
+        }],
+        "extra_info": {"original_question": "Which recipe uses 1.5 units?"},
+    }
+
+    content = augment_dataset_row(row)["prompt"][0]["content"]
+
+    assert (
+        "Candidate Literals: ['1.5' "
+        "(1.5^^http://www.w3.org/2001/XMLSchema#float)]"
+    ) in content

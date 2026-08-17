@@ -538,7 +538,7 @@ class HypothesisGraph:
                 )
             return None
         if str(source) not in candidate_sources:
-            return "The initial Find_relation source must be a supplied candidate entity."
+            return "The initial Find_relation source must be a supplied candidate entity or literal."
         return None
 
     def mark_expanded(self, sample_id: int, node_id: Optional[str]) -> None:

@@ -14,7 +14,7 @@ import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .hyper_prompt import build_hyper_prompt
+from .hyper_prompt import build_hyper_prompt, question_candidate_literals
 from .hyper_r1 import combine_function_states, relation_path, serialize_frontier
 from .relation_paging import relation_page, serialize_relation_page_state
 
@@ -636,9 +636,31 @@ class DemonstrationBuilder:
             within_budget.append(demo)
         demos = within_budget
         candidate_entities = self._row_candidate_entities(row, plan, question_id)
+        candidate_literals = question_candidate_literals(question)
+        public_sources = {
+            str(source[-1])
+            for source in (*candidate_entities, *candidate_literals)
+            if source
+        }
+        public_demos = []
+        for demo in demos:
+            unavailable = [
+                step.arguments[0]
+                for step in demo.steps
+                if step.action == "Find_relation"
+                and step.arguments
+                and not step.arguments[0].startswith("expression")
+                and step.arguments[0] not in public_sources
+            ]
+            if unavailable:
+                self.stats["public_source_proposal_miss"] += 1
+                continue
+            public_demos.append(demo)
+        demos = public_demos
         base_prompt = self._row_base_prompt(row)
         for demo in demos:
             demo.private_metadata["candidate_entities"] = candidate_entities
+            demo.private_metadata["candidate_literals"] = candidate_literals
             demo.private_metadata["candidate_entity_order"] = "stable_question_hash"
             demo.private_metadata["base_prompt"] = base_prompt
             demo.private_metadata["max_active"] = self.max_active
@@ -3168,9 +3190,10 @@ class DemonstrationValidator:
                             }
                         )
                 candidate_sources = {
-                    str(entity[-1])
-                    for entity in demo.private_metadata.get("candidate_entities", ())
-                    if entity
+                    str(source[-1])
+                    for key in ("candidate_entities", "candidate_literals")
+                    for source in demo.private_metadata.get(key, ())
+                    if source
                 }
                 opens_new_root = (
                     bool(active)
@@ -3449,6 +3472,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 demo.question,
                 demo.private_metadata.get("candidate_entities", ()),
                 demo.private_metadata.get("base_prompt", ""),
+                candidate_literals=demo.private_metadata.get("candidate_literals", ()),
             ),
         }
     ]

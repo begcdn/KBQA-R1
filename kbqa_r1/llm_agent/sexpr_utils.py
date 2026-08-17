@@ -163,10 +163,14 @@ class SExprUtils:
                 continue
             # Prefer "Candidate Entities:", fallback to "Entities:" to be robust to earlier prompts
             m = re.search(r"(Candidate Entities|Entities):\s*\[(.*?)\]", text, re.DOTALL)
-            if not m:
-                continue
-            inner = m.group(2)
-            pairs = re.findall(r"'([^']+)'\s*\(([^)]+)\)", inner)
+            pairs = []
+            if m:
+                pairs.extend(re.findall(r"'([^']+)'\s*\(([^)]+)\)", m.group(2)))
+            literal_match = re.search(r"Candidate Literals:\s*\[(.*?)\]", text, re.DOTALL)
+            if literal_match:
+                pairs.extend(
+                    re.findall(r"'([^']+)'\s*\(([^)]+)\)", literal_match.group(1))
+                )
             if not pairs:
                 continue
             entities: List[Tuple[str, str]] = []

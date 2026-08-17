@@ -162,6 +162,20 @@ def test_relation_source_is_bound_to_candidates_and_selected_state():
     )
 
 
+def test_public_literal_can_open_an_independent_relation_root():
+    graph = HypothesisGraph(max_active=4, max_nodes=8)
+    add(graph, "r.first", ["m.first"])
+    literal = "1.5^^http://www.w3.org/2001/XMLSchema#float"
+
+    assert graph.relation_source_error(0, literal, ["m.topic", literal]) is None
+    assert graph.execution_error(
+        0,
+        opens_frontier=True,
+        frontier_width=2,
+        opens_new_root=True,
+    ) is None
+
+
 def test_new_candidate_root_can_open_while_other_hypotheses_stay_active():
     graph = HypothesisGraph(max_active=6, max_nodes=12)
     add(graph, "r.first", ["m.first"])
