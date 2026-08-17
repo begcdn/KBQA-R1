@@ -167,6 +167,12 @@ class DynamicRelationRetrieval:
         # Freebase entity IDs
         if entity.startswith('m.') or entity.startswith('g.'):
             return 'entity'
+
+        # Typed Freebase literals use ``value^^datatype``.  They must be
+        # expanded through the template query below rather than treated as
+        # opaque names.
+        if '^^' in entity:
+            return 'literal'
         
         # Check if it's a number
         try:
@@ -182,6 +188,13 @@ class DynamicRelationRetrieval:
         # Check if it's a URL
         if entity.startswith('http'):
             return 'url'
+
+        # GrailQA programs may start from an ontology class before applying a
+        # JOIN, for example ``meteorology.beaufort_wind_force``.  MIDs were
+        # handled above; the remaining dotted Freebase identifiers are class
+        # constants, not display names.
+        if re.fullmatch(r'[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+', entity):
+            return 'onto'
         
         # Default classification
         return 'name'
@@ -198,7 +211,7 @@ class DynamicRelationRetrieval:
                 # Simple entity case
                 entity_type = self._detect_entity_type(sexpr)
                 
-                if entity_type in ['entity', 'onto']:
+                if entity_type == 'entity':
                     # Simple entity query
                     if relation_type == "reverse":
                         # ?y ?relation ns:entity
@@ -217,7 +230,10 @@ WHERE {{
     FILTER (?y != ns:{sexpr})
 }}"""
                 
-                elif entity_type in ['int', 'url']:
+                elif entity_type == 'onto':
+                    return self._generate_ontology_query(sexpr, relation_type)
+
+                elif entity_type in ['int', 'literal', 'url', 'name']:
                     # Complex type query using template substitution
                     return self._generate_template_query(func_list, expr_id, relation_type)
             
@@ -228,6 +244,22 @@ WHERE {{
         except Exception as e:
             logger.error(f"Error generating relation query: {e}")
             return None
+
+    def _generate_ontology_query(self, ontology: str, relation_type: str) -> str:
+        """Find relations adjacent to instances of a Freebase class."""
+        outer_limit = int(os.getenv('KBQA_OUTER_LIMIT', '200'))
+        if relation_type == "reverse":
+            edge = "?x ?relation ?y ."
+        else:
+            edge = "?y ?relation ?x ."
+        return f"""PREFIX ns: <http://rdf.freebase.com/ns/>
+SELECT DISTINCT ?relation
+WHERE {{
+    ?x ns:type.object.type ns:{ontology} .
+    {edge}
+    FILTER (?y != ?x)
+}}
+LIMIT {outer_limit}"""
     
     def _generate_template_query(self, func_list: List[str], expr_id: str, relation_type: str) -> Optional[str]:
         """Generate query using template substitution for complex types"""
@@ -408,5 +440,4 @@ LIMIT {outer_limit}"""
         self.cache_enabled = enabled
         if not enabled:
             self.clear_cache()
-
 
