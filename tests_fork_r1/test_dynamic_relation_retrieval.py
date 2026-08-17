@@ -22,17 +22,18 @@ def test_detects_grailqa_class_and_typed_literal_starts():
     )
 
 
-def test_ontology_frontier_queries_class_instances_in_both_directions():
+def test_ontology_class_does_not_trigger_a_broad_relation_scan():
     retrieval = _retrieval_without_backends()
+    retrieval._generate_template_query = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("ontology classes must not use relation-query templates")
+    )
 
-    forward = retrieval._generate_ontology_query("people.person", "forward")
-    reverse = retrieval._generate_ontology_query("people.person", "reverse")
-
-    type_clause = "?x ns:type.object.type ns:people.person ."
-    assert type_clause in forward
-    assert "?y ?relation ?x ." in forward
-    assert type_clause in reverse
-    assert "?x ?relation ?y ." in reverse
+    assert retrieval._generate_relation_query(
+        "people.person",
+        "forward",
+        "",
+        ["expression1 = START('people.person')"],
+    ) is None
 
 
 def test_typed_literal_uses_relation_template_query():

@@ -35,6 +35,13 @@ _TC = re.compile(
 )
 _COUNT = re.compile(rf"^COUNT\(({_EXPRESSION})\)$")
 _STOP = re.compile(rf"^STOP\(({_EXPRESSION})\)$")
+_ONTOLOGY_TYPE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
+)
+
+
+def _is_ontology_type(value: str) -> bool:
+    return bool(_ONTOLOGY_TYPE.fullmatch(str(value).strip()))
 
 
 def normalize_values(values: Iterable[Any]) -> Tuple[str, ...]:
@@ -570,7 +577,7 @@ class DemonstrationBuilder:
             return []
         intersection_demos: List[HyperDemonstration] = []
         semantic_branch_indexes = set()
-        if plan.operators:
+        if plan.operators or self._has_bare_type_intersection(plan):
             operator_demo = self._build_operator_program_demo(
                 question_id, question, plan, gold_answers
             )
@@ -719,6 +726,10 @@ class DemonstrationBuilder:
                     statement.raw,
                     statement.arguments[0],
                 )
+                # START is an assignment and may deliberately reuse an old
+                # expression name. Do not mistake the overwritten branch for
+                # the new constant during a later AND.
+                expression_nodes.pop(statement.target, None)
                 continue
             if statement.kind == "stop":
                 continue
@@ -854,13 +865,6 @@ class DemonstrationBuilder:
                 left = expression_nodes.get(statement.sources[0])
                 right = expression_nodes.get(statement.sources[1])
                 if (left is None) != (right is None):
-                    # GrailQA commonly intersects an executable branch with a
-                    # bare ontology START (for example, COUNT(items AND
-                    # exhibition_subject)). HyPER has no public action that
-                    # materializes a bare type branch. Elide it only when live
-                    # execution proves that the intersection is denotationally
-                    # identical to the executable branch; otherwise the row is
-                    # not representable by the runtime grammar and is rejected.
                     missing_source = (
                         statement.sources[0] if left is None else statement.sources[1]
                     )
@@ -869,29 +873,59 @@ class DemonstrationBuilder:
                     if preserved is None or bare_start is None:
                         self.stats["operator_program_unrepresented_intersection"] += 1
                         return None
-                    bare_state = [bare_start[0]]
-                    if left is None:
-                        combined_state, combined_target = combine_function_states(
-                            bare_state,
-                            missing_source,
-                            preserved.function_state,
-                            preserved.target_expression,
-                        )
-                    else:
-                        combined_state, combined_target = combine_function_states(
-                            preserved.function_state,
-                            preserved.target_expression,
-                            bare_state,
-                            missing_source,
-                        )
-                    combined_values = self._execute(combined_state, combined_target)
-                    if combined_values != preserved.denotation:
-                        self.stats[
-                            "operator_program_nonredundant_bare_intersection"
-                        ] += 1
+                    ontology_type = bare_start[1]
+                    if not _is_ontology_type(ontology_type):
+                        self.stats["operator_program_unrepresented_intersection"] += 1
                         return None
-                    self.stats["operator_program_redundant_bare_intersection"] += 1
-                    expression_nodes[statement.target] = preserved
+                    if not select_parent(
+                        preserved, "apply_required_ontology_type_constraint"
+                    ):
+                        return None
+
+                    # Match the released Merge runtime exactly: create a START
+                    # for the inferred type, then execute the AND in the same
+                    # query. This avoids enumerating every instance of broad
+                    # classes such as people.person.
+                    expression_numbers = [
+                        int(number)
+                        for raw in preserved.function_state
+                        for number in re.findall(r"expression(\d+)", raw)
+                    ]
+                    type_expression = f"expression{max(expression_numbers, default=0) + 1}"
+                    combined_target = preserved.target_expression
+                    combined_state = [
+                        *preserved.function_state,
+                        f"{type_expression} = START('{ontology_type}')",
+                        f"{combined_target} = AND({combined_target}, {type_expression})",
+                    ]
+                    combined_values = self._execute(combined_state, combined_target)
+                    if combined_values is None:
+                        return None
+                    filtered = add_node(
+                        combined_state,
+                        combined_target,
+                        combined_values,
+                        parent=preserved,
+                        role="type_constrained",
+                        operation="merge",
+                        provenance=(f"ontology_type:{ontology_type}",),
+                    )
+                    if filtered is None:
+                        return None
+                    before = tuple(active)
+                    active.remove(preserved.hypothesis_id)
+                    active.append(filtered.hypothesis_id)
+                    steps.append(
+                        DemonstrationStep(
+                            "Merge",
+                            (preserved.target_expression, ontology_type),
+                            before,
+                            (filtered.hypothesis_id,),
+                            ("explicit_gold_type_constraint",),
+                        )
+                    )
+                    self.stats["operator_program_type_constraint"] += 1
+                    expression_nodes[statement.target] = filtered
                     continue
                 if (
                     left is None
@@ -1029,7 +1063,7 @@ class DemonstrationBuilder:
             demo_id=f"{question_id}:operator:{_digest(plan.executable_functions)}",
             question_id=question_id,
             question=question,
-            family="operator_program",
+            family="operator_program" if plan.operators else "typed_program",
             hypotheses=hypotheses,
             steps=steps,
             gold_answers=gold_answers,
@@ -2631,6 +2665,19 @@ class DemonstrationBuilder:
             None,
         )
 
+    def _has_bare_type_intersection(self, plan: GoldPlan) -> bool:
+        for combine in plan.intersections:
+            for source in combine.sources:
+                definition = self._definition_before(plan, source, combine.index)
+                if (
+                    definition is not None
+                    and definition.kind == "start"
+                    and definition.arguments
+                    and _is_ontology_type(definition.arguments[0])
+                ):
+                    return True
+        return False
+
     def _immediate_intersection_branches(
         self, plan: GoldPlan, combine: ProgramStatement
     ) -> Tuple[ProgramStatement, ...]:
@@ -2673,7 +2720,12 @@ class DemonstrationBuilder:
         if isinstance(extra, Mapping):
             entities = extra.get("extracted_entities") or extra.get("candidate_entities")
             if entities:
-                values = [(str(item[0]), str(item[-1])) for item in entities if item]
+                values = [
+                    (str(item[0]), str(item[-1]))
+                    for item in entities
+                    if item
+                    and str(item[-1]).startswith(("m.", "g."))
+                ]
             else:
                 values = []
         else:
@@ -2686,7 +2738,8 @@ class DemonstrationBuilder:
                     if start is None:
                         continue
                     value = start.group(1)
-                    values.append((value, value))
+                    if value.startswith(("m.", "g.")):
+                        values.append((value, value))
 
         unique: Dict[str, str] = {}
         for name, identity in values:
@@ -2982,6 +3035,32 @@ class DemonstrationValidator:
                         )
                     active.add(combined.hypothesis_id)
                 selected = None
+            elif step.action == "Merge":
+                if len(step.arguments) != 2:
+                    errors.append("Merge requires an expression and an ontology type")
+                elif not _is_ontology_type(step.arguments[1]):
+                    errors.append(f"Merge has invalid ontology type {step.arguments[1]}")
+                if len(step.created) != 1:
+                    errors.append("Merge must create exactly one hypothesis")
+                elif selected is None:
+                    errors.append("Merge requires Select")
+                else:
+                    child = demo.hypotheses[step.created[0]]
+                    if selected not in active:
+                        errors.append(f"Merge expands inactive {selected}")
+                    parent = demo.hypotheses[selected]
+                    if step.arguments[0] != parent.target_expression:
+                        errors.append(
+                            f"Merge source {step.arguments[0]} does not match "
+                            f"selected {selected} target {parent.target_expression}"
+                        )
+                    if child.parent_id != selected:
+                        errors.append(
+                            f"Merge child {child.hypothesis_id} has wrong parent"
+                        )
+                    active.discard(selected)
+                    active.add(child.hypothesis_id)
+                selected = None
             elif step.action in {"Order", "Compare", "Time_constraint", "Count"}:
                 expected_arguments = {
                     "Order": 3,
@@ -3138,6 +3217,9 @@ def _action_text(step: DemonstrationStep) -> str:
     elif step.action == "Combine":
         body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
         thought = "Both active branches express required parts of the question."
+    elif step.action == "Merge":
+        body = f"Merge [ {step.arguments[0]} | {step.arguments[1]} ]"
+        thought = "The question requires this retained branch to have a specific Freebase type."
     elif step.action in {"Order", "Compare"}:
         body = f"{step.action} [ {' | '.join(step.arguments)} ]"
         thought = (
@@ -3297,6 +3379,19 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             event = (
                 f"Combined {step.arguments[0]} and {step.arguments[1]} into "
                 f"{step.created[0]}."
+            )
+        elif step.action == "Merge":
+            if len(step.created) != 1:
+                raise ValueError("Merge must create one executable hypothesis")
+            if selected is None:
+                raise ValueError("Merge requires a selected hypothesis")
+            active.remove(selected)
+            active.extend(step.created)
+            known.update(step.created)
+            executions += 1
+            selected = None
+            event = (
+                f"Applied ontology type {step.arguments[1]} into {step.created[0]}."
             )
         elif step.action in {"Order", "Compare", "Time_constraint", "Count"}:
             if len(step.created) != 1:

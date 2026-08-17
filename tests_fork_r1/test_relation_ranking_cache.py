@@ -122,6 +122,53 @@ class FakeHyperRetrieval:
         return ranked
 
 
+class FakeMergeState:
+    def __init__(self):
+        self.functions = [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.people', expression1)",
+        ]
+        self.current = 1
+
+    def get_sample_entities(self, _sample_id):
+        return [("Topic", "m.topic")]
+
+    def get_sample_function_state(self, _sample_id):
+        return list(self.functions)
+
+    def get_next_expression_id(self, _sample_id):
+        self.current += 1
+        return self.current
+
+    def update_sample_function_state(self, _sample_id, function):
+        self.functions.append(function)
+
+
+def test_merge_accepts_question_inferred_ontology_type_without_gold_candidate():
+    state = FakeMergeState()
+    processor = SExprActionProcessor(
+        FakeHyperRetrieval(),
+        state,
+        hyper_frontier_width=6,
+    )
+    action = ActionResult(
+        action_type=ActionType.MERGE,
+        arguments=["expression1", "dining.chef"],
+        raw_text="Merge [ expression1 | dining.chef ]",
+        step_number=1,
+    )
+
+    processed = processor.process_merge_action(
+        action,
+        state.get_sample_function_state(0),
+        sample_id=0,
+    )
+
+    assert processed.is_valid is True
+    assert processed.arguments == ["expression1", "expression2"]
+    assert state.functions[-1] == "expression2 = START('dining.chef')"
+
+
 def test_hyper_find_relation_uses_immutable_question_and_one_public_argument():
     retrieval = FakeHyperRetrieval()
     processor = SExprActionProcessor(

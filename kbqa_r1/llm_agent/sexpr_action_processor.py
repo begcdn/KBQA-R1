@@ -625,16 +625,9 @@ class SExprActionProcessor:
             action.is_valid = False
             action.error_message = f"Invalid Merge between two ontology types: {expr1} and {expr2}"
             return action
-        # 2) If a literal_type appears, it must exactly match one in candidate_entities
-        if (is_onto1 or is_onto2) and sample_id is not None:
-            #  
-            candidate_entities = self.state_manager.get_sample_entities(sample_id) or []
-            candidate_type_ids = {ent_id for _, ent_id in candidate_entities}
-            lit_to_check = expr1 if is_onto1 else expr2
-            if lit_to_check not in candidate_type_ids:
-                action.is_valid = False
-                action.error_message = f"Merge blocked: ontology entity '{lit_to_check}' not in candidate entities"
-                return action
+        # Ontology types are semantic-parser outputs, like the relation in
+        # Compare or Order. Requiring them in Candidate Entities leaks the gold
+        # program into training and makes the action unavailable at inference.
         
         if sample_id is not None:
             current_function_state = self.state_manager.get_sample_function_state(sample_id)

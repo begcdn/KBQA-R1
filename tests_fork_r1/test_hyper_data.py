@@ -242,7 +242,7 @@ def test_operator_program_opens_comparison_branch_and_combines_it():
     assert trajectory_sft_record(demo)["extra_info"]["replay_verified"] is True
 
 
-def test_operator_program_elides_redundant_bare_type_before_count():
+def test_operator_program_executes_explicit_type_constraint_before_count():
     row = {
         "ID": "count-with-redundant-type",
         "question": "How many exhibition subjects are connected to the curator?",
@@ -278,14 +278,18 @@ def test_operator_program_elides_redundant_bare_type_before_count():
     assert [step.action for step in demo.steps] == [
         "Find_relation",
         "Select",
+        "Merge",
+        "Select",
         "Count",
         "Commit",
     ]
-    assert builder.stats["operator_program_redundant_bare_intersection"] == 1
+    merge = next(step for step in demo.steps if step.action == "Merge")
+    assert merge.arguments == ("expression1", "exhibitions.exhibition_subject")
+    assert builder.stats["operator_program_type_constraint"] == 1
     assert DemonstrationValidator(executor).validate(demo) == []
 
 
-def test_operator_program_elides_redundant_bare_type_after_compare():
+def test_operator_program_executes_explicit_type_constraint_after_compare():
     literal = "7.0^^http://www.w3.org/2001/XMLSchema#float"
     row = {
         "ID": "compare-with-redundant-type",
@@ -308,12 +312,17 @@ def test_operator_program_elides_redundant_bare_type_after_compare():
     builder = DemonstrationBuilder(executor, lambda *_args: [])
     demo = builder.build(row)[0]
 
-    assert [step.action for step in demo.steps] == ["Compare", "Commit"]
-    assert builder.stats["operator_program_redundant_bare_intersection"] == 1
+    assert [step.action for step in demo.steps] == [
+        "Compare",
+        "Select",
+        "Merge",
+        "Commit",
+    ]
+    assert builder.stats["operator_program_type_constraint"] == 1
     assert DemonstrationValidator(executor).validate(demo) == []
 
 
-def test_operator_program_rejects_nonredundant_bare_type_intersection():
+def test_operator_program_keeps_nonredundant_bare_type_intersection():
     literal = "7.0^^http://www.w3.org/2001/XMLSchema#float"
     row = {
         "ID": "compare-with-required-type",
@@ -336,9 +345,16 @@ def test_operator_program_rejects_nonredundant_bare_type_intersection():
         return []
 
     builder = DemonstrationBuilder(executor, lambda *_args: [])
+    demo = builder.build(row)[0]
 
-    assert builder.build(row) == []
-    assert builder.stats["operator_program_nonredundant_bare_intersection"] == 1
+    assert [step.action for step in demo.steps] == [
+        "Compare",
+        "Select",
+        "Merge",
+        "Commit",
+    ]
+    assert demo.hypotheses[demo.steps[2].created[0]].denotation == ("m.force10",)
+    assert DemonstrationValidator(executor).validate(demo) == []
 
 
 def test_operator_program_applies_order_and_time_to_the_selected_branch():
@@ -726,7 +742,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
 
     demos = DemonstrationBuilder(typed_executor, candidates).build(row)
 
-    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+    assert [demo.family for demo in demos] == ["typed_program"]
     continuation_sources = [
         step.arguments[0]
         for step in demos[0].steps
@@ -734,6 +750,11 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
     ]
     assert continuation_sources
     assert set(continuation_sources) == {"expression1"}
+    assert [step.action for step in demos[0].steps][-3:] == [
+        "Select",
+        "Merge",
+        "Commit",
+    ]
 
 
 def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer():
@@ -1067,6 +1088,56 @@ def test_builder_resolves_entity_labels_and_uses_stable_nonpositional_order():
     assert "'m.topic' (m.topic)" not in rendered
 
 
+def test_builder_never_exposes_gold_types_as_candidate_entities():
+    row = {
+        "ID": "no-type-leak",
+        "question": "Which connected people are chefs?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.people', expression1)",
+            "expression2 = START('dining.chef')",
+            "expression1 = AND(expression1, expression2)",
+        ],
+        "answer": ["m.chef"],
+        "extra_info": {
+            "candidate_entities": [
+                ["Topic", "m.topic"],
+                ["Chef", "dining.chef"],
+            ]
+        },
+    }
+
+    def executor(functions, _target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.chef"]
+        if "r.people" in text:
+            return ["m.chef", "m.other"]
+        if "r.alternative" in text:
+            return ["m.other"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.people", 0.9, 1),
+            RelationOption("r.alternative", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, options).build(row)[0]
+
+    assert demo.family == "typed_program"
+    assert demo.private_metadata["candidate_entities"] == [("Topic", "m.topic")]
+    rendered = trajectory_sft_record(demo)
+    user_prompt = rendered["messages"][0]["content"]
+    assert "dining.chef" not in user_prompt.split("Question:", 1)[0]
+    assert any(
+        "Merge [ expression1 | dining.chef ]" in message["content"]
+        for message in rendered["messages"]
+        if message["role"] == "assistant"
+    )
+    assert DemonstrationValidator(executor).validate(demo) == []
+
+
 def test_failed_candidate_is_not_misrepresented_as_empty_evidence():
     row = {
         "ID": "execution-failure",
@@ -1283,15 +1354,16 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
 
     builder = DemonstrationBuilder(two_root_executor, two_root_candidates)
     demos = builder.build(row)
-    conjunctions = [demo for demo in demos if demo.family == "conjunction"]
+    typed = [demo for demo in demos if demo.family == "typed_program"]
 
-    assert len(conjunctions) == 1
-    conjunction = conjunctions[0]
-    assert conjunction.private_metadata["conjunction_roots"] == 2
+    assert len(typed) == 1
+    conjunction = typed[0]
     assert [step.action for step in conjunction.steps] == [
         "Find_relation",
         "Find_relation",
         "Combine",
+        "Select",
+        "Merge",
         "Commit",
     ]
     assert conjunction.steps[0].arguments == ("m.school_a",)

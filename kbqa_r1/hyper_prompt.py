@@ -17,6 +17,7 @@ HyPER-R1 executable hypothesis graph:
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
 - Use `Prune [ Hn ]` only for a visible path or execution contradiction. An empty result is direct negative evidence; low rank, low confidence, and a merely different nonempty answer are not contradiction certificates.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
+- Use `Merge [ expression | ontology_type ]` after Select when the question restricts a retained hypothesis to a Freebase type, such as `religion.religious_leader`. Infer the type from the question; it need not appear among Candidate Entities.
 - The existing executable logical actions remain available: `Order [ mode | expression_or_type | relation ]`, `Compare [ mode | relation | value ]`, `Time_constraint [ relation | time ]`, and `Count [ expression ]`. Select an existing hypothesis before applying a continuation operator; Compare and ontology-rooted Order may open an independent branch that can later be combined.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.

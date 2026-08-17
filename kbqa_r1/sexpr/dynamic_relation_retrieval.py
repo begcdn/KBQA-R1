@@ -231,7 +231,10 @@ WHERE {{
 }}"""
                 
                 elif entity_type == 'onto':
-                    return self._generate_ontology_query(sexpr, relation_type)
+                    # Ontology classes are logical constraints, not graph roots
+                    # whose instances should be scanned to discover relations.
+                    # They are handled by Merge at the policy layer.
+                    return None
 
                 elif entity_type in ['int', 'literal', 'url', 'name']:
                     # Complex type query using template substitution
@@ -245,22 +248,6 @@ WHERE {{
             logger.error(f"Error generating relation query: {e}")
             return None
 
-    def _generate_ontology_query(self, ontology: str, relation_type: str) -> str:
-        """Find relations adjacent to instances of a Freebase class."""
-        outer_limit = int(os.getenv('KBQA_OUTER_LIMIT', '200'))
-        if relation_type == "reverse":
-            edge = "?x ?relation ?y ."
-        else:
-            edge = "?y ?relation ?x ."
-        return f"""PREFIX ns: <http://rdf.freebase.com/ns/>
-SELECT DISTINCT ?relation
-WHERE {{
-    ?x ns:type.object.type ns:{ontology} .
-    {edge}
-    FILTER (?y != ?x)
-}}
-LIMIT {outer_limit}"""
-    
     def _generate_template_query(self, func_list: List[str], expr_id: str, relation_type: str) -> Optional[str]:
         """Generate query using template substitution for complex types"""
         try:
@@ -440,4 +427,3 @@ LIMIT {outer_limit}"""
         self.cache_enabled = enabled
         if not enabled:
             self.clear_cache()
-
