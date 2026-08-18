@@ -69,6 +69,14 @@ trajectories, that threshold is 2,636, so `structurally_ready_for_sft` is false.
 All other readiness checks pass. This threshold is a curriculum heuristic, not
 a replay-validity or inference-compatibility failure.
 
+The observed recovery funnel is 1,957 detected opportunities -> 1,737 verified
+demonstrations built (88.8%) -> 1,655 retained in the training split (95.3% of
+built, 84.6% of detected). Thus, the final split and ordinary filtering account
+for little of the low count. The unresolved question is earlier: whether 1,957
+is the natural base rate in GrailQA or an underestimate caused by the recovery
+opportunity definition, proposal visibility, budgets, or teacher construction.
+That cause must be established before oversampling or generating more examples.
+
 ## Important limitations
 
 - The teacher uses gold programs to select the correct action among naturally
@@ -97,4 +105,3 @@ a replay-validity or inference-compatibility failure.
 - `scripts/data_process/build_hyper_demonstrations.py`: corpus selection, metrics,
   and readiness gates.
 - `scripts/train/train_hyper_r1_sft.sh`: SFT entrypoint and gate enforcement.
-

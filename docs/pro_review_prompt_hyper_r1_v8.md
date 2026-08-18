@@ -9,7 +9,8 @@ Repository: `https://github.com/begcdn/KBQA-R1`
 
 Branch: `codex/hyper-r1`
 
-Review commit: `b474ad2`
+Review the current branch head. The compact analysis bundle was introduced at
+commit `c1c6cf4`.
 
 Start with:
 
@@ -55,6 +56,16 @@ check is recovery quantity:
 The 10% requirement is a hand-set curriculum heuristic. It is not evidence by
 itself that 1,655 examples are insufficient.
 
+The observed builder funnel is:
+
+- detected recovery opportunities: 1,957
+- verified recovery demonstrations built: 1,737 (88.8% of detected)
+- recovery demonstrations retained in training: 1,655 (95.3% of built)
+
+This shows that ordinary verification, deduplication, and splitting do not
+explain most of the shortfall. It does **not** show that the opportunity detector
+finds every place where recovery ought to be taught.
+
 ## Your tasks
 
 1. **Give a critical verdict:** choose exactly one of `train now`, `rebalance
@@ -70,25 +81,37 @@ itself that 1,655 examples are insufficient.
    examples genuinely teach preservation and recovery among plausible nonempty
    alternatives, or mostly teach gold-guided next-action imitation. Inspect the
    recovery samples and relevant builder logic, not only aggregate counts.
-4. **Judge the failed recovery threshold:** assess whether 1,655 high-quality
+4. **Explain why recovery is low before prescribing a fix:** reconstruct a
+   measured recovery funnel from source questions to final training examples.
+   Inspect (a) the prevalence and shapes of recoverable gold programs, (b) the
+   exact definition of a recovery opportunity, (c) proposal ranking and page
+   visibility, (d) execution and visible-failure requirements, (e) node/turn
+   budgets, (f) replay and public-source validation, and (g) deduplication,
+   balancing, and the train/validation split. Determine whether the low count is
+   mainly because GrailQA rarely requires recovery, the detector undercounts
+   plausible nonempty wrong branches, teacher construction makes recovery
+   unnecessary, or proposal/budget filters suppress otherwise useful examples.
+   Distinguish genuine no-recovery questions from missed teaching opportunities.
+5. **Judge the failed recovery threshold:** assess whether 1,655 high-quality
    recovery trajectories are likely enough for SFT, whether the 10% rule is
    justified, and whether oversampling/reweighting existing verified recovery
-   examples is safer than synthesizing more. Do not recommend changing the
-   threshold merely to make the report green.
-5. **Inspect distribution risks:** direct progress dominates; three-hop
+   examples is safer than synthesizing more. Do not recommend oversampling or
+   synthesis until task 4 identifies the cause, and do not recommend changing
+   the threshold merely to make the report green.
+6. **Inspect distribution risks:** direct progress dominates; three-hop
    acceptance is 37.36% and four-hop acceptance is 5%. Determine whether the
    current curriculum would make a model commit early, ignore Widen/Prune, or
    fail on longer exploration despite excellent replay validity.
-6. **Assess proposal quality and training implications:** relation top-1 is
+7. **Assess proposal quality and training implications:** relation top-1 is
    49.88%, first-page recall 91.62%, and within-budget recall 95.25%. Explain
    whether these numbers create useful policy-learning situations or impose a
    hard ceiling that must be fixed before SFT.
-7. **Propose the smallest sound next step:** if data transformation is enough,
+8. **Propose the smallest sound next step:** if data transformation is enough,
    specify exact family weights or sampling rules and preserve the
    question-disjoint split. If new data is needed, specify how it can be
    generated and verified without giving the student gold relations. If redesign
    is needed, identify the broken mechanism precisely.
-8. **Pre-register SFT success criteria:** specify metrics that would show the
+9. **Pre-register SFT success criteria:** specify metrics that would show the
    policy learned HyPER-R1 rather than memorized valid syntax. Include action
    validity, relation/frontier decisions, recovery from a plausible wrong
    branch, Widen use, premature Commit, conjunction completion, end-answer
@@ -101,12 +124,12 @@ Use these headings:
 1. Verdict
 2. What the corpus genuinely guarantees
 3. Critical risks or contract violations
-4. Is 1,655 recovery trajectories enough?
-5. Exact next data action
-6. SFT and evaluation plan
-7. Stop conditions
+4. Why recovery is low
+5. Is 1,655 recovery trajectories enough?
+6. Exact next data action
+7. SFT and evaluation plan
+8. Stop conditions
 
 Be decisive and implementation-aware. Distinguish proven corpus properties,
 reasonable hypotheses, and unknowns. Do not propose a broad collection of small
 experiments; recommend one coherent path toward the strongest final KGQA method.
-
