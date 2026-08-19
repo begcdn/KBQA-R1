@@ -22,9 +22,13 @@ class ActionType(Enum):
     COUNT = "Count"
     SELECT_HYPOTHESIS = "Select"
     WIDEN_FRONTIER = "Widen"
+    INSPECT_PROPOSAL = "Inspect"
+    PARK_HYPOTHESIS = "Park"
+    RECALL_HYPOTHESIS = "Recall"
     PRUNE_HYPOTHESIS = "Prune"
     COMMIT_HYPOTHESIS = "Commit"
     COMBINE_HYPOTHESES = "Combine"
+    ABSTAIN = "Abstain"
     # FINISH = "Finish"  # Removed: Not needed for kbqa-r1 training
 
 @dataclass
@@ -86,6 +90,18 @@ class ActionParser:
                 "pattern": r"(?:Action(\d+):\s*|^)Widen\s*\[\s*([^\]]+)\s*\]",
                 "description": "Expose the next ranked relation proposals for an open frontier"
             },
+            ActionType.INSPECT_PROPOSAL: {
+                "pattern": r"(?:Action(\d+):\s*|^)Inspect\s*\[\s*(P\d+)\s*\]",
+                "description": "Execute one visible symbolic relation proposal"
+            },
+            ActionType.PARK_HYPOTHESIS: {
+                "pattern": r"(?:Action(\d+):\s*|^)Park\s*\[\s*(H\d+)\s*\]",
+                "description": "Move an unresolved hypothesis out of the visible workspace"
+            },
+            ActionType.RECALL_HYPOTHESIS: {
+                "pattern": r"(?:Action(\d+):\s*|^)Recall\s*\[\s*(H\d+)\s*\]",
+                "description": "Restore a parked hypothesis to the visible workspace"
+            },
             ActionType.PRUNE_HYPOTHESIS: {
                 "pattern": r"(?:Action(\d+):\s*|^)Prune\s*\[\s*(H\d+)\s*\]",
                 "description": "Reject one active executable hypothesis"
@@ -97,6 +113,10 @@ class ActionParser:
             ActionType.COMBINE_HYPOTHESES: {
                 "pattern": r"(?:Action(\d+):\s*|^)Combine\s*\[\s*(H\d+)\s*\|\s*(H\d+)\s*\]",
                 "description": "Intersect two active executable hypotheses"
+            },
+            ActionType.ABSTAIN: {
+                "pattern": r"(?:Action(\d+):\s*|^)Abstain\s*(?:\[\s*\])?",
+                "description": "End without a certified answer when search resources are exhausted"
             },
             # ActionType.FINISH: {
             #     "pattern": r"(?:Action(\d+):\s*|^)Finish\s*\[\s*([^\]]+)\s*\]",
@@ -161,6 +181,8 @@ class ActionParser:
                         arg2 = match.group(3).strip()
                         arg3 = match.group(4).strip()
                         arguments = [arg1, arg2, arg3]
+                    elif action_type == ActionType.ABSTAIN:
+                        arguments = []
                     else:
                         # Single-argument actions
                         arg = match.group(2).strip()
@@ -221,7 +243,9 @@ class ActionParser:
             action_content = action_match.group(1)
             for line_match in re.finditer(r"[^\r\n]+", action_content):
                 line = line_match.group(0)
-                if line and '[' in line and ']' in line:
+                is_bracketed_action = '[' in line and ']' in line
+                is_abstain = re.search(r"(?:Action\d+:\s*)?Abstain\b", line, re.IGNORECASE)
+                if line and (is_bracketed_action or is_abstain):
                     action_result = self.parse_action(line)
                     if action_result:
                         if action_result.source_span is not None:

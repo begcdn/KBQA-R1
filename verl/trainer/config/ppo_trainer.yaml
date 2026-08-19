@@ -401,7 +401,7 @@ hyper_r1:
   # Enable graph-state rollouts.
   enable: false
 
-  # Uniform executed-hypothesis budget; plausible alternatives are retained.
+  # Number of executable hypotheses visible to the policy at once.
   max_active: 24
 
   # Relations per stable page. Widen repeatedly exposes later pages.
@@ -410,8 +410,11 @@ hyper_r1:
   # Explicit ranker shared by demonstration building and runtime retrieval.
   relation_model: null
 
-  # Hard cap on exact executions per question.
-  max_nodes: 24
+  # Persistent executed-hypothesis storage; Park does not recover this budget.
+  max_nodes: 128
+
+  # Graph-query attempts, including proposals that fail to execute.
+  max_execution_attempts: 24
 
 # ODBC configuration for Virtuoso knowledge base connection
 odbc_config:

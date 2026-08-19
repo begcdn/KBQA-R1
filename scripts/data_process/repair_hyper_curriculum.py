@@ -20,6 +20,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationStep,
     ExecutedHypothesis,
     HyperDemonstration,
+    RelationProposal,
     step_sft_records,
     trajectory_sft_record,
 )
@@ -85,9 +86,25 @@ def _load_demo(payload):
             visible_before=tuple(step.get("visible_before", ())),
             created=tuple(step.get("created", ())),
             rationale_facts=tuple(step.get("rationale_facts", ())),
+            relation_page=tuple(step.get("relation_page", ())),
+            supervision=step.get("supervision", "policy_target"),
+            certificate_kind=step.get("certificate_kind"),
+            certificate_evidence=tuple(step.get("certificate_evidence", ())),
+            exposed=tuple(step.get("exposed", ())),
         )
         for step in payload["steps"]
     ]
+    proposals = {
+        proposal_id: RelationProposal(
+            proposal_id=str(proposal["proposal_id"]),
+            frontier_id=str(proposal["frontier_id"]),
+            source=str(proposal["source"]),
+            relation=str(proposal["relation"]),
+            score=float(proposal["score"]),
+            rank=int(proposal["rank"]),
+        )
+        for proposal_id, proposal in dict(payload.get("proposals") or {}).items()
+    }
     return HyperDemonstration(
         demo_id=payload["demo_id"],
         question_id=str(payload["question_id"]),
@@ -97,6 +114,7 @@ def _load_demo(payload):
         steps=steps,
         gold_answers=tuple(payload.get("gold_answers", ())),
         private_metadata=dict(payload.get("private_metadata", {})),
+        proposals=proposals,
     )
 
 

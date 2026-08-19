@@ -3,11 +3,12 @@ Enhanced LLM Generation Manager with S-Expression support
 Replaces SPARQL-based generation with action-based reasoning and S-Expression execution
 """
 
+import json
 import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               result_denotation_values,
                               result_display_labels,
                               required_hyper_relation_model)
+from kbqa_r1.hyper_prompt import extract_hyper_question
 from kbqa_r1.relation_paging import (
     relation_page,
     serialize_relation_page_state,
@@ -54,6 +56,33 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))  # Default to INFO for S-Expression logs
 
 
+def _metadata_mapping(value: Any) -> Mapping[str, Any]:
+    """Decode one object-valued dataset field without guessing its schema."""
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, Mapping) else {}
+    return {}
+
+
+def _metadata_sequence(value: Any) -> Tuple[str, ...]:
+    """Normalize a serialized function list while rejecting scalar strings."""
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
+
+
 class SExprLLMGenerationManager:
     """
     Enhanced LLM Generation Manager with S-Expression support
@@ -82,22 +111,27 @@ class SExprLLMGenerationManager:
         self.hyper_relation_model = required_hyper_relation_model(config)
         self.hyper_graph = HypothesisGraph(
             max_active=int(getattr(config, "hyper_r1_max_active", 24)),
-            max_nodes=int(getattr(config, "hyper_r1_max_nodes", 24)),
+            max_nodes=int(getattr(config, "hyper_r1_max_nodes", 128)),
+            max_execution_attempts=int(
+                getattr(config, "hyper_r1_max_execution_attempts", 24)
+            ),
         )
         self.hyper_frontier_width = int(
             getattr(config, "hyper_r1_frontier_width", 6)
         )
         if self.hyper_frontier_width < 2:
             raise ValueError("HyPER-R1 frontier width must be at least two")
-        if self.hyper_frontier_width > self.hyper_graph.max_active:
-            raise ValueError("HyPER-R1 frontier width cannot exceed max_active")
         self._hyper_action_records: Dict[int, List[dict]] = {}
         self._hyper_frontiers: Dict[int, List[dict]] = {}
+        self._hyper_next_proposal_index: Dict[int, int] = {}
         self._hyper_turn_actions: Dict[Tuple[int, int], List[ActionResult]] = {}
         self._hyper_turn_invalid_spans: Dict[
             Tuple[int, int], List[Tuple[int, int]]
         ] = {}
         self._hyper_valid_answer_turns: Dict[int, int] = {}
+        self._hyper_protocol_valid_answer_turns: Dict[int, int] = {}
+        self._hyper_gold_contracts: Dict[int, dict] = {}
+        self._hyper_commit_certificates: Dict[int, dict] = {}
         self._hyper_premature_answers: set[int] = set()
 
         self.tensor_fn = TensorHelper(TensorConfig(
@@ -216,6 +250,115 @@ class SExprLLMGenerationManager:
             status_update_interval=5  # 每5秒更新状态
         )
 
+    def _load_hyper_gold_contracts(self, gen_batch, batch_size: int) -> None:
+        """Load private training contracts used only to score terminal Commit.
+
+        These values are never serialized into model observations.  When a
+        reward-model field is present, every HyPER rollout must carry a valid
+        gold function list; silently falling back to answer-only reward would
+        recreate the spurious-program supervision this method is designed to
+        avoid.
+        """
+        self._hyper_gold_contracts.clear()
+        reward_rows = gen_batch.non_tensor_batch.get("reward_model")
+        if reward_rows is None:
+            return
+        extra_rows = gen_batch.non_tensor_batch.get("extra_info")
+        if len(reward_rows) != batch_size:
+            raise RuntimeError(
+                "HyPER-R1 reward metadata does not align with the rollout batch"
+            )
+
+        from kbqa_r1.hyper_data import (
+            compile_gold_plan,
+            normalize_gold_answers,
+        )
+
+        for sample_id in range(batch_size):
+            reward = _metadata_mapping(reward_rows[sample_id])
+            ground_truth = _metadata_mapping(reward.get("ground_truth", {}))
+            extra = (
+                _metadata_mapping(extra_rows[sample_id])
+                if extra_rows is not None and sample_id < len(extra_rows)
+                else {}
+            )
+            functions = _metadata_sequence(ground_truth.get("function_list"))
+            if not functions:
+                functions = _metadata_sequence(extra.get("function_list"))
+            if not functions:
+                raise RuntimeError(
+                    "HyPER-R1 requires a gold function_list for every rewarded "
+                    f"rollout; sample {sample_id} has none"
+                )
+            plan = compile_gold_plan(functions)
+            gold_answers = ()
+            for raw_answers in (
+                ground_truth.get("target"),
+                ground_truth.get("answer"),
+                extra.get("answer"),
+            ):
+                if raw_answers is None:
+                    continue
+                if isinstance(raw_answers, (str, bytes)) or not hasattr(
+                    raw_answers, "__iter__"
+                ):
+                    raw_answers = [raw_answers]
+                gold_answers = normalize_gold_answers(raw_answers)
+                if gold_answers:
+                    break
+            if not gold_answers:
+                raise RuntimeError(
+                    "HyPER-R1 requires normalized gold answers for every rewarded "
+                    f"rollout; sample {sample_id} has none"
+                )
+            self._hyper_gold_contracts[sample_id] = {
+                "function_list": plan.executable_functions,
+                "target_expression": plan.target_expression,
+                "answers": gold_answers,
+            }
+
+    def _load_hyper_public_contracts(self, batch_size: int) -> None:
+        """Derive live operator obligations from the same prompts the policy sees."""
+        for sample_id in range(batch_size):
+            prompt = self.state_manager.get_sample_prompt(sample_id)
+            try:
+                question = extract_hyper_question(prompt)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "HyPER-R1 requires a public Question field for transition validation; "
+                    f"sample {sample_id} has none"
+                ) from exc
+            self.hyper_graph.register_public_question(sample_id, question)
+
+    def _certify_hyper_commit(self, sample_id: int) -> dict:
+        """Privately certify one committed program against its gold query."""
+        contract = self._hyper_gold_contracts.get(sample_id)
+        node = self.hyper_graph.committed_node(sample_id)
+        if contract is None or node is None:
+            return {
+                "gold_contract_available": contract is not None,
+                "answer_exact": False,
+                "intent_equivalent": False,
+                "valid": False,
+            }
+
+        from kbqa_r1.hyper_data import certify_program_commit
+
+        certificate = certify_program_commit(
+            node.function_state,
+            node.target_expression,
+            node.denotation,
+            contract["function_list"],
+            contract["target_expression"],
+            contract["answers"],
+        )
+        return {
+            "gold_contract_available": True,
+            "answer_exact": certificate.answer_exact,
+            "intent_equivalent": certificate.intent_equivalent,
+            "valid": certificate.valid,
+        }
+
     def _get_independent_gpu_manager(self):
         """
         获取独立的GPU维护管理器（绕过Ray的GPU环境限制）
@@ -281,16 +424,14 @@ class SExprLLMGenerationManager:
     ) -> str:
         if not self.hyper_r1_enable:
             return response
-        # The released executor observation describes only its chosen top-1
-        # relation. HyPER-R1 replaces it with the complete sibling frontier so
-        # the observation itself cannot reintroduce an implicit commitment.
+        if opens_frontier:
+            raise RuntimeError(
+                "HyPER-R1 relation catalogs are symbolic; Find_relation must not "
+                "reach the executable action path"
+            )
         return self._hyper_info(
             sample_id,
-            (
-                "Executed the requested relation frontier."
-                if opens_frontier
-                else "Executed the selected hypothesis operation."
-            ),
+            "Executed the selected hypothesis operation.",
             is_final_turn=False,
         )
 
@@ -330,25 +471,56 @@ class SExprLLMGenerationManager:
             return self.result_processor._add_guidance_prompt(content, is_final_turn)
 
     def _open_relation_page_state(self, sample_id: int) -> str:
-        """Expose page cursors without revealing unseen relation labels."""
-        active_ids = {
-            node.node_id for node in self.hyper_graph.active_nodes(sample_id)
-        }
+        """Serialize only exposed symbolic proposals; execution remains lazy."""
         states = []
         for frontier in self._hyper_frontiers.get(sample_id, ()):
-            if not active_ids.intersection(frontier["node_ids"]):
+            if frontier.get("closed"):
                 continue
             total = len(frontier["decision"].ranked_relations)
             exposed = min(int(frontier["next_offset"]), total)
-            states.append(
-                serialize_relation_page_state(
-                    str(frontier["source"]),
-                    exposed=exposed,
-                    total=total,
-                    page_size=self.hyper_frontier_width,
+            lines = [
+                "<proposal_catalog>",
+                f"source={frontier['source']} exposed={exposed}/{total} "
+                f"page_size={self.hyper_frontier_width}",
+            ]
+            for proposal_id, proposal in frontier.get("proposals", {}).items():
+                if proposal["status"] not in {"visible", "failed"}:
+                    continue
+                candidate = proposal["candidate"]
+                lines.append(
+                    f"{proposal_id} rank={proposal['rank']} relation={candidate.relation} "
+                    f"score={float(candidate.score):.4f} status={proposal['status']}"
                 )
+            lines.append(
+                "Use Inspect [ Pn ] to execute one visible proposal; Widen only reveals the next page."
             )
+            lines.append("</proposal_catalog>")
+            states.append("\n".join(lines))
         return "\n".join(states)
+
+    def _expose_hyper_proposal_page(self, sample_id: int, frontier: dict):
+        ranked = frontier["decision"].frontier(
+            len(frontier["decision"].ranked_relations)
+        )
+        page = relation_page(
+            ranked,
+            offset=int(frontier["next_offset"]),
+            page_size=self.hyper_frontier_width,
+        )
+        exposed = []
+        next_index = self._hyper_next_proposal_index.get(sample_id, 0)
+        for offset, candidate in enumerate(page.items, start=page.start + 1):
+            proposal_id = f"P{next_index}"
+            next_index += 1
+            frontier.setdefault("proposals", {})[proposal_id] = {
+                "candidate": candidate,
+                "rank": offset,
+                "status": "visible",
+            }
+            exposed.append(proposal_id)
+        self._hyper_next_proposal_index[sample_id] = next_index
+        frontier["next_offset"] = page.stop
+        return page, tuple(exposed)
 
     def _record_hyper_action(
         self,
@@ -379,12 +551,9 @@ class SExprLLMGenerationManager:
         )
 
     def _open_widen_signature(self, sample_id: int) -> Tuple[Tuple[object, ...], ...]:
-        active_ids = {
-            node.node_id for node in self.hyper_graph.active_nodes(sample_id)
-        }
         signatures = []
         for frontier in self._hyper_frontiers.get(sample_id, ()):
-            if not active_ids.intersection(frontier["node_ids"]):
+            if frontier.get("closed"):
                 continue
             start = int(frontier["next_offset"])
             ranked = frontier["decision"].frontier(
@@ -611,6 +780,88 @@ class SExprLLMGenerationManager:
             provenance=[provenance],
         )
 
+    def _open_hyper_relation_catalog(
+        self, action, sample_id: int, turn: int, is_final_turn: bool
+    ) -> str:
+        """Rank a complete local catalog and expose one symbolic page."""
+        source = str(action.arguments[0])
+        graph_state = self.hyper_graph.state(sample_id)
+        parent_id = graph_state.selected_id
+        active_before = len(self.hyper_graph.active_nodes(sample_id))
+        selected_before = parent_id or ""
+        state_key = self._decision_state_key(sample_id, turn)
+        action.action_index = 0
+        before = len(self.action_processor.get_fork_r1_decisions(sample_id))
+        processed = self.action_processor.process_find_relation_action(
+            action,
+            list(self.state_manager.get_sample_function_state(sample_id)),
+            sample_id,
+        )
+        if not processed.is_valid:
+            return self._hyper_info(
+                sample_id,
+                f"Relation catalog failed: {processed.error_message}",
+                is_final_turn,
+            )
+        decisions = self.action_processor.get_fork_r1_decisions(sample_id)
+        if len(decisions) <= before:
+            return self._hyper_info(
+                sample_id,
+                "Relation catalog could not be constructed.",
+                is_final_turn,
+            )
+        decision = decisions[-1]
+        frontier = {
+            "source": source,
+            "decision": decision,
+            "parent_id": parent_id,
+            "contrast_group": (
+                f"turn{turn}:catalog{len(self._hyper_frontiers.get(sample_id, ())) }"
+                f":parent{parent_id or 'root'}"
+            ),
+            "proposals": {},
+            "next_offset": 0,
+            "closed": False,
+        }
+        page, proposal_ids = self._expose_hyper_proposal_page(sample_id, frontier)
+        if not proposal_ids:
+            return self._hyper_info(
+                sample_id, "Relation catalog is empty.", is_final_turn
+            )
+        self._hyper_frontiers.setdefault(sample_id, []).append(frontier)
+        self.hyper_graph.clear_selection(sample_id)
+        action_key = self.hyper_graph.action_key(
+            sample_id,
+            action.action_type.value,
+            (parent_id,) if parent_id else (),
+            details=(
+                f"source:{source}",
+                *(frontier["proposals"][pid]["candidate"].relation for pid in proposal_ids),
+            ),
+        )
+        self._record_hyper_action(
+            sample_id,
+            action,
+            turn,
+            state_key=state_key,
+            action_key=action_key,
+            active_before=active_before,
+            selected_before=selected_before,
+        )
+        return self._hyper_info(
+            sample_id,
+            f"Opened a symbolic relation catalog from {source}; exposed proposals "
+            f"{page.start + 1}-{page.stop} of {page.total}. No graph query was executed.",
+            is_final_turn,
+        )
+
+    def _hyper_proposal(self, sample_id: int, proposal_id: str):
+        for frontier in reversed(self._hyper_frontiers.get(sample_id, ())):
+            proposal = frontier.get("proposals", {}).get(proposal_id)
+            if proposal is not None:
+                return frontier, proposal
+        raise KeyError(f"unknown or unexposed proposal: {proposal_id}")
+
     def _process_hyper_control(self, action, sample_id: int, turn: int) -> str:
         from ..sexpr.action_parser import ActionType
 
@@ -619,6 +870,8 @@ class SExprLLMGenerationManager:
             graph_state = self.hyper_graph.state(sample_id)
             if graph_state.committed_id is not None:
                 raise ValueError("the hypothesis graph is already committed; return its answer")
+            if graph_state.abstained:
+                raise ValueError("the hypothesis graph is closed after Abstain")
             state_key = self._decision_state_key(sample_id, turn)
             active_before = len(self.hyper_graph.active_nodes(sample_id))
             selected_before = graph_state.selected_id or ""
@@ -629,63 +882,27 @@ class SExprLLMGenerationManager:
                 if graph_state.selected_id is not None:
                     raise ValueError("Widen before Select so the original frontier remains current")
                 source = str(action.arguments[0])
-                active_ids = {
-                    node.node_id for node in self.hyper_graph.active_nodes(sample_id)
-                }
                 frontier = next(
                     (
                         item
                         for item in reversed(self._hyper_frontiers.get(sample_id, ()))
                         if item["source"] == source
                         and item["next_offset"] < len(item["decision"].ranked_relations)
-                        and active_ids.intersection(item["node_ids"])
+                        and not item.get("closed")
                     ),
                     None,
                 )
                 if frontier is None:
                     raise ValueError(f"no open frontier from {source} has further ranked proposals")
-                ranked = frontier["decision"].frontier(
-                    len(frontier["decision"].ranked_relations)
+                page, proposal_ids = self._expose_hyper_proposal_page(
+                    sample_id, frontier
                 )
-                page = relation_page(
-                    ranked,
-                    offset=frontier["next_offset"],
-                    page_size=self.hyper_frontier_width,
-                )
-                batch = page.items
-                if not batch:
+                if not proposal_ids:
                     raise ValueError(f"frontier from {source} is already fully exposed")
-                if self.hyper_graph.available_active_slots(sample_id) < len(batch):
-                    raise ValueError(
-                        f"Widen needs {len(batch)} slots but the uniform node budget is exhausted"
-                    )
-                if not self.hyper_graph.has_capacity(sample_id, len(batch)):
-                    raise ValueError("the executed-node budget cannot hold the widened frontier")
-                created = []
-                exposed_relations = []
-                for candidate in batch:
-                    exposed_relations.append(candidate.relation)
-                    try:
-                        node = self._execute_hyper_candidate(
-                            sample_id,
-                            frontier["decision"],
-                            candidate,
-                            parent_id=frontier["parent_id"],
-                            contrast_group=frontier["contrast_group"],
-                            provenance="widened_alternative",
-                        )
-                    except (KeyError, ValueError, RuntimeError):
-                        logger.exception(
-                            "[HyPER-R1] Failed to execute widened relation %s for sample %s",
-                            candidate.relation,
-                            sample_id,
-                        )
-                        node = None
-                    if node is not None:
-                        effective_id = node.equivalent_to or node.node_id
-                        created.append(effective_id)
-                        frontier["node_ids"].append(effective_id)
-                frontier["next_offset"] = page.stop
+                exposed_relations = [
+                    frontier["proposals"][pid]["candidate"].relation
+                    for pid in proposal_ids
+                ]
                 action_key = self.hyper_graph.action_key(
                     sample_id,
                     action.action_type.value,
@@ -698,16 +915,73 @@ class SExprLLMGenerationManager:
                     turn,
                     state_key=state_key,
                     action_key=action_key,
-                    node_id=created[-1] if created else "",
                     active_before=active_before,
                     selected_before=selected_before,
                 )
                 return self._hyper_info(
                     sample_id,
                     (
-                        f"Widened the frontier from {source} with {len(created)} "
-                        f"additional executable hypotheses (relations "
-                        f"{page.start + 1}-{page.stop} of {page.total})."
+                        f"Widened the symbolic catalog from {source}; exposed "
+                        f"proposals {page.start + 1}-{page.stop} of {page.total}. "
+                        "No graph query was executed."
+                    ),
+                    is_final_turn,
+                )
+            if action.action_type == ActionType.INSPECT_PROPOSAL:
+                proposal_id = str(action.arguments[0])
+                frontier, proposal = self._hyper_proposal(sample_id, proposal_id)
+                if proposal["status"] != "visible":
+                    raise ValueError(
+                        f"proposal {proposal_id} is {proposal['status']}, not inspectable"
+                    )
+                if self.hyper_graph.available_active_slots(sample_id) <= 0:
+                    raise RuntimeError(
+                        "the visible hypothesis workspace is full; Park an unresolved hypothesis first"
+                    )
+                if not self.hyper_graph.has_capacity(sample_id):
+                    raise RuntimeError("the persistent hypothesis store is full")
+                if not self.hyper_graph.has_execution_budget(sample_id):
+                    raise RuntimeError(
+                        "the execution budget is exhausted; use Abstain unless a complete hypothesis is already justified"
+                    )
+                candidate = proposal["candidate"]
+                try:
+                    node = self._execute_hyper_candidate(
+                        sample_id,
+                        frontier["decision"],
+                        candidate,
+                        parent_id=frontier["parent_id"],
+                        contrast_group=frontier["contrast_group"],
+                        provenance=f"inspected_proposal:{proposal_id}",
+                    )
+                except Exception:
+                    proposal["status"] = "failed"
+                    raise
+                proposal["status"] = "inspected"
+                effective_id = node.equivalent_to or node.node_id if node else ""
+                action_key = self.hyper_graph.action_key(
+                    sample_id,
+                    action.action_type.value,
+                    (effective_id,) if effective_id else (),
+                    details=(proposal_id, candidate.relation),
+                )
+                self._record_hyper_action(
+                    sample_id,
+                    action,
+                    turn,
+                    state_key=state_key,
+                    action_key=action_key,
+                    node_id=effective_id,
+                    active_before=active_before,
+                    selected_before=selected_before,
+                )
+                return self._hyper_info(
+                    sample_id,
+                    (
+                        f"Inspected {proposal_id} ({candidate.relation}) and created "
+                        f"{effective_id}."
+                        if effective_id
+                        else f"Inspection of {proposal_id} produced no executable hypothesis."
                     ),
                     is_final_turn,
                 )
@@ -736,6 +1010,42 @@ class SExprLLMGenerationManager:
                 return self._hyper_info(
                     sample_id,
                     f"Selected {node.node_id}. Further Find_relation actions now expand this hypothesis.",
+                    is_final_turn,
+                )
+
+            if action.action_type == ActionType.PARK_HYPOTHESIS:
+                node = self.hyper_graph.park(sample_id, action.arguments[0])
+                self._record_hyper_action(
+                    sample_id,
+                    action,
+                    turn,
+                    state_key=state_key,
+                    action_key=action_key,
+                    node_id=node.node_id,
+                    active_before=active_before,
+                    selected_before=selected_before,
+                )
+                return self._hyper_info(
+                    sample_id,
+                    f"Parked {node.node_id} without making a semantic judgment.",
+                    is_final_turn,
+                )
+
+            if action.action_type == ActionType.RECALL_HYPOTHESIS:
+                node = self.hyper_graph.recall(sample_id, action.arguments[0])
+                self._record_hyper_action(
+                    sample_id,
+                    action,
+                    turn,
+                    state_key=state_key,
+                    action_key=action_key,
+                    node_id=node.node_id,
+                    active_before=active_before,
+                    selected_before=selected_before,
+                )
+                return self._hyper_info(
+                    sample_id,
+                    f"Recalled {node.node_id} to the visible workspace.",
                     is_final_turn,
                 )
 
@@ -770,6 +1080,23 @@ class SExprLLMGenerationManager:
                 return self._hyper_info(
                     sample_id,
                     f"Committed {node.node_id}. Return exactly these values in <answer>: {values}",
+                    is_final_turn,
+                )
+
+            if action.action_type == ActionType.ABSTAIN:
+                self.hyper_graph.abstain(sample_id)
+                self._record_hyper_action(
+                    sample_id,
+                    action,
+                    turn,
+                    state_key=state_key,
+                    action_key=action_key,
+                    active_before=active_before,
+                    selected_before=selected_before,
+                )
+                return self._hyper_info(
+                    sample_id,
+                    "Abstained without claiming that an unresolved hypothesis is complete.",
                     is_final_turn,
                 )
 
@@ -847,7 +1174,7 @@ class SExprLLMGenerationManager:
         execution_result,
         mid_list: List[str],
     ) -> None:
-        """Replace the selected leaf with a bounded executable relation frontier."""
+        """Register one executed non-catalog operation in the hypothesis graph."""
         if not self.hyper_r1_enable:
             return
         from ..sexpr.action_parser import ActionType
@@ -865,29 +1192,15 @@ class SExprLLMGenerationManager:
         if graph_state.committed_id is not None:
             raise ValueError("cannot execute after Commit")
         parent_id = graph_state.selected_id
-        decisions = self.action_processor.get_fork_r1_decisions(sample_id)
-        decision = decisions[-1] if decisions else None
         has_relation = any(
             action.action_type == ActionType.FIND_RELATION for action in processed_actions
         )
-        if decision is not None and decision.turn != self.action_processor._fork_r1_current_turn:
-            decision = None
-        operation = (
-            "expand"
-            if has_relation
-            else processed_actions[-1].action_type.value.lower()
-        )
-        contrast_group = None
-        relation_id = None
-        relation_prompt = None
-        score = 0.0
-        if has_relation and decision is not None:
-            contrast_group = (
-                f"turn{decision.turn}:action{decision.action_index}:parent{parent_id or 'root'}"
+        if has_relation:
+            raise RuntimeError(
+                "HyPER-R1 Find_relation/Widen expose proposals only; Inspect is "
+                "the sole relation-execution action"
             )
-            relation_id = decision.chosen_relation
-            relation_prompt = decision.relation_prompt
-            score = max(0.0, min(1.0, 0.5 + decision.resolver_margin / 2.0))
+        operation = processed_actions[-1].action_type.value.lower()
 
         # Exploring a leaf replaces it in the active frontier. Its historical
         # node remains in the graph for provenance and credit assignment.
@@ -898,21 +1211,6 @@ class SExprLLMGenerationManager:
         selected_before = graph_state.selected_id or ""
         node_ids = [parent_id] if parent_id is not None else []
         action_details = processed_actions[-1].arguments
-        if has_relation and decision is not None:
-            # Credit the graph decision that actually reached the executor.
-            # Different surface prompts that open the same ranked frontier are
-            # the same action; genuinely different frontiers remain distinct.
-            action_details = (
-                f"source:{decision.entity_argument}",
-                *tuple(
-                    sorted(
-                        {
-                            candidate.relation
-                            for candidate in decision.frontier(self.hyper_frontier_width)
-                        }
-                    )
-                ),
-            )
         action_key = self.hyper_graph.action_key(
             sample_id,
             processed_actions[-1].action_type.value,
@@ -930,10 +1228,10 @@ class SExprLLMGenerationManager:
             denotation_labels=result_display_labels(execution_result.results),
             parent_id=parent_id,
             operation=operation,
-            relation_id=relation_id,
-            relation_prompt=relation_prompt,
-            resolver_score=score,
-            contrast_group=contrast_group,
+            relation_id=None,
+            relation_prompt=None,
+            resolver_score=0.0,
+            contrast_group=None,
             provenance=["policy_choice"],
         )
         for processed_action in processed_actions:
@@ -948,50 +1246,7 @@ class SExprLLMGenerationManager:
                 selected_before=selected_before,
             )
 
-        if not has_relation or decision is None:
-            return
-        frontier = decision.frontier(self.hyper_frontier_width)
-        opened_node_ids = [factual.equivalent_to or factual.node_id]
-        for candidate in frontier:
-            if candidate.relation == decision.chosen_relation:
-                continue
-            if not self.hyper_graph.has_capacity(sample_id):
-                break
-            if self.hyper_graph.available_active_slots(sample_id) <= 0:
-                logger.info(
-                    "[HyPER-R1] Active frontier full for sample %s; policy must prune before broadening",
-                    sample_id,
-                )
-                break
-            try:
-                node = self._execute_hyper_candidate(
-                    sample_id,
-                    decision,
-                    candidate,
-                    parent_id=parent_id,
-                    contrast_group=contrast_group,
-                    provenance="ranked_alternative",
-                )
-                if node is not None:
-                    opened_node_ids.append(node.equivalent_to or node.node_id)
-            except (KeyError, ValueError, RuntimeError):
-                logger.exception(
-                    "[HyPER-R1] Failed to execute frontier relation %s for sample %s",
-                    candidate.relation,
-                    sample_id,
-                )
-        self._hyper_frontiers.setdefault(sample_id, []).append(
-            {
-                "source": str(decision.entity_argument),
-                "decision": decision,
-                "parent_id": parent_id,
-                "contrast_group": contrast_group,
-                "node_ids": opened_node_ids,
-                "next_offset": len(frontier),
-            }
-        )
-        # Opening a frontier does not select its top-1 member. The next
-        # expansion must be preceded by an explicit policy Select action.
+        return
 
     def _attach_hyper_training_fields(self, output: DataProto, batch_size: int) -> DataProto:
         """Build token-local masks for all deliberate graph-control actions.
@@ -1020,6 +1275,21 @@ class SExprLLMGenerationManager:
             )
         execution_counts = torch.zeros(batch_size, dtype=torch.float32, device=responses.device)
         commit_valid = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
+        commit_protocol_valid = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        commit_answer_exact = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        commit_intent_equivalent = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        gold_contract_available = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        abstained = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
         premature_answer = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
         action_records = []
         graph_records = []
@@ -1028,6 +1298,20 @@ class SExprLLMGenerationManager:
             graph_records.append(self.hyper_graph.to_dict(sample_id))
             execution_counts[sample_id] = float(graph.execution_attempts)
             commit_valid[sample_id] = sample_id in self._hyper_valid_answer_turns
+            commit_protocol_valid[sample_id] = (
+                sample_id in self._hyper_protocol_valid_answer_turns
+            )
+            certificate = self._hyper_commit_certificates.get(sample_id, {})
+            commit_answer_exact[sample_id] = bool(
+                certificate.get("answer_exact", False)
+            )
+            commit_intent_equivalent[sample_id] = bool(
+                certificate.get("intent_equivalent", False)
+            )
+            gold_contract_available[sample_id] = (
+                sample_id in self._hyper_gold_contracts
+            )
+            abstained[sample_id] = bool(graph.abstained)
             premature_answer[sample_id] = sample_id in self._hyper_premature_answers
             records = list(self._hyper_action_records.get(sample_id, []))
             action_records.append(records)
@@ -1046,6 +1330,11 @@ class SExprLLMGenerationManager:
         output.batch["hyper_r1_invalid_action_mask"] = invalid_action_mask
         output.batch["hyper_r1_execution_counts"] = execution_counts
         output.batch["hyper_r1_commit_valid"] = commit_valid
+        output.batch["hyper_r1_commit_protocol_valid"] = commit_protocol_valid
+        output.batch["hyper_r1_commit_answer_exact"] = commit_answer_exact
+        output.batch["hyper_r1_commit_intent_equivalent"] = commit_intent_equivalent
+        output.batch["hyper_r1_gold_contract_available"] = gold_contract_available
+        output.batch["hyper_r1_abstained"] = abstained
         output.batch["hyper_r1_premature_answer"] = premature_answer
         output.non_tensor_batch["hyper_r1_action_records"] = np.array(
             action_records, dtype=object
@@ -1222,7 +1511,17 @@ class SExprLLMGenerationManager:
                             False,
                             False,
                         )
-                    self._hyper_valid_answer_turns[i] = int(turn)
+                    self._hyper_protocol_valid_answer_turns[i] = int(turn)
+                    certificate = self._certify_hyper_commit(i)
+                    self._hyper_commit_certificates[i] = certificate
+                    # Private gold is a reward-side verifier, never an
+                    # observation. A semantically spurious Commit therefore
+                    # terminates normally but cannot earn task reward.
+                    if (
+                        not certificate["gold_contract_available"]
+                        or certificate["valid"]
+                    ):
+                        self._hyper_valid_answer_turns[i] = int(turn)
                 logger.info(f"[SEXPR] Sample {i}: Completed (found answer)")
                 logger.info(f"[SEXPR] Sample {i}: prediction: {pred}")
                 # Clear the linear executor state. The hypothesis graph remains
@@ -1239,6 +1538,8 @@ class SExprLLMGenerationManager:
                     observation = self._process_sexpr_prediction(pred, i, turn=turn)
                     observation = SExprUtils.ensure_leading_newline_info(observation)
                     local_next_obs = observation
+                    if self.hyper_r1_enable and self.hyper_graph.state(i).abstained:
+                        local_done = True
                     
                     # Check if the observation contains timeout error
                     if self._is_timeout_error(observation):
@@ -1333,9 +1634,13 @@ class SExprLLMGenerationManager:
             graph_action_types = {
                 ActionType.SELECT_HYPOTHESIS,
                 ActionType.WIDEN_FRONTIER,
+                ActionType.INSPECT_PROPOSAL,
+                ActionType.PARK_HYPOTHESIS,
+                ActionType.RECALL_HYPOTHESIS,
                 ActionType.PRUNE_HYPOTHESIS,
                 ActionType.COMMIT_HYPOTHESIS,
                 ActionType.COMBINE_HYPOTHESES,
+                ActionType.ABSTAIN,
             }
             graph_state = self.hyper_graph.state(index)
             if len(actions) != 1:
@@ -1349,7 +1654,7 @@ class SExprLLMGenerationManager:
                 if len(actions) != 1:
                     return self._hyper_info(
                         index,
-                        "Use exactly one Select, Widen, Prune, Combine, or Commit action per turn.",
+                        "Use exactly one HyPER graph action per turn.",
                         is_final_turn,
                     )
                 return self._process_hyper_control(graph_actions[0], index, turn)
@@ -1378,6 +1683,7 @@ class SExprLLMGenerationManager:
                 index,
                 opens_frontier=bool(relation_actions),
                 frontier_width=self.hyper_frontier_width,
+                operation=actions[0].action_type.value,
                 opens_new_root=bool(
                     relation_actions
                     and graph_state.selected_id is None
@@ -1403,6 +1709,9 @@ class SExprLLMGenerationManager:
                 )
                 if source_error:
                     return self._hyper_info(index, source_error, is_final_turn)
+                return self._open_hyper_relation_catalog(
+                    relation_actions[0], index, turn, is_final_turn
+                )
         
         # Update action attempts for special actions present in this prediction
         present_special = set()
@@ -1939,12 +2248,18 @@ class SExprLLMGenerationManager:
                 self.hyper_graph.clear()
                 self._hyper_action_records.clear()
                 self._hyper_frontiers.clear()
+                self._hyper_next_proposal_index.clear()
                 self._hyper_turn_actions.clear()
                 self._hyper_turn_invalid_spans.clear()
                 self._hyper_valid_answer_turns.clear()
+                self._hyper_protocol_valid_answer_turns.clear()
+                self._hyper_commit_certificates.clear()
                 self._hyper_premature_answers.clear()
+                self._load_hyper_gold_contracts(gen_batch, batch_size)
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
+            if self.hyper_r1_enable:
+                self._load_hyper_public_contracts(batch_size)
 
         
         # Enhanced logging for testing (controlled frequency)

@@ -15,21 +15,31 @@ def test_hyper_graph_actions_parse():
     text = """<action>
 Action1: Select [ H2 ]
 Action2: Widen [ expression2 ]
-Action3: Prune [ H3 ]
-Action4: Combine [ H2 | H4 ]
-Action5: Commit [ H5 ]
+Action3: Inspect [ P7 ]
+Action4: Park [ H3 ]
+Action5: Recall [ H3 ]
+Action6: Prune [ H3 ]
+Action7: Combine [ H2 | H4 ]
+Action8: Commit [ H5 ]
+Action9: Abstain
 </action>"""
 
     actions = parser.parse_actions_from_text(text)
     assert [action.action_type for action in actions] == [
         ActionType.SELECT_HYPOTHESIS,
         ActionType.WIDEN_FRONTIER,
+        ActionType.INSPECT_PROPOSAL,
+        ActionType.PARK_HYPOTHESIS,
+        ActionType.RECALL_HYPOTHESIS,
         ActionType.PRUNE_HYPOTHESIS,
         ActionType.COMBINE_HYPOTHESES,
         ActionType.COMMIT_HYPOTHESIS,
+        ActionType.ABSTAIN,
     ]
     assert actions[1].arguments == ["expression2"]
-    assert actions[3].arguments == ["H2", "H4"]
+    assert actions[2].arguments == ["P7"]
+    assert actions[6].arguments == ["H2", "H4"]
+    assert actions[-1].arguments == []
 
 
 def test_find_relation_supports_hyper_source_only_and_legacy_intent():

@@ -1475,6 +1475,7 @@ class SExprActionProcessor:
                         entities=state_snapshot["entities"],
                         prompt=state_snapshot["prompt"],
                         raw_action=str(getattr(action, "raw_text", "") or ""),
+                        require_sibling=self.hyper_frontier_width is None,
                     )
                     if decision is not None:
                         self._fork_r1_decisions[sample_id].append(decision)

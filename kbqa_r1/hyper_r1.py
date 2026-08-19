@@ -22,10 +22,21 @@ from .answer_utils import extract_last_answer_values
 
 class HypothesisStatus(str, Enum):
     ACTIVE = "active"
+    PARKED = "parked"
     EXPANDED = "expanded"
     PRUNED = "pruned"
     MERGED = "merged"
     COMMITTED = "committed"
+    CLOSED = "closed"
+
+
+class HypothesisSemanticStatus(str, Enum):
+    """Semantic truth is independent of prompt-storage status."""
+
+    UNRESOLVED = "unresolved"
+    VIABLE = "viable"
+    PROVED_FALSE = "proved_false"
+    PROVED_COMPLETE = "proved_complete"
 
 
 class HypothesisEdgeKind(str, Enum):
@@ -60,6 +71,7 @@ class HypothesisNode:
     resolver_score: float = 0.0
     depth: int = 0
     status: HypothesisStatus = HypothesisStatus.ACTIVE
+    semantic_status: HypothesisSemanticStatus = HypothesisSemanticStatus.UNRESOLVED
     equivalent_to: Optional[str] = None
     provenance: List[str] = field(default_factory=list)
 
@@ -75,9 +87,36 @@ class HypothesisGraphState:
     edges: List[HypothesisEdge] = field(default_factory=list)
     selected_id: Optional[str] = None
     committed_id: Optional[str] = None
+    abstained: bool = False
     execution_attempts: int = 0
     execution_calls: int = 0
     next_node_index: int = 0
+    question_contract: Optional["PublicQuestionContract"] = None
+    prune_certificates: Dict[str, "PruneCertificate"] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PublicQuestionContract:
+    """Question-only operator obligations available to the live environment."""
+
+    question: str
+    count_required: Optional[bool]
+
+    @property
+    def count_completion_possible(self) -> bool:
+        # Missing public context fails closed: Count remains possible and an
+        # empty branch cannot be declared terminally false.
+        return self.count_required is not False
+
+
+@dataclass(frozen=True)
+class PruneCertificate:
+    """Environment-owned proof that an executed hypothesis is terminally false."""
+
+    kind: str
+    node_id: str
+    evidence: Tuple[str, ...]
+    empty_preserving_completion: bool
 
 
 def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
@@ -88,6 +127,64 @@ def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
         if text:
             normalized.append(text)
     return tuple(sorted(set(normalized)))
+
+
+_COUNT_QUESTION_PATTERNS = (
+    re.compile(r"\bhow\s+many\b", re.IGNORECASE),
+    re.compile(
+        r"^\s*(?:what|which)\s+(?:is|was|are|were)\s+the\s+"
+        r"(?:total\s+)?(?:number|count)\s+of\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:give|find|return)\s+(?:me\s+)?the\s+"
+        r"(?:total\s+)?(?:number|count)\s+of\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def public_question_contract(question: str) -> PublicQuestionContract:
+    """Derive the supported Count contract from student-visible question text."""
+    text = str(question).strip()
+    if not text:
+        return PublicQuestionContract(question="", count_required=None)
+    return PublicQuestionContract(
+        question=text,
+        count_required=any(pattern.search(text) for pattern in _COUNT_QUESTION_PATTERNS),
+    )
+
+
+def public_empty_prune_certificate(
+    node_id: str,
+    denotation: Iterable[str],
+    contract: Optional[PublicQuestionContract],
+) -> Optional[PruneCertificate]:
+    """Issue a public contradiction proof only when every legal completion stays empty."""
+    if normalize_denotation(denotation):
+        return None
+    if contract is None or contract.count_completion_possible:
+        return None
+    return PruneCertificate(
+        kind="empty_monotone",
+        node_id=str(node_id),
+        evidence=(
+            "observed_denotation:empty",
+            "public_count_obligation:false",
+        ),
+        empty_preserving_completion=True,
+    )
+
+
+def validate_public_prune_certificate(
+    node_id: str,
+    denotation: Iterable[str],
+    contract: Optional[PublicQuestionContract],
+    certificate: Optional[PruneCertificate],
+) -> bool:
+    """Recompute a Prune proof instead of trusting a policy or serialized label."""
+    expected = public_empty_prune_certificate(node_id, denotation, contract)
+    return expected is not None and certificate == expected
 
 
 def normalize_display_labels(labels: Optional[Mapping[str, str]]) -> Dict[str, str]:
@@ -175,6 +272,8 @@ def serialize_frontier(
     max_active: int,
     node_count: int,
     execution_calls: int,
+    parked_nodes: Sequence[Mapping[str, Any]] = (),
+    execution_budget: Optional[int] = None,
     max_answers: int = 4,
 ) -> str:
     """Canonical policy observation shared by demonstrations and live rollouts."""
@@ -182,8 +281,10 @@ def serialize_frontier(
     visible = active | ({committed_id} if committed_id else set())
     lines = [
         "<hypothesis_graph>",
-        f"active={len(active)} capacity={max_active} nodes={node_count} "
-        f"execution_attempts={execution_calls} selected={selected_id or 'none'} "
+        f"active={len(active)} capacity={max_active} stored={node_count} "
+        f"parked={len(parked_nodes)} execution_attempts={execution_calls}"
+        + (f"/{execution_budget}" if execution_budget is not None else "")
+        + f" selected={selected_id or 'none'} "
         f"committed={committed_id or 'none'}",
     ]
     for node in nodes:
@@ -210,11 +311,19 @@ def serialize_frontier(
             f"path={path} answers={len(denotation)}: {answers}"
         )
     lines.append(
-        "Actions: Select, Find_relation [ source ], Widen [ source ], Combine, Prune, or Commit. "
-        "Widen exposes the next stable ranked page. Prune only for a visible path or "
-        "execution contradiction; low rank or limited capacity is not a contradiction."
+        "Actions: Select, Find_relation [ source ], Widen [ source ], Inspect [ Pn ], "
+        "Park, Recall, Combine, Prune, Commit, or Abstain. Widen exposes symbolic "
+        "proposals and Inspect alone executes one."
     )
     lines.append("</hypothesis_graph>")
+    if parked_nodes:
+        lines.append("<parked_hypotheses>")
+        for node in parked_nodes:
+            path = " -> ".join(relation_path(node.get("function_state", ()))) or "root"
+            lines.append(
+                f"{node['node_id']} path={path} answers={len(normalize_denotation(node.get('denotation', ())))}"
+            )
+        lines.append("</parked_hypotheses>")
     return "\n".join(lines)
 
 
@@ -319,13 +428,21 @@ def combine_function_states(
 class HypothesisGraph:
     """Owns persistent executable alternatives for all samples in a rollout."""
 
-    def __init__(self, max_active: int = 24, max_nodes: int = 24):
+    def __init__(
+        self,
+        max_active: int = 24,
+        max_nodes: int = 128,
+        max_execution_attempts: int = 24,
+    ):
         if max_active < 2:
             raise ValueError("HyPER-R1 requires at least two active hypotheses")
         if max_nodes < max_active:
             raise ValueError("max_nodes must be at least max_active")
+        if max_execution_attempts < 1:
+            raise ValueError("max_execution_attempts must be positive")
         self.max_active = int(max_active)
         self.max_nodes = int(max_nodes)
+        self.max_execution_attempts = int(max_execution_attempts)
         self._samples: Dict[int, HypothesisGraphState] = {}
 
     def state(self, sample_id: int) -> HypothesisGraphState:
@@ -333,11 +450,38 @@ class HypothesisGraph:
             self._samples[sample_id] = HypothesisGraphState(sample_id=sample_id)
         return self._samples[sample_id]
 
+    def register_public_question(self, sample_id: int, question: str) -> PublicQuestionContract:
+        """Attach the immutable student-visible operator contract to one rollout."""
+        contract = public_question_contract(question)
+        self.state(sample_id).question_contract = contract
+        return contract
+
+    def count_completion_possible(self, sample_id: int) -> bool:
+        contract = self.state(sample_id).question_contract
+        return contract is None or contract.count_completion_possible
+
+    def operator_allowed(self, sample_id: int, operation: str) -> bool:
+        if str(operation).strip().lower() != "count":
+            return True
+        return self.count_completion_possible(sample_id)
+
     def has_capacity(self, sample_id: int, required: int = 1) -> bool:
-        """Return whether another executed hypothesis can be retained."""
+        """Return whether another executed hypothesis can be stored.
+
+        This is deliberately separate from the execution-attempt budget and
+        the visible active-workspace budget.
+        """
         if required < 0:
             raise ValueError("required must be non-negative")
         return len(self.state(sample_id).nodes) + required <= self.max_nodes
+
+    def has_execution_budget(self, sample_id: int, required: int = 1) -> bool:
+        if required < 0:
+            raise ValueError("required must be non-negative")
+        return (
+            self.state(sample_id).execution_attempts + required
+            <= self.max_execution_attempts
+        )
 
     def clear(self, sample_id: Optional[int] = None) -> None:
         if sample_id is None:
@@ -376,7 +520,7 @@ class HypothesisGraph:
         if len(self.active_nodes(sample_id)) >= self.max_active:
             raise RuntimeError(
                 f"HyPER-R1 active frontier is full for sample {sample_id}: "
-                f"{len(self.active_nodes(sample_id))}/{self.max_active}; prune before exploring"
+                f"{len(self.active_nodes(sample_id))}/{self.max_active}; park a viable hypothesis"
             )
 
         node_id = f"H{graph.next_node_index}"
@@ -452,6 +596,11 @@ class HypothesisGraph:
     def record_execution_attempt(self, sample_id: int) -> int:
         """Count every proposed graph execution, including failed proposals."""
         graph = self.state(sample_id)
+        if not self.has_execution_budget(sample_id):
+            raise RuntimeError(
+                f"HyPER-R1 execution budget exhausted for sample {sample_id}: "
+                f"{graph.execution_attempts}/{self.max_execution_attempts}"
+            )
         graph.execution_attempts += 1
         return graph.execution_attempts
 
@@ -476,8 +625,10 @@ class HypothesisGraph:
         if graph.committed_id is not None:
             raise ValueError("the hypothesis graph is already committed")
         node = self.require_active(sample_id, node_id)
-        if not node.denotation:
-            raise ValueError("cannot select an empty hypothesis")
+        if not node.denotation and not self.count_completion_possible(sample_id):
+            raise ValueError(
+                "cannot select an empty hypothesis when the public question has no Count obligation"
+            )
         graph.selected_id = node_id
         return node
 
@@ -494,30 +645,43 @@ class HypothesisGraph:
         opens_frontier: bool,
         frontier_width: int,
         opens_new_root: bool = False,
+        operation: Optional[str] = None,
     ) -> Optional[str]:
         """Return why an executable policy action is illegal in this state."""
         graph = self.state(sample_id)
         if graph.committed_id is not None:
             return "The graph is committed. Return the committed values in <answer>."
+        if graph.abstained:
+            return "The graph is closed after Abstain."
         active = self.active_nodes(sample_id)
+        selected = self.selected_node(sample_id)
+        operation_name = str(operation or "").strip().lower()
+        if operation_name == "count" and not self.operator_allowed(sample_id, "count"):
+            return "Count is not licensed by the public question contract."
+        if selected is not None and not selected.denotation and operation_name != "count":
+            return (
+                "An empty selected hypothesis can only be continued by the public "
+                "Count obligation; otherwise Park it or inspect another branch."
+            )
         if active and graph.selected_id is None and not opens_new_root:
             return "Select an active hypothesis before any executable continuation."
         if not active and graph.nodes and graph.selected_id is None:
             return "No active hypothesis can be continued."
         if not graph.nodes and not opens_frontier and not opens_new_root:
             return "Begin the executable frontier with Find_relation."
-        if opens_frontier:
-            active_after = len(active) - (1 if graph.selected_id is not None else 0)
-            if (
-                active_after + frontier_width > self.max_active
-                or not self.has_capacity(sample_id, frontier_width)
-            ):
+        # Opening or widening a proposal catalog is symbolic and consumes no
+        # hypothesis or execution capacity. Only Inspect is budgeted.
+        if not opens_frontier:
+            if not self.has_capacity(sample_id):
                 return (
-                    "The next complete relation page does not fit the remaining "
-                    "uniform node budget; no partial page was executed."
+                    "The persistent hypothesis store is exhausted. Commit only if a "
+                    "complete hypothesis is already justified; otherwise use Abstain."
                 )
-        elif not self.has_capacity(sample_id):
-            return "The executed-node budget is exhausted; Commit an active hypothesis."
+            if not self.has_execution_budget(sample_id):
+                return (
+                    "The execution budget is exhausted. Commit only if a complete "
+                    "hypothesis is already justified; otherwise use Abstain."
+                )
         return None
 
     def relation_source_error(
@@ -554,6 +718,9 @@ class HypothesisGraph:
     def available_active_slots(self, sample_id: int) -> int:
         return self.max_active - len(self.active_nodes(sample_id))
 
+    def clear_selection(self, sample_id: int) -> None:
+        self.state(sample_id).selected_id = None
+
     def combination_parents(
         self, sample_id: int, left_id: str, right_id: str
     ) -> Tuple[HypothesisNode, HypothesisNode]:
@@ -567,12 +734,59 @@ class HypothesisGraph:
             self.require_active(sample_id, right_id),
         )
 
-    def prune(self, sample_id: int, node_id: str, reason: str = "policy") -> None:
+    def prune(
+        self, sample_id: int, node_id: str, reason: str = "policy"
+    ) -> PruneCertificate:
         node = self.require_active(sample_id, node_id)
+        graph = self.state(sample_id)
+        certificate = public_empty_prune_certificate(
+            node.node_id,
+            node.denotation,
+            graph.question_contract,
+        )
+        if certificate is None:
+            if not node.denotation and self.count_completion_possible(sample_id):
+                raise ValueError(
+                    "empty hypothesis remains unresolved because Count can produce the valid answer zero; park instead"
+                )
+            raise ValueError(
+                "nonempty hypotheses are unresolved without a public contradiction certificate; park instead"
+            )
+        if not validate_public_prune_certificate(
+            node.node_id,
+            node.denotation,
+            graph.question_contract,
+            certificate,
+        ):
+            raise ValueError("the environment could not verify the Prune certificate")
+        node.semantic_status = HypothesisSemanticStatus.PROVED_FALSE
         node.status = HypothesisStatus.PRUNED
         node.provenance.append(reason)
+        graph.prune_certificates[node.node_id] = certificate
+        if graph.selected_id == node_id:
+            graph.selected_id = None
+        return certificate
+
+    def park(self, sample_id: int, node_id: str) -> HypothesisNode:
+        node = self.require_active(sample_id, node_id)
+        node.status = HypothesisStatus.PARKED
+        node.provenance.append("parked")
         if self.state(sample_id).selected_id == node_id:
             self.state(sample_id).selected_id = None
+        return node
+
+    def recall(self, sample_id: int, node_id: str) -> HypothesisNode:
+        graph = self.state(sample_id)
+        if node_id not in graph.nodes:
+            raise KeyError(f"unknown hypothesis: {node_id}")
+        node = graph.nodes[node_id]
+        if node.status != HypothesisStatus.PARKED:
+            raise ValueError(f"hypothesis {node_id} is {node.status.value}, not parked")
+        if self.available_active_slots(sample_id) <= 0:
+            raise RuntimeError("the active workspace is full; park another hypothesis first")
+        node.status = HypothesisStatus.ACTIVE
+        node.provenance.append("recalled")
+        return node
 
     def commit(self, sample_id: int, node_id: str) -> HypothesisNode:
         graph = self.state(sample_id)
@@ -580,13 +794,24 @@ class HypothesisGraph:
         if not node.denotation:
             raise ValueError("cannot commit an empty hypothesis")
         for other in graph.nodes.values():
-            if other.is_active and other.node_id != node_id:
-                other.status = HypothesisStatus.PRUNED
-                other.provenance.append("commit")
+            if other.status in {HypothesisStatus.ACTIVE, HypothesisStatus.PARKED} and other.node_id != node_id:
+                other.status = HypothesisStatus.CLOSED
+                other.provenance.append("closed_by_commit")
         node.status = HypothesisStatus.COMMITTED
         graph.selected_id = None
         graph.committed_id = node_id
         return node
+
+    def abstain(self, sample_id: int) -> None:
+        graph = self.state(sample_id)
+        if graph.committed_id is not None:
+            raise ValueError("cannot Abstain after Commit")
+        graph.abstained = True
+        graph.selected_id = None
+        for node in graph.nodes.values():
+            if node.status in {HypothesisStatus.ACTIVE, HypothesisStatus.PARKED}:
+                node.status = HypothesisStatus.CLOSED
+                node.provenance.append("closed_by_abstain")
 
     def committed_node(self, sample_id: int) -> Optional[HypothesisNode]:
         graph = self.state(sample_id)
@@ -620,6 +845,10 @@ class HypothesisGraph:
             "selected": self._node_program_key(graph.nodes.get(graph.selected_id)),
             "active": sorted(
                 (self._node_program_key(node) for node in self.active_nodes(sample_id)),
+                key=repr,
+            ),
+            "parked": sorted(
+                (self._node_program_key(node) for node in self.parked_nodes(sample_id)),
                 key=repr,
             ),
             "node_count": len(graph.nodes),
@@ -671,6 +900,13 @@ class HypothesisGraph:
     def active_nodes(self, sample_id: int) -> List[HypothesisNode]:
         return [node for node in self.state(sample_id).nodes.values() if node.is_active]
 
+    def parked_nodes(self, sample_id: int) -> List[HypothesisNode]:
+        return [
+            node
+            for node in self.state(sample_id).nodes.values()
+            if node.status == HypothesisStatus.PARKED
+        ]
+
     def lineage(self, sample_id: int, node_id: Optional[str] = None) -> List[str]:
         graph = self.state(sample_id)
         current = node_id or graph.committed_id
@@ -695,6 +931,8 @@ class HypothesisGraph:
             max_active=self.max_active,
             node_count=len(graph.nodes),
             execution_calls=graph.execution_attempts,
+            parked_nodes=[node.__dict__ for node in self.parked_nodes(sample_id)],
+            execution_budget=self.max_execution_attempts,
             max_answers=max_answers,
         )
 
@@ -704,6 +942,10 @@ class HypothesisGraph:
             "sample_id": sample_id,
             "selected_id": graph.selected_id,
             "committed_id": graph.committed_id,
+            "abstained": graph.abstained,
+            "max_active": self.max_active,
+            "max_nodes": self.max_nodes,
+            "max_execution_attempts": self.max_execution_attempts,
             "execution_calls": graph.execution_calls,
             "execution_attempts": graph.execution_attempts,
             "nodes": [
@@ -714,6 +956,7 @@ class HypothesisGraph:
                     "denotation_labels": dict(node.denotation_labels),
                     "parent_ids": list(node.parent_ids),
                     "status": node.status.value,
+                    "semantic_status": node.semantic_status.value,
                 }
                 for node in graph.nodes.values()
             ],
@@ -815,16 +1058,23 @@ def enforce_commit_reward(
     token_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     commit_valid: torch.Tensor,
+    abstained: Optional[torch.Tensor] = None,
     invalid_penalty: float = 0.25,
 ) -> torch.Tensor:
-    """Make an answer-grounded Commit a necessary condition for reward."""
+    """Reward certified Commit, permit safe abstention, penalize false claims."""
     if token_rewards.shape != response_mask.shape:
         raise ValueError("token_rewards and response_mask must have the same shape")
     if commit_valid.ndim != 1 or commit_valid.shape[0] != token_rewards.shape[0]:
         raise ValueError("commit_valid must contain one value per rollout")
+    if abstained is None:
+        abstained = torch.zeros_like(commit_valid, dtype=torch.bool)
+    if abstained.ndim != 1 or abstained.shape[0] != token_rewards.shape[0]:
+        raise ValueError("abstained must contain one value per rollout")
     result = token_rewards.clone()
-    invalid = commit_valid.to(dtype=torch.bool).logical_not()
-    result[invalid] = 0
+    valid = commit_valid.to(dtype=torch.bool)
+    safe_abstention = abstained.to(dtype=torch.bool) & ~valid
+    invalid = ~valid & ~safe_abstention
+    result[~valid] = 0
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows[invalid], lengths[invalid]] = -abs(float(invalid_penalty))
@@ -835,7 +1085,7 @@ def charge_execution_budget(
     token_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     execution_counts: torch.Tensor,
-    max_nodes: int,
+    max_execution_attempts: int,
     cost: float,
     group_ids: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
@@ -844,8 +1094,8 @@ def charge_execution_budget(
         raise ValueError("token_rewards and response_mask must have the same shape")
     if execution_counts.ndim != 1 or execution_counts.shape[0] != token_rewards.shape[0]:
         raise ValueError("execution_counts must be one value per rollout")
-    if max_nodes <= 0:
-        raise ValueError("max_nodes must be positive")
+    if max_execution_attempts <= 0:
+        raise ValueError("max_execution_attempts must be positive")
     result = token_rewards.clone()
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
     baseline = torch.zeros_like(execution_counts)
@@ -862,7 +1112,11 @@ def charge_execution_budget(
             dtype=execution_counts.dtype,
         )
     excess = (execution_counts - baseline).clamp_min(0)
-    penalties = float(cost) * excess.to(result.dtype) / float(max_nodes)
+    penalties = (
+        float(cost)
+        * excess.to(result.dtype)
+        / float(max_execution_attempts)
+    )
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows, lengths] -= penalties
     return result

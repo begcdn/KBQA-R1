@@ -372,8 +372,9 @@ def main() -> None:
     )
     parser.add_argument("--frontier-width", type=int, default=6)
     parser.add_argument("--max-active", type=int, default=24)
-    parser.add_argument("--max-nodes", type=int, default=24)
-    parser.add_argument("--max-turns", type=int, default=16)
+    parser.add_argument("--max-nodes", type=int, default=128)
+    parser.add_argument("--max-execution-attempts", type=int, default=24)
+    parser.add_argument("--max-turns", type=int, default=32)
     parser.add_argument(
         "--workers",
         type=int,
@@ -414,6 +415,7 @@ def main() -> None:
             provider,
             max_active=args.max_active,
             max_nodes=args.max_nodes,
+            max_execution_attempts=args.max_execution_attempts,
             frontier_width=args.frontier_width,
             max_turns=args.max_turns,
             entity_display_provider=display_provider,
@@ -625,6 +627,10 @@ def main() -> None:
                 source_types["literal_or_name"] += 1
     proposal_stats = dict(sorted(proposal_stats.items()))
     relation_total = proposal_stats.get("relation_decisions", 0)
+    audited_programs = proposal_stats.get("gold_program_proposal_audit_rows", 0)
+    audited_program_decisions = proposal_stats.get(
+        "gold_program_proposal_decisions", 0
+    )
     continuation_total = proposal_stats.get("continuation_decisions", 0)
     recovery_probe_total = proposal_stats.get("recovery_probe_decisions", 0)
     conjunction_total = proposal_stats.get("conjunction_decisions", 0)
@@ -701,14 +707,63 @@ def main() -> None:
     frontier_diagnostics = _frontier_diagnostics(train_demonstrations)
     family_difficulty = _frontier_difficulty_by_family(train_demonstrations)
     recovery_count = (
-        families.get("delayed_frontier_recovery", 0)
-        + families.get("semantic_frontier_recovery", 0)
+        families.get("certified_empty_recovery", 0)
+        + families.get("non_destructive_nonempty_recovery", 0)
     )
     multi_hop_count = sum(
         any(node.depth > 0 for node in demo.hypotheses.values())
         for demo in train_demonstrations
     )
-    minimum_recoveries = max(500, math.ceil(0.10 * multi_hop_count))
+    recovery_strata = Counter(
+        str(demo.private_metadata.get("recovery_stratum"))
+        for demo in train_demonstrations
+        if demo.private_metadata.get("recovery_stratum")
+    )
+    required_recovery_strata = {
+        "immediate_linear",
+        "post_widen",
+        "deep",
+        "conjunction",
+        "operator_adjacent",
+    }
+    irreversible_steps = [
+        step
+        for demo in train_demonstrations
+        for step in demo.steps
+        if step.action in {"Prune", "Commit"}
+    ]
+    intervention_steps = [
+        step
+        for demo in train_demonstrations
+        for step in demo.steps
+        if step.supervision == "intervention"
+    ]
+    intervention_masks_match = True
+    for demo, row in zip(train_demonstrations, train_rows):
+        action_messages = [
+            message
+            for message in row.get("messages", ())
+            if message.get("role") == "assistant"
+            and "<action>" in str(message.get("content", ""))
+        ]
+        if len(action_messages) != len(demo.steps):
+            intervention_masks_match = False
+            break
+        if any(
+            (message.get("loss_mask", 1) == 0)
+            != (step.supervision == "intervention")
+            for step, message in zip(demo.steps, action_messages)
+        ):
+            intervention_masks_match = False
+            break
+    root_provenance = Counter(
+        str(demo.private_metadata.get("root_entity_provenance", "missing"))
+        for demo in train_demonstrations
+    )
+    selected_program_audits = [
+        demo.private_metadata.get("gold_program_proposal_audit", {})
+        for demo in train_demonstrations
+    ]
     entity_display_total = visible_mid_count + candidate_mid_count
     entity_display_labeled = labeled_mid_count + candidate_labeled_count
     entity_display_described = descriptor_mid_count + candidate_descriptor_count
@@ -737,7 +792,31 @@ def main() -> None:
             families.get("frontier_commit", 0)
             or families.get("direct_frontier_progress", 0)
         ),
-        "recovery_skill_has_training_mass": recovery_count >= minimum_recoveries,
+        "recovery_skill_is_present": recovery_count > 0,
+        "recovery_state_coverage": required_recovery_strata.issubset(
+            recovery_strata
+        ),
+        "all_irreversible_actions_have_certificates": all(
+            step.certificate_kind for step in irreversible_steps
+        ),
+        "interventions_are_not_policy_targets": (
+            all(step.action == "Select" for step in intervention_steps)
+            and intervention_masks_match
+        ),
+        "oracle_topic_entity_protocol": (
+            bool(root_provenance)
+            and set(root_provenance).issubset(
+                {"oracle_gold_program", "no_entity_root"}
+            )
+            and root_provenance.get("missing", 0) == 0
+        ),
+        "full_program_proposal_ceiling_is_measured": audited_programs > 0,
+        "all_selected_questions_are_oracle_reachable_under_runtime_budgets": bool(
+            selected_program_audits
+        ) and all(
+            audit.get("all_relations_within_budget")
+            for audit in selected_program_audits
+        ),
         "adaptive_widening_is_represented": (
             proposal_stats.get("proposal_recovered_by_widen", 0) == 0
             or families.get("adaptive_frontier_widen", 0) > 0
@@ -765,9 +844,12 @@ def main() -> None:
         "no_conflicting_teacher_actions_for_same_observation": (
             decision_consistency["contradictory_states"] == 0
         ),
+        "public_count_contract_matches_gold_count_programs": (
+            proposal_stats.get("public_count_contract_false_negative", 0) == 0
+        ),
     }
     report = {
-        "quality_schema": "hyper_r1_v7_paged_operators",
+        "quality_schema": "hyper_r1_v12_public_count_prune_parity",
         "input": args.input,
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
@@ -802,9 +884,14 @@ def main() -> None:
         "relation_rank_cutoff": None,
         "max_active": args.max_active,
         "max_nodes": args.max_nodes,
+        "max_execution_attempts": args.max_execution_attempts,
         "max_turns": args.max_turns,
+        "answer_generation_is_outside_max_turns": True,
         "graph_query_workers": args.workers,
-        "maximum_selected_trajectory_turns": max(
+        "maximum_selected_policy_action_turns": max(
+            (len(demo.steps) for demo in demonstrations), default=0
+        ),
+        "maximum_selected_total_model_generations": max(
             (len(demo.steps) + 1 for demo in demonstrations), default=0
         ),
         "sft_rows": len(train_rows),
@@ -822,13 +909,49 @@ def main() -> None:
             "relation_at_frontier": (
                 relation_recall
             ),
-            "relation_within_node_budget": relation_within_budget_recall,
+            "relation_visible_within_single_decision_turn_budget": (
+                relation_within_budget_recall
+            ),
             "recovered_by_widen": (
                 relation_within_budget_recall - relation_recall
                 if relation_within_budget_recall is not None and relation_recall is not None
                 else None
             ),
             "relation_top1": relation_top1,
+            "gold_prefix_conditional_program_ceiling": {
+                "audited_programs": audited_programs,
+                "audited_relation_decisions": audited_program_decisions,
+                "all_relations_present": (
+                    proposal_stats.get("gold_program_all_relations_present", 0)
+                    / audited_programs
+                    if audited_programs else None
+                ),
+                "whole_program_runtime_reachable": (
+                    proposal_stats.get(
+                        "gold_program_all_relations_within_budget", 0
+                    )
+                    / audited_programs
+                    if audited_programs else None
+                ),
+                "relation_present": (
+                    proposal_stats.get("gold_program_relation_present", 0)
+                    / audited_program_decisions
+                    if audited_program_decisions else None
+                ),
+                "relation_visible_within_single_decision_turn_budget": (
+                    proposal_stats.get("gold_program_relation_within_budget", 0)
+                    / audited_program_decisions
+                    if audited_program_decisions else None
+                ),
+                "interpretation": (
+                    "Oracle diagnostic only: each ranking is queried from the state "
+                    "that would be visible after all preceding gold decisions. It "
+                    "then simulates Find/Widen, Inspect, Select/Park, logical "
+                    "operators, Commit, and the final answer turn under the exact "
+                    "runtime budgets. It is an oracle reachability ceiling, not "
+                    "learned policy accuracy."
+                ),
+            },
             "topk_opportunity_over_top1": (
                 relation_recall - relation_top1
                 if relation_recall is not None and relation_top1 is not None else None
@@ -897,6 +1020,24 @@ def main() -> None:
                 sorted(conjunction_source_positions.items())
             ),
         },
+        "root_entity_provenance": dict(sorted(root_provenance.items())),
+        "entity_linking_protocol": (
+            "oracle topic entities from MID-valued START nodes in the annotated "
+            "GrailQA program, matching BoG's oracle entity-linking assumption"
+        ),
+        "selected_program_runtime_reachability": {
+            "questions": len(
+                {
+                    demo.question_id
+                    for demo in train_demonstrations
+                }
+            ),
+            "oracle_reachable_trajectories": sum(
+                bool(audit.get("all_relations_within_budget"))
+                for audit in selected_program_audits
+            ),
+            "trajectories": len(selected_program_audits),
+        },
         "denotational_ambiguity": {
             **frontier_diagnostics,
             "interpretation": (
@@ -923,18 +1064,46 @@ def main() -> None:
         "teacher_rationales": "deterministic templates grounded in verified public steps",
         "explicit_gold_labels_exposed_to_student": False,
         "gold_injected_into_proposals": False,
+        "proof_carrying_supervision": {
+            "recovery_trajectories": recovery_count,
+            "recovery_strata": dict(sorted(recovery_strata.items())),
+            "required_recovery_strata": sorted(required_recovery_strata),
+            "intervention_actions": len(intervention_steps),
+            "certified_irreversible_actions": sum(
+                bool(step.certificate_kind) for step in irreversible_steps
+            ),
+            "irreversible_actions": len(irreversible_steps),
+            "nonempty_without_certificate": "preserve_as_unresolved",
+            "commit_requirement": (
+                "exact_denotation_and_bidirectional_query_containment_for_the_"
+                "supported_fragment"
+            ),
+            "public_count_contract": {
+                "rows": proposal_stats.get("public_count_contract_rows", 0),
+                "gold_count_rows": proposal_stats.get("gold_count_rows", 0),
+                "public_count_required_rows": proposal_stats.get(
+                    "public_count_required_rows", 0
+                ),
+                "false_negatives": proposal_stats.get(
+                    "public_count_contract_false_negative", 0
+                ),
+                "conservative_false_positives": proposal_stats.get(
+                    "public_count_contract_false_positive", 0
+                ),
+            },
+        },
         "quality_assessment": {
             "structurally_ready_for_sft": all(quality_checks.values()),
             "checks": quality_checks,
-            "minimum_recovery_trajectories": minimum_recoveries,
+            "minimum_recovery_trajectories": None,
             "multi_hop_training_trajectories": multi_hop_count,
             "deep_input_rows": deep_input_rows,
             "deep_training_trajectories": deep_training_trajectories,
             "minimum_deep_trajectories": minimum_deep_trajectories,
             "note": (
                 "Validity failures block export. Expensive SFT additionally requires "
-                "readable entity evidence, non-positional conjunction roots, and enough "
-                "verified recovery and deep trajectories to teach the method-specific behavior. "
+                "readable entity evidence, non-positional conjunction roots, proof-carrying "
+                "irreversible actions, and recovery across the required public state shapes. "
                 "Decision-level SFT rows exclude the final answer-copy turn."
             ),
         },

@@ -200,7 +200,8 @@ max_response_length=${max_response_length:-1024}
 actor_lr=${actor_lr:-1e-6}
 hyper_r1_enable=${hyper_r1_enable:-false}
 hyper_r1_max_active=${hyper_r1_max_active:-24}
-hyper_r1_max_nodes=${hyper_r1_max_nodes:-24}
+hyper_r1_max_nodes=${hyper_r1_max_nodes:-128}
+hyper_r1_max_execution_attempts=${hyper_r1_max_execution_attempts:-24}
 hyper_r1_frontier_width=${hyper_r1_frontier_width:-6}
 hyper_r1_relation_model=${hyper_r1_relation_model:-}
 hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
@@ -276,7 +277,7 @@ echo "Train File   : ${TRAIN_FILE}"
 echo "Val File     : ${VAL_FILE}"
 echo "Model Path   : ${MODEL_PATH}"
 echo "Experiment   : ${EXPERIMENT_NAME}"
-echo "HyPER-R1     : ${hyper_r1_enable} (active=${hyper_r1_max_active}, nodes=${hyper_r1_max_nodes})"
+echo "HyPER-R1     : ${hyper_r1_enable} (active=${hyper_r1_max_active}, nodes=${hyper_r1_max_nodes}, executions=${hyper_r1_max_execution_attempts})"
 echo "Checkpoints  : ${CHECKPOINT_DIR}/${EXPERIMENT_NAME}"
 echo "Log File     : ${LOG_FILE} (only main run log; internal sexpr file logs disabled)"
 echo "GPUs / node  : ${NGPUS_PER_NODE} (using ${TRAINING_GPUS} for training)"
@@ -387,6 +388,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     hyper_r1.enable=${hyper_r1_enable} \
     hyper_r1.max_active=${hyper_r1_max_active} \
     hyper_r1.max_nodes=${hyper_r1_max_nodes} \
+    hyper_r1.max_execution_attempts=${hyper_r1_max_execution_attempts} \
     hyper_r1.frontier_width=${hyper_r1_frontier_width} \
     hyper_r1.relation_model="${hyper_r1_relation_model}" \
     +sexpr_config.enable_logging=false \

@@ -1,16 +1,32 @@
 from dataclasses import replace
 
 from kbqa_r1.hyper_data import (
-    DemonstrationBuilder,
+    DemonstrationBuilder as _DemonstrationBuilder,
     DemonstrationValidator,
     IneligibleProgram,
     ProgramExecutionError,
     RelationOption,
+    certify_program_commit,
     compile_gold_plan,
     decision_sft_records,
+    programs_are_intent_equivalent,
     step_sft_records,
     trajectory_sft_record,
 )
+
+
+def DemonstrationBuilder(*args, **kwargs):
+    """Use the production oracle-topic-entity protocol in fixtures."""
+    return _DemonstrationBuilder(*args, **kwargs)
+
+
+def semantic_actions(demo):
+    """Hide storage/query mechanics when asserting the logical trajectory."""
+    return [
+        step.action
+        for step in demo.steps
+        if step.action not in {"Inspect", "Park", "Recall"}
+    ]
 
 
 def fake_executor(functions, target):
@@ -180,7 +196,7 @@ def test_operator_program_teaches_count_after_retained_relation_frontier():
     demo = DemonstrationBuilder(executor, options).build(row)[0]
 
     assert demo.family == "operator_program"
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Find_relation",
         "Select",
         "Count",
@@ -194,6 +210,32 @@ def test_operator_program_teaches_count_after_retained_relation_frontier():
         if message["role"] == "assistant"
     ]
     assert any("Count [ expression1 ]" in message for message in assistant)
+
+
+def test_count_teacher_rejects_private_operator_not_licensed_by_public_question():
+    row = {
+        "ID": "hidden-count-program",
+        "question": "Which items are connected to the topic?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.items', expression1)",
+            "expression1 = COUNT(expression1)",
+        ],
+        "answer": ["2"],
+    }
+
+    def executor(functions, target):
+        del target
+        return (
+            ["2"]
+            if any("COUNT(" in item for item in functions)
+            else ["m.one", "m.two"]
+        )
+
+    builder = DemonstrationBuilder(executor, candidates)
+
+    assert builder.build(row) == []
+    assert builder.stats["public_count_contract_false_negative"] == 1
 
 
 def test_operator_program_opens_comparison_branch_and_combines_it():
@@ -231,7 +273,7 @@ def test_operator_program_opens_comparison_branch_and_combines_it():
 
     demo = DemonstrationBuilder(executor, options).build(row)[0]
 
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Compare",
         "Find_relation",
         "Combine",
@@ -275,7 +317,7 @@ def test_operator_program_executes_explicit_type_constraint_before_count():
     builder = DemonstrationBuilder(executor, options)
     demo = builder.build(row)[0]
 
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Find_relation",
         "Select",
         "Merge",
@@ -312,7 +354,7 @@ def test_operator_program_executes_explicit_type_constraint_after_compare():
     builder = DemonstrationBuilder(executor, lambda *_args: [])
     demo = builder.build(row)[0]
 
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Compare",
         "Select",
         "Merge",
@@ -347,7 +389,7 @@ def test_operator_program_keeps_nonredundant_bare_type_intersection():
     builder = DemonstrationBuilder(executor, lambda *_args: [])
     demo = builder.build(row)[0]
 
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Compare",
         "Select",
         "Merge",
@@ -390,7 +432,7 @@ def test_operator_program_applies_order_and_time_to_the_selected_branch():
 
     demo = DemonstrationBuilder(executor, options).build(row)[0]
 
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Find_relation",
         "Select",
         "Order",
@@ -442,7 +484,7 @@ def test_operator_program_is_rejected_when_runtime_node_budget_cannot_fit_it():
     assert builder.stats["operator_program_node_budget_miss"] == 1
 
 
-def test_builds_replayable_delayed_frontier_recovery():
+def test_builds_replayable_certified_empty_recovery():
     row = {
         "ID": "q1",
         "question": "Which answer follows both intended relations?",
@@ -456,11 +498,12 @@ def test_builds_replayable_delayed_frontier_recovery():
     builder = DemonstrationBuilder(fake_executor, candidates)
     demos = builder.build(row)
     demo = demos[0]
-    assert demo.family == "delayed_frontier_recovery"
+    assert demo.family == "certified_empty_recovery"
     actions = [step.action for step in demo.steps]
-    assert actions[:3] == ["Find_relation", "Select", "Find_relation"]
+    assert semantic_actions(demo)[:3] == ["Find_relation", "Select", "Find_relation"]
+    assert actions.count("Inspect") >= 3
     assert "Prune" in actions
-    assert actions[-3:] == ["Select", "Find_relation", "Commit"]
+    assert semantic_actions(demo)[-3:] == ["Select", "Find_relation", "Commit"]
     assert demo.private_metadata["proposal_relations"] == [
         "r.alt1", "r.gold1", "r.other1"
     ]
@@ -470,6 +513,12 @@ def test_builds_replayable_delayed_frontier_recovery():
         if step.action == "Find_relation"
     )
     assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
+    forced_select = next(
+        step for step in demo.steps if step.supervision == "intervention"
+    )
+    assert forced_select.action == "Select"
+    prune = next(step for step in demo.steps if step.action == "Prune")
+    assert prune.certificate_kind == "empty_monotone"
 
     public = step_sft_records(demo)
     assert all("private_metadata" not in record for record in public)
@@ -491,7 +540,9 @@ def test_builds_replayable_delayed_frontier_recovery():
         for message in sft["messages"]
         if message["role"] == "user" and "<hypothesis_graph>" in message["content"]
     ]
-    assert "nodes=3 execution_attempts=3" in graph_observations[0]
+    assert "stored=0" in graph_observations[0]
+    assert "execution_attempts=0/24" in graph_observations[0]
+    assert "<proposal_catalog>" in graph_observations[0]
     assert "H3" not in graph_observations[0]
 
     assert len(demos) == 1
@@ -538,7 +589,7 @@ def test_recovery_does_not_emit_a_contradictory_direct_twin():
 
     demos = DemonstrationBuilder(fake_executor, candidates).build(row)
 
-    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+    assert [demo.family for demo in demos] == ["certified_empty_recovery"]
 
 
 def test_three_hop_program_teaches_repeated_public_frontier_progress():
@@ -572,7 +623,7 @@ def test_three_hop_program_teaches_repeated_public_frontier_progress():
         ]
 
     demo = DemonstrationBuilder(
-        executor, provider, max_turns=14
+        executor, provider, max_turns=32
     ).build(row)[0]
 
     assert demo.family == "deep_frontier_progress"
@@ -616,11 +667,11 @@ def test_three_hop_program_applies_terminal_type_after_public_progress():
             RelationOption(f"r.alt_{join.index}_b", 0.75, 3),
         ]
 
-    demo = DemonstrationBuilder(executor, provider, max_turns=14).build(row)[0]
+    demo = DemonstrationBuilder(executor, provider, max_turns=32).build(row)[0]
 
     assert demo.family == "deep_frontier_progress"
     assert [step.action for step in demo.steps].count("Find_relation") == 3
-    assert [step.action for step in demo.steps][-3:] == [
+    assert semantic_actions(demo)[-3:] == [
         "Select",
         "Merge",
         "Commit",
@@ -662,10 +713,10 @@ def test_four_hop_program_stays_within_the_training_turn_budget():
             RelationOption(f"r.alt_{join.index}_b", 0.75, 3),
         ]
 
-    demo = DemonstrationBuilder(executor, provider, max_turns=14).build(row)[0]
+    demo = DemonstrationBuilder(executor, provider, max_turns=32).build(row)[0]
 
     assert demo.private_metadata["path_hops"] == 4
-    assert len(demo.steps) + 1 <= 14
+    assert len(demo.steps) <= 32
     assert [step.action for step in demo.steps].count("Find_relation") == 4
     assert max(node.depth for node in demo.hypotheses.values()) == 3
     assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
@@ -699,7 +750,7 @@ def test_recovery_probe_uses_natural_frontier_without_hidden_gold_injection():
     builder = DemonstrationBuilder(executor, provider)
     recovery = builder.build(row)[0]
 
-    assert recovery.family == "delayed_frontier_recovery"
+    assert recovery.family == "certified_empty_recovery"
     wrong_children = [
         node for node in recovery.hypotheses.values()
         if node.parent_id == "H0"
@@ -722,10 +773,13 @@ def test_one_hop_frontier_commits_without_ceremonial_select():
     }
     demo = DemonstrationBuilder(fake_executor, one_hop_candidates).build(row)[0]
     assert demo.family == "frontier_commit"
-    assert [step.action for step in demo.steps] == ["Find_relation", "Commit"]
+    assert semantic_actions(demo) == ["Find_relation", "Commit"]
+    assert sum(step.action == "Inspect" for step in demo.steps) == 2
     assert DemonstrationValidator(fake_executor, max_active=6).validate(demo) == []
     decisions = decision_sft_records(demo)
-    assert len(decisions) == 2
+    assert len(decisions) == sum(
+        step.supervision == "policy_target" for step in demo.steps
+    )
     assert all("<action>" in row["messages"][-1]["content"] for row in decisions)
     assert all("<answer>" not in row["messages"][-1]["content"] for row in decisions)
     assert decisions[-1]["messages"][-1]["loss_mask"] == 1
@@ -760,7 +814,7 @@ def test_recovery_is_not_manufactured_when_gold_is_already_top1():
 
     demos = DemonstrationBuilder(fake_executor, gold_first).build(row)
     assert [demo.family for demo in demos] == ["direct_frontier_progress"]
-    assert [step.action for step in demos[0].steps] == [
+    assert semantic_actions(demos[0]) == [
         "Find_relation", "Select", "Find_relation", "Commit"
     ]
     assert all(step.action != "Prune" for step in demos[0].steps)
@@ -790,7 +844,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
 
     demos = DemonstrationBuilder(typed_executor, candidates).build(row)
 
-    assert [demo.family for demo in demos] == ["delayed_frontier_recovery"]
+    assert [demo.family for demo in demos] == ["certified_empty_recovery"]
     assert any(step.action == "Prune" for step in demos[0].steps)
     continuation_sources = [
         step.arguments[0]
@@ -799,7 +853,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
     ]
     assert continuation_sources
     assert set(continuation_sources) == {"expression1"}
-    assert [step.action for step in demos[0].steps][-3:] == [
+    assert semantic_actions(demos[0])[-3:] == [
         "Select",
         "Merge",
         "Commit",
@@ -807,7 +861,7 @@ def test_two_hop_progress_survives_routine_answer_type_tail():
     assert DemonstrationValidator(typed_executor).validate(demos[0]) == []
 
 
-def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer():
+def test_nonempty_probe_is_preserved_as_unresolved_and_intervention_is_masked():
     row = {
         "ID": "wrong-answer",
         "question": "Which answer follows both intended relations?",
@@ -826,21 +880,211 @@ def test_recovery_uses_visible_path_mismatch_for_nonempty_wrong_terminal_answer(
         return fake_executor(functions, target)
 
     demos = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)
-    assert [demo.family for demo in demos] == ["semantic_frontier_recovery"]
-    semantic_prunes = [
-        step for step in demos[0].steps
-        if step.action == "Prune"
-        and any(
-            fact.startswith("question_path_mismatch:")
-            for fact in step.rationale_facts
-        )
+    assert [demo.family for demo in demos] == [
+        "non_destructive_nonempty_recovery"
     ]
-    assert semantic_prunes
-    rendered = str(trajectory_sft_record(demos[0]))
-    assert "visible relation path conflicts" in rendered
+    assert all(step.action != "Prune" for step in demos[0].steps)
+    intervention = next(
+        step for step in demos[0].steps if step.supervision == "intervention"
+    )
+    assert intervention.action == "Select"
+    return_select = next(
+        step
+        for step in demos[0].steps
+        if "switch_while_preserving_unresolved_probe" in step.rationale_facts
+    )
+    unresolved = {
+        node.hypothesis_id
+        for node in demos[0].hypotheses.values()
+        if node.parent_id == intervention.arguments[0] and node.denotation
+    }
+    assert unresolved.intersection(return_select.visible_before)
+    trajectory = trajectory_sft_record(demos[0])
+    rendered = str(trajectory)
+    assert "still unresolved" in rendered
+    forced_text = f"Select [ {intervention.arguments[0]} ]"
+    forced_messages = [
+        message
+        for message in trajectory["messages"]
+        if forced_text in message.get("content", "")
+    ]
+    assert len(forced_messages) == 1
+    assert forced_messages[0]["loss_mask"] == 0
     assert DemonstrationValidator(
         nonempty_wrong_executor, max_active=6
     ).validate(demos[0]) == []
+    decisions = decision_sft_records(demos[0])
+    targets = [row["messages"][-1]["content"] for row in decisions]
+    assert all(forced_text not in target for target in targets)
+
+
+def test_answer_exact_natural_alternative_is_not_pruned_or_called_complete():
+    row = {
+        "ID": "answer-exact-alternative",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "r.alt1" in text and "r.natural" in text:
+            return ["m.answer"]
+        return fake_executor(functions, target)
+
+    def provider(query, state, join):
+        if "r.alt1" in "\n".join(state):
+            return [
+                RelationOption("r.natural", 0.95, 1),
+                RelationOption("r.alt2", 0.80, 2),
+            ]
+        return candidates(query, state, join)
+
+    builder = DemonstrationBuilder(executor, provider)
+    demo = builder.build(row)[0]
+
+    assert demo.family == "non_destructive_nonempty_recovery"
+    natural = next(
+        node
+        for node in demo.hypotheses.values()
+        if node.relation == "r.natural"
+    )
+    assert natural.denotation == demo.gold_answers
+    assert all(
+        not (step.action == "Prune" and step.arguments == (natural.hypothesis_id,))
+        for step in demo.steps
+    )
+    committed = next(step.arguments[0] for step in demo.steps if step.action == "Commit")
+    assert committed != natural.hypothesis_id
+    assert builder.stats["recovery_answer_exact_without_intent_proof"] == 1
+
+
+def test_answer_equality_does_not_prove_logical_program_equivalence():
+    gold = [
+        "expression1 = START('m.topic')",
+        "expression1 = JOIN('r.gold', expression1)",
+    ]
+    spurious = [
+        "expression1 = START('m.topic')",
+        "expression1 = JOIN('r.detour', expression1)",
+    ]
+
+    assert not programs_are_intent_equivalent(
+        spurious, "expression1", gold, "expression1"
+    )
+    certificate = certify_program_commit(
+        spurious,
+        "expression1",
+        ["m.answer"],
+        gold,
+        "expression1",
+        ["m.answer"],
+    )
+    assert certificate.answer_exact
+    assert not certificate.intent_equivalent
+    assert not certificate.valid
+
+
+def test_conjunctive_equivalence_ignores_association_and_duplicate_atoms():
+    left_associated = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a', expression0)",
+        "expression2 = JOIN('r.b', expression0)",
+        "expression3 = AND(expression1, expression2)",
+        "expression4 = JOIN('r.c', expression0)",
+        "expression5 = AND(expression3, expression4)",
+    ]
+    right_associated = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a', expression0)",
+        "expression2 = JOIN('r.b', expression0)",
+        "expression3 = JOIN('r.c', expression0)",
+        "expression4 = AND(expression2, expression3)",
+        "expression5 = AND(expression1, expression4)",
+    ]
+    one_branch = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a', expression0)",
+    ]
+    duplicate_branch = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a', expression0)",
+        "expression2 = JOIN('r.a', expression0)",
+        "expression3 = AND(expression1, expression2)",
+    ]
+
+    assert programs_are_intent_equivalent(
+        left_associated, "expression5", right_associated, "expression5"
+    )
+    assert programs_are_intent_equivalent(
+        one_branch, "expression1", duplicate_branch, "expression3"
+    )
+
+
+def test_conjunctive_equivalence_rejects_missing_or_reversed_constraints():
+    conjunction = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a', expression0)",
+        "expression2 = JOIN('r.b', expression0)",
+        "expression3 = AND(expression1, expression2)",
+    ]
+    missing = conjunction[:2]
+    reversed_relation = [
+        "expression0 = START('m.topic')",
+        "expression1 = JOIN('r.a_reverse', expression0)",
+    ]
+
+    assert not programs_are_intent_equivalent(
+        missing, "expression1", conjunction, "expression3"
+    )
+    assert not programs_are_intent_equivalent(
+        reversed_relation, "expression1", missing, "expression1"
+    )
+
+
+def test_validator_rejects_same_answer_commit_with_wrong_logical_program():
+    row = {
+        "ID": "spurious-commit",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, _target):
+        text = "\n".join(functions)
+        if "r.gold" in text or "r.detour" in text:
+            return ["m.answer"]
+        return []
+
+    def options(*_args):
+        return [
+            RelationOption("r.gold", 0.9, 1),
+            RelationOption("r.detour", 0.8, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, options).build(row)[0]
+    committed_id = next(
+        step.arguments[0] for step in demo.steps if step.action == "Commit"
+    )
+    committed = demo.hypotheses[committed_id]
+    demo.hypotheses[committed_id] = replace(
+        committed,
+        function_state=(
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.detour', expression1)",
+        ),
+        relation="r.detour",
+    )
+
+    errors = DemonstrationValidator(executor).validate(demo)
+    assert any("lacks exact answer-and-intent proof" in error for error in errors)
 
 
 def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
@@ -869,7 +1113,7 @@ def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
     demo = builder.build(row)[0]
 
     assert demo.family == "adaptive_frontier_widen"
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Find_relation", "Widen", "Widen", "Commit"
     ]
     assert demo.private_metadata["gold_rank"] == 13
@@ -879,9 +1123,9 @@ def test_widen_recovers_a_naturally_ranked_relation_outside_initial_frontier():
     assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
     rendered = trajectory_sft_record(demo)
     rendered_text = str(rendered["messages"])
-    assert "exposed=6/14 next_page=6" in rendered_text
-    assert "exposed=12/14 next_page=2" in rendered_text
-    assert "exposed=14/14 next_page=none" in rendered_text
+    assert "source=m.topic exposed=6/14" in rendered_text
+    assert "source=m.topic exposed=12/14" in rendered_text
+    assert "source=m.topic exposed=14/14" in rendered_text
     assert any(
         "Widen [ m.topic ]" in message["content"]
         for message in rendered["messages"]
@@ -925,7 +1169,8 @@ def test_widen_also_applies_to_a_selected_hypothesis_continuation():
     assert [step.action for step in demo.steps].count("Widen") == 1
     widen = next(step for step in demo.steps if step.action == "Widen")
     assert widen.arguments == ("expression1",)
-    assert len(widen.created) == 2
+    assert widen.created == ()
+    assert len(widen.exposed) == 2
     assert all(step.action != "Prune" for step in demo.steps)
     assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
@@ -966,7 +1211,7 @@ def test_plausible_frontier_is_not_pruned_for_capacity():
     assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
 
-def test_capacity_eviction_is_rejected_when_frontier_is_not_full():
+def test_fake_semantic_prune_is_rejected_without_a_certificate():
     row = {
         "ID": "capacity-rationale-too-early",
         "question": "Which answer follows both intended relations?",
@@ -985,24 +1230,36 @@ def test_capacity_eviction_is_rejected_when_frontier_is_not_full():
         return fake_executor(functions, target)
 
     demo = DemonstrationBuilder(nonempty_wrong_executor, candidates).build(row)[0]
-    prune_index = next(
-        index
-        for index, step in enumerate(demo.steps)
-        if step.action == "Prune"
-        and any(
-            fact.startswith("question_path_mismatch:")
-            for fact in step.rationale_facts
-        )
-    )
     bad_steps = list(demo.steps)
-    bad_steps[prune_index] = replace(
-        bad_steps[prune_index], rationale_facts=("frontier_capacity_eviction",)
+    return_index = next(
+        index
+        for index, step in enumerate(bad_steps)
+        if "switch_while_preserving_unresolved_probe" in step.rationale_facts
+    )
+    return_step = bad_steps[return_index]
+    nonempty_probe = next(
+        node_id
+        for node_id in return_step.visible_before
+        if demo.hypotheses[node_id].parent_id is not None
+        and demo.hypotheses[node_id].denotation
+    )
+    bad_steps.insert(
+        return_index,
+        replace(
+            return_step,
+            action="Prune",
+            arguments=(nonempty_probe,),
+            created=(),
+            rationale_facts=("question_path_mismatch:r.alt1",),
+            certificate_kind=None,
+            certificate_evidence=(),
+        ),
     )
 
     errors = DemonstrationValidator(
         nonempty_wrong_executor, max_active=6
     ).validate(replace(demo, steps=bad_steps))
-    assert any("capacity eviction" in error and "not full" in error for error in errors)
+    assert any("public contradiction certificate" in error for error in errors)
 
 
 def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget():
@@ -1022,18 +1279,51 @@ def test_builder_rejects_trajectories_that_cannot_finish_within_rollout_budget()
     assert builder.stats["trajectory_turn_budget_miss"] == 1
 
 
-def test_builder_requires_room_for_two_complete_relation_frontiers():
-    try:
-        DemonstrationBuilder(
-            fake_executor,
-            candidates,
-            frontier_width=3,
-            max_active=5,
-        )
-    except ValueError as exc:
-        assert "two complete relation frontiers" in str(exc)
-    else:
-        raise AssertionError("multi-root curriculum must fit both full frontiers")
+def test_action_budget_does_not_reserve_the_separate_answer_generation():
+    row = {
+        "ID": "exact-action-budget",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.answer"],
+        "candidate_entity_map": {"m.topic": "Topic"},
+    }
+
+    def executor(functions, target):
+        del target
+        return ["m.answer"] if "r.gold1" in "\n".join(functions) else []
+
+    def provider(query, state, join):
+        del query, state
+        return [RelationOption(join.relation, 0.9, 1)]
+
+    # Find_relation, Inspect, Commit occupy the three action turns. Runtime
+    # generates the answer afterwards, outside max_turns.
+    builder = DemonstrationBuilder(
+        executor,
+        provider,
+        max_turns=3,
+    )
+    audit = builder._audit_gold_program_proposals(
+        row["question"], compile_gold_plan(row["function_list"])
+    )
+
+    assert audit["required_actions"] == 3
+    assert audit["required_turns_with_answer"] == 4
+    assert audit["budget_checks"]["turns"] is True
+    assert audit["runtime_reachable"] is True
+
+
+def test_symbolic_relation_pages_do_not_consume_active_hypothesis_slots():
+    builder = DemonstrationBuilder(
+        fake_executor,
+        candidates,
+        frontier_width=3,
+        max_active=5,
+    )
+    assert builder.max_active == 5
 
 
 def test_gold_is_never_injected_when_proposal_frontier_misses_it():
@@ -1090,7 +1380,7 @@ def test_candidate_queries_use_only_question_visible_intent():
     )
 
 
-def test_builder_resolves_entity_labels_and_uses_stable_nonpositional_order():
+def test_builder_resolves_oracle_root_labels_and_excludes_linker_distractors():
     row = {
         "ID": "readable-roots",
         "question": "Which answer follows the intended relation?",
@@ -1128,14 +1418,75 @@ def test_builder_resolves_entity_labels_and_uses_stable_nonpositional_order():
     assert first.private_metadata["candidate_entities"] == second.private_metadata[
         "candidate_entities"
     ]
-    assert set(first.private_metadata["candidate_entities"]) == {
-        ("Topic Entity", "m.topic"),
-        ("Other Entity", "m.other"),
-    }
+    assert first.private_metadata["candidate_entities"] == [
+        ("Topic Entity", "m.topic")
+    ]
     rendered = str(trajectory_sft_record(first))
     assert "Topic Entity" in rendered
+    assert "Other Entity" not in rendered
     assert "Answer Entity [m.gold_prefix]" in rendered
     assert "'m.topic' (m.topic)" not in rendered
+    assert first.private_metadata["root_entity_provenance"] == "oracle_gold_program"
+
+
+def test_production_builder_uses_gold_program_as_oracle_entity_link():
+    row = {
+        "ID": "missing-linker-root",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+
+    builder = _DemonstrationBuilder(fake_executor, one_hop_candidates)
+    demo = builder.build(row)[0]
+
+    assert demo.private_metadata["candidate_entities"] == [("m.topic", "m.topic")]
+    assert demo.private_metadata["root_entity_provenance"] == "oracle_gold_program"
+    assert builder.stats["oracle_root_entities_used"] == 1
+
+
+def test_full_program_proposal_audit_applies_the_complete_lazy_runtime_budget():
+    functions = [
+        "expression1 = START('m.topic')",
+        "expression1 = JOIN('r.first', expression1)",
+        "expression1 = JOIN('r.deep', expression1)",
+    ]
+
+    def provider(_question, _state, decision):
+        if decision.relation == "r.first":
+            return [
+                RelationOption("r.first", 0.99, 1),
+                RelationOption("r.other", 0.98, 2),
+            ]
+        options = [
+            RelationOption(f"r.other{index}", 1.0 - index / 100, index)
+            for index in range(1, 13)
+        ]
+        options.append(RelationOption("r.deep", 0.1, 13))
+        return options
+
+    builder = _DemonstrationBuilder(
+        fake_executor,
+        provider,
+        max_active=12,
+        max_nodes=12,
+        max_turns=8,
+    )
+    audit = builder._audit_gold_program_proposals(
+        "question", compile_gold_plan(functions)
+    )
+
+    assert audit["all_relations_present"] is True
+    assert audit["all_relations_within_budget"] is False
+    assert audit["runtime_reachable"] is False
+    assert audit["budget_checks"]["turns"] is False
+    assert audit["decisions"][1]["rank"] == 13
+    assert audit["decisions"][1]["pages_required"] == 3
+    assert builder.stats["gold_program_relation_present"] == 2
+    assert builder.stats["gold_program_runtime_reachable"] == 0
 
 
 def test_builder_never_exposes_gold_types_as_candidate_entities():
@@ -1176,7 +1527,7 @@ def test_builder_never_exposes_gold_types_as_candidate_entities():
     demo = DemonstrationBuilder(executor, options).build(row)[0]
 
     assert demo.family == "frontier_commit"
-    assert [step.action for step in demo.steps] == [
+    assert semantic_actions(demo) == [
         "Find_relation",
         "Select",
         "Merge",
@@ -1270,16 +1621,21 @@ def test_conjunction_requires_both_branches():
     }
     demos = DemonstrationBuilder(fake_executor, candidates).build(row)
     conjunction = next(demo for demo in demos if demo.family == "conjunction")
-    assert [step.action for step in conjunction.steps] == [
+    assert semantic_actions(conjunction) == [
         "Find_relation", "Combine", "Commit"
     ]
     assert DemonstrationValidator(fake_executor, max_active=6).validate(conjunction) == []
 
     bad_steps = list(conjunction.steps)
-    bad_steps[1] = replace(bad_steps[1], arguments=("H0", "H1"))
+    combine_index = next(
+        index for index, step in enumerate(bad_steps) if step.action == "Combine"
+    )
+    bad_steps[combine_index] = replace(
+        bad_steps[combine_index], arguments=("H0", "H1")
+    )
     malformed = replace(conjunction, steps=bad_steps)
     assert any(
-        "do not match required branches" in error
+        "wrong parents" in error
         for error in DemonstrationValidator(fake_executor, max_active=6).validate(malformed)
     )
 
@@ -1414,7 +1770,7 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
 
     assert len(typed) == 1
     conjunction = typed[0]
-    assert [step.action for step in conjunction.steps] == [
+    assert semantic_actions(conjunction) == [
         "Find_relation",
         "Find_relation",
         "Combine",
@@ -1422,8 +1778,10 @@ def test_builds_two_root_conjunction_followed_by_answer_type_constraint():
         "Merge",
         "Commit",
     ]
-    assert conjunction.steps[0].arguments == ("m.school_a",)
-    assert conjunction.steps[1].arguments == ("m.school_b",)
+    roots = [
+        step.arguments for step in conjunction.steps if step.action == "Find_relation"
+    ]
+    assert roots[:2] == [("m.school_a",), ("m.school_b",)]
     assert DemonstrationValidator(two_root_executor, max_active=6).validate(conjunction) == []
 
 
@@ -1470,13 +1828,13 @@ def test_builds_typed_public_deep_conjunction_from_two_multihop_roots():
             return ["m.right_prefix"]
         return []
 
-    builder = DemonstrationBuilder(executor, provider, max_turns=14)
+    builder = DemonstrationBuilder(executor, provider, max_turns=32)
     demos = builder.build(row)
     deep = [demo for demo in demos if demo.family == "deep_conjunction_progress"]
 
     assert len(deep) == 1
     assert [step.action for step in deep[0].steps].count("Find_relation") == 4
-    assert [step.action for step in deep[0].steps][-4:] == [
+    assert semantic_actions(deep[0])[-4:] == [
         "Combine",
         "Select",
         "Merge",
@@ -1524,16 +1882,14 @@ def test_deep_conjunction_can_continue_after_combining_branches():
             return ["m.left_prefix"]
         return []
 
-    builder = DemonstrationBuilder(executor, provider, max_turns=14)
+    builder = DemonstrationBuilder(executor, provider, max_turns=32)
     demos = builder.build(row)
     deep = [demo for demo in demos if demo.family == "deep_conjunction_progress"]
 
     assert len(deep) == 1
-    actions = [step.action for step in deep[0].steps]
+    actions = semantic_actions(deep[0])
     combine_index = actions.index("Combine")
-    continuation = [
-        action for action in actions[combine_index + 1 :] if action != "Prune"
-    ]
+    continuation = [action for action in actions[combine_index + 1 :] if action != "Prune"]
     assert continuation[:2] == ["Select", "Find_relation"]
     assert actions[-1] == "Commit"
     assert DemonstrationValidator(executor, max_active=6).validate(deep[0]) == []

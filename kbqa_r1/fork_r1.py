@@ -82,6 +82,7 @@ def relation_name(selected: Any) -> str:
     return str(
         getattr(selected, "relation_id", None)
         or getattr(selected, "relation_name", None)
+        or getattr(selected, "relation", None)
         or ""
     )
 
@@ -133,13 +134,17 @@ def build_fork_decision(
     entities: Iterable[Sequence[str]] = (),
     prompt: str = "",
     raw_action: str,
+    require_sibling: bool = True,
 ) -> Optional[ForkDecision]:
     chosen = relation_name(selected_relation)
     ranked = ranked_candidates(candidates, scores)
     sibling = choose_hard_sibling(chosen, ranked)
-    if not chosen or sibling is None:
+    if not chosen or (require_sibling and sibling is None):
         return None
     chosen_score = next((item.score for item in ranked if item.relation == chosen), 0.0)
+    resolver_margin = (
+        chosen_score - sibling.score if sibling is not None else float("inf")
+    )
     return ForkDecision(
         sample_id=sample_id,
         turn=turn,
@@ -149,7 +154,7 @@ def build_fork_decision(
         relation_prompt=relation_prompt,
         chosen_relation=chosen,
         ranked_relations=tuple(ranked),
-        resolver_margin=chosen_score - sibling.score,
+        resolver_margin=resolver_margin,
         state_before=tuple(state_before),
         expression_counter=int(expression_counter),
         entities=tuple((str(entity[0]), str(entity[1])) for entity in entities),

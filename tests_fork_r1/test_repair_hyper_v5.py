@@ -3,7 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pandas as pd
+import pytest
 
 from kbqa_r1.hyper_data import (
     DemonstrationStep,
@@ -79,43 +79,19 @@ def test_repair_leaves_empty_and_semantic_mismatch_prunes_unchanged():
     assert counts["semantic_recovery_mismatch_unchanged"] == 1
 
 
-def test_export_accepts_jsonl_gz_writes_sft_parquets_and_split_report(tmp_path):
+def test_export_rejects_uncertified_v5_corpus(tmp_path):
     source = tmp_path / "demonstrations.jsonl.gz"
     with gzip.open(source, "wt", encoding="utf-8") as handle:
         handle.write(json.dumps(_demo("adaptive_frontier_widen", "question_path_mismatch:r.alt").to_dict()))
         handle.write("\n")
     output = tmp_path / "repaired"
 
-    report = MODULE.export_repaired_corpus(source, output)
-
-    assert report["converted_total"] == 1
-    assert report["graph_execution_performed"] is False
-    assert report["assertions"] == {
-        "only_rationale_facts_changed": True,
-        "actions_unchanged": True,
-        "question_disjoint_train_validation": True,
-    }
-    for filename in (
-        "demonstrations.jsonl",
-        "train.parquet",
-        "validation.parquet",
-        "train_decision.parquet",
-        "validation_decision.parquet",
-        "repair_report.json",
-    ):
-        assert (output / filename).exists()
-
-    messages = pd.read_parquet(
-        output / "train_decision.parquet", columns=["messages"]
-    )["messages"]
-    assert {
-        type(message["loss_mask"])
-        for conversation in messages
-        for message in conversation
-    } == {int}
+    with pytest.raises(RuntimeError, match="cannot be made proof-carrying"):
+        MODULE.export_repaired_corpus(source, output)
+    assert not output.exists()
 
 
-def test_export_carries_forward_audited_report_with_repair_record(tmp_path):
+def test_uncertified_v5_export_cannot_preserve_stale_ready_status(tmp_path):
     source = tmp_path / "demonstrations.jsonl.gz"
     with gzip.open(source, "wt", encoding="utf-8") as handle:
         handle.write(
@@ -142,12 +118,6 @@ def test_export_carries_forward_audited_report_with_repair_record(tmp_path):
     )
     output = tmp_path / "repaired"
 
-    repair = MODULE.export_repaired_corpus(source, output, source_report)
-    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
-
-    assert report["quality_assessment"]["structurally_ready_for_sft"] is True
-    assert report["capacity_rationale_repair"] == repair
-    assert report["training_demonstrations"] == repair["train_trajectory_rows"]
-    assert report["sft_rows"] == repair["train_trajectory_rows"]
-    assert report["decision_sft_rows"] == repair["train_decision_rows"]
-    assert report["validation_rows"] == repair["validation_trajectory_rows"]
+    with pytest.raises(RuntimeError, match="rebuild the corpus"):
+        MODULE.export_repaired_corpus(source, output, source_report)
+    assert not (output / "report.json").exists()

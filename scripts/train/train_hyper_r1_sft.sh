@@ -19,17 +19,18 @@ import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-if report.get("quality_schema") != "hyper_r1_v7_paged_operators":
+if report.get("quality_schema") != "hyper_r1_v12_public_count_prune_parity":
     raise SystemExit(
-        "HyPER-R1 corpus predates exhaustive relation paging and runtime operators; "
+        "HyPER-R1 corpus predates public Count-aware Prune parity; "
         "rebuild it."
     )
 expected_contract = {
     "relation_page_size": 6,
     "relation_rank_cutoff": None,
     "max_active": 24,
-    "max_nodes": 24,
-    "max_turns": 16,
+    "max_nodes": 128,
+    "max_execution_attempts": 24,
+    "max_turns": 32,
 }
 contract_mismatches = {
     key: {"expected": expected, "actual": report.get(key)}

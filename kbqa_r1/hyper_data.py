@@ -15,7 +15,15 @@ import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .hyper_prompt import build_hyper_prompt, question_candidate_literals
-from .hyper_r1 import combine_function_states, relation_path, serialize_frontier
+from .hyper_r1 import (
+    PruneCertificate,
+    combine_function_states,
+    public_empty_prune_certificate,
+    public_question_contract,
+    relation_path,
+    serialize_frontier,
+    validate_public_prune_certificate,
+)
 from .relation_paging import relation_page, serialize_relation_page_state
 
 
@@ -297,8 +305,341 @@ def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
     return GoldPlan(tuple(statements), tuple(executable), final_target)
 
 
+def logical_program_signature(
+    function_list: Sequence[str], target_expression: Optional[str] = None
+) -> Tuple[Any, ...]:
+    """Return a variable-name-independent logical signature for one result.
+
+    Denotation equality is not semantic equivalence: two different Freebase
+    programs can happen to return the same entities.  This signature preserves
+    roots, directed relations, branch structure, and logical operators while
+    ignoring expression names and the order of conjunction operands.
+    """
+    plan = compile_gold_plan(function_list)
+    target = str(target_expression or plan.target_expression)
+    statements = tuple(
+        statement for statement in plan.statements if statement.kind != "stop"
+    )
+
+    def definition(expression: str, before: int) -> ProgramStatement:
+        match = next(
+            (
+                statement
+                for statement in reversed(statements)
+                if statement.index < before and statement.target == expression
+            ),
+            None,
+        )
+        if match is None:
+            raise IneligibleProgram(
+                f"logical target {expression} has no definition before {before}"
+            )
+        return match
+
+    def visit(expression: str, before: int) -> Tuple[Any, ...]:
+        statement = definition(expression, before)
+        if statement.kind == "start":
+            return ("start", statement.arguments[0])
+        if statement.kind == "join":
+            if statement.sources:
+                source = visit(statement.sources[0], statement.index)
+            else:
+                source = ("literal", statement.arguments[1].strip("'"))
+            return ("join", statement.relation, source)
+        if statement.kind == "and":
+            branches = sorted(
+                (visit(source, statement.index) for source in statement.sources),
+                key=repr,
+            )
+            return ("and", *branches)
+        if statement.kind == "order":
+            mode, source, relation = statement.arguments
+            return ("order", mode, relation, visit(source, statement.index))
+        if statement.kind == "compare":
+            mode, relation, source = statement.arguments
+            return ("compare", mode, relation, visit(source, statement.index))
+        if statement.kind == "time_constraint":
+            relation, time = statement.arguments
+            return (
+                "time_constraint",
+                relation,
+                time,
+                visit(statement.sources[0], statement.index),
+            )
+        if statement.kind == "count":
+            return ("count", visit(statement.sources[0], statement.index))
+        raise IneligibleProgram(f"unsupported logical signature kind {statement.kind}")
+
+    return visit(target, len(plan.statements) + 1)
+
+
+@dataclass(frozen=True)
+class _ConjunctiveQuery:
+    head: Tuple[str, str]
+    atoms: Tuple[Tuple[str, Tuple[str, str], Tuple[str, str]], ...]
+
+
+def _signature_to_conjunctive_query(
+    signature: Tuple[Any, ...]
+) -> _ConjunctiveQuery:
+    """Compile the supported set-valued fragment into a conjunctive query."""
+    next_variable = 0
+    atoms: List[Tuple[str, Tuple[str, str], Tuple[str, str]]] = []
+    parent: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    def variable() -> Tuple[str, str]:
+        nonlocal next_variable
+        value = ("var", f"v{next_variable}")
+        next_variable += 1
+        parent[value] = value
+        return value
+
+    def constant(value: Any) -> Tuple[str, str]:
+        return ("const", str(value))
+
+    def find(term: Tuple[str, str]) -> Tuple[str, str]:
+        if term[0] == "const":
+            return term
+        root = parent.setdefault(term, term)
+        while parent[root] != root:
+            root = parent[root]
+        cursor = term
+        while parent[cursor] != cursor:
+            following = parent[cursor]
+            parent[cursor] = root
+            cursor = following
+        return root
+
+    def substitute(old: Tuple[str, str], new: Tuple[str, str]) -> None:
+        nonlocal atoms
+        atoms = [
+            (
+                relation,
+                new if left == old else left,
+                new if right == old else right,
+            )
+            for relation, left, right in atoms
+        ]
+
+    def unify(left: Tuple[str, str], right: Tuple[str, str]) -> Tuple[str, str]:
+        left = find(left)
+        right = find(right)
+        if left == right:
+            return left
+        if left[0] == "const" and right[0] == "const":
+            raise IneligibleProgram("conjunction equates two distinct constants")
+        if left[0] == "const":
+            substitute(right, left)
+            parent[right] = right
+            return left
+        if right[0] == "const":
+            substitute(left, right)
+            parent[left] = left
+            return right
+        parent[right] = left
+        substitute(right, left)
+        return left
+
+    def visit(node: Tuple[Any, ...]) -> Tuple[str, str]:
+        kind = node[0]
+        if kind in {"start", "literal"}:
+            return constant(node[1])
+        if kind == "join":
+            source = visit(node[2])
+            output = variable()
+            atoms.append((f"JOIN:{node[1]}", output, source))
+            return output
+        if kind == "and":
+            if len(node) < 3:
+                raise IneligibleProgram("AND requires two branches")
+            output = visit(node[1])
+            for branch in node[2:]:
+                output = unify(output, visit(branch))
+            return output
+        if kind == "compare":
+            output = variable()
+            source = visit(node[3])
+            atoms.append((f"COMPARE:{node[1]}:{node[2]}", output, source))
+            return output
+        if kind == "time_constraint":
+            output = visit(node[3])
+            atoms.append(
+                (
+                    f"TIME:{node[1]}",
+                    output,
+                    constant(node[2]),
+                )
+            )
+            return output
+        raise IneligibleProgram(f"{kind} is outside the conjunctive-query fragment")
+
+    head = find(visit(signature))
+    normalized_atoms = {
+        (relation, find(left), find(right))
+        for relation, left, right in atoms
+    }
+    return _ConjunctiveQuery(
+        head=head,
+        atoms=tuple(sorted(normalized_atoms, key=repr)),
+    )
+
+
+def _has_query_homomorphism(
+    source: _ConjunctiveQuery, target: _ConjunctiveQuery
+) -> bool:
+    """Return whether ``source`` maps homomorphically into ``target``."""
+    mapping: Dict[Tuple[str, str], Tuple[str, str]] = {}
+
+    def bind(
+        source_term: Tuple[str, str], target_term: Tuple[str, str]
+    ) -> Optional[Dict[Tuple[str, str], Tuple[str, str]]]:
+        if source_term[0] == "const":
+            return {} if source_term == target_term else None
+        existing = mapping.get(source_term)
+        if existing is not None:
+            return {} if existing == target_term else None
+        return {source_term: target_term}
+
+    initial = bind(source.head, target.head)
+    if initial is None:
+        return False
+    mapping.update(initial)
+    target_by_relation: Dict[
+        str, List[Tuple[str, Tuple[str, str], Tuple[str, str]]]
+    ] = {}
+    for atom in target.atoms:
+        target_by_relation.setdefault(atom[0], []).append(atom)
+
+    ordered = sorted(
+        source.atoms,
+        key=lambda atom: (len(target_by_relation.get(atom[0], ())), repr(atom)),
+    )
+
+    def search(index: int) -> bool:
+        if index == len(ordered):
+            return True
+        relation, source_left, source_right = ordered[index]
+        for _, target_left, target_right in target_by_relation.get(relation, ()):
+            additions: Dict[Tuple[str, str], Tuple[str, str]] = {}
+            valid = True
+            for source_term, target_term in (
+                (source_left, target_left),
+                (source_right, target_right),
+            ):
+                if source_term[0] == "const":
+                    if source_term != target_term:
+                        valid = False
+                        break
+                    continue
+                existing = mapping.get(source_term)
+                if existing is not None and existing != target_term:
+                    valid = False
+                    break
+                if existing is None:
+                    pending = additions.get(source_term)
+                    if pending is not None and pending != target_term:
+                        valid = False
+                        break
+                    additions[source_term] = target_term
+            if not valid:
+                continue
+            mapping.update(additions)
+            if search(index + 1):
+                return True
+            for term in additions:
+                mapping.pop(term, None)
+        return False
+
+    return search(0)
+
+
+def _signatures_are_formally_equivalent(
+    left: Tuple[Any, ...], right: Tuple[Any, ...]
+) -> bool:
+    if left == right:
+        return True
+    if left[0] == right[0] == "count":
+        return _signatures_are_formally_equivalent(left[1], right[1])
+    if left[0] == right[0] == "order":
+        return (
+            left[1:3] == right[1:3]
+            and _signatures_are_formally_equivalent(left[3], right[3])
+        )
+    try:
+        left_query = _signature_to_conjunctive_query(left)
+        right_query = _signature_to_conjunctive_query(right)
+    except IneligibleProgram:
+        return False
+    # Q1 is contained in Q2 iff there is a homomorphism from Q2 to Q1.
+    return _has_query_homomorphism(left_query, right_query) and _has_query_homomorphism(
+        right_query, left_query
+    )
+
+
+def programs_are_intent_equivalent(
+    candidate_functions: Sequence[str],
+    candidate_target: str,
+    gold_functions: Sequence[str],
+    gold_target: str,
+) -> bool:
+    """Conservatively prove supported-query equivalence.
+
+    Conjunctive programs use bidirectional query containment. Aggregating or
+    ordering operators must match exactly and recurse into equivalent inputs.
+    Unsupported constructs fail closed.
+    """
+    try:
+        candidate = logical_program_signature(candidate_functions, candidate_target)
+        gold = logical_program_signature(gold_functions, gold_target)
+        return _signatures_are_formally_equivalent(candidate, gold)
+    except IneligibleProgram:
+        return False
+
+
+@dataclass(frozen=True)
+class ProgramCommitCertificate:
+    answer_exact: bool
+    intent_equivalent: bool
+
+    @property
+    def valid(self) -> bool:
+        return self.answer_exact and self.intent_equivalent
+
+
+def certify_program_commit(
+    candidate_functions: Sequence[str],
+    candidate_target: str,
+    candidate_answers: Sequence[str],
+    gold_functions: Sequence[str],
+    gold_target: str,
+    gold_answers: Sequence[str],
+) -> ProgramCommitCertificate:
+    """Require both denotational correctness and formal query equivalence."""
+    return ProgramCommitCertificate(
+        answer_exact=(
+            normalize_values(candidate_answers) == normalize_values(gold_answers)
+        ),
+        intent_equivalent=programs_are_intent_equivalent(
+            candidate_functions,
+            candidate_target,
+            gold_functions,
+            gold_target,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class RelationOption:
+    relation: str
+    score: float
+    rank: int
+
+
+@dataclass(frozen=True)
+class RelationProposal:
+    proposal_id: str
+    frontier_id: str
+    source: str
     relation: str
     score: float
     rank: int
@@ -336,6 +677,10 @@ class DemonstrationStep:
     created: Tuple[str, ...] = ()
     rationale_facts: Tuple[str, ...] = ()
     relation_page: Tuple[int, int, int] = ()
+    supervision: str = "policy_target"
+    certificate_kind: Optional[str] = None
+    certificate_evidence: Tuple[str, ...] = ()
+    exposed: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -348,6 +693,7 @@ class HyperDemonstration:
     steps: List[DemonstrationStep]
     gold_answers: Tuple[str, ...]
     private_metadata: Dict[str, Any] = field(default_factory=dict)
+    proposals: Dict[str, RelationProposal] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -358,6 +704,7 @@ class HyperDemonstration:
             "hypotheses": {key: asdict(value) for key, value in self.hypotheses.items()},
             "steps": [asdict(step) for step in self.steps],
             "gold_answers": list(self.gold_answers),
+            "proposals": {key: asdict(value) for key, value in self.proposals.items()},
             "private_metadata": self.private_metadata,
         }
 
@@ -379,6 +726,17 @@ def replace_join_relation(raw: str, relation: str) -> str:
         raise ValueError(f"not a JOIN statement: {raw}")
     _, source = join.groups()
     return f"{target} = JOIN('{relation}', {source})"
+
+
+def replace_join_relation_and_source(
+    raw: str, relation: str, source_expression: str
+) -> str:
+    """Apply a relation to the selected runtime hypothesis expression."""
+    match = _ASSIGNMENT.match(raw)
+    if not match or not _JOIN.match(match.group(2)):
+        raise ValueError(f"not a JOIN statement: {raw}")
+    target = match.group(1)
+    return f"{target} = JOIN('{relation}', {source_expression})"
 
 
 def _join_source(raw: str) -> str:
@@ -445,30 +803,40 @@ class DemonstrationBuilder:
         executor: ProgramExecutor,
         candidate_provider: CandidateProvider,
         max_active: int = 24,
-        max_nodes: int = 24,
+        max_nodes: int = 128,
+        max_execution_attempts: int = 24,
         frontier_width: int = 6,
-        max_turns: int = 16,
+        max_turns: int = 32,
         entity_display_provider: Optional[EntityDisplayProvider] = None,
     ):
         if frontier_width < 2:
             raise ValueError("frontier_width must permit alternatives")
-        if max_active < frontier_width * 2:
-            raise ValueError("max_active must hold two complete relation frontiers")
+        if max_active < 2:
+            raise ValueError("max_active must permit competing hypotheses")
         if max_nodes < max_active:
             raise ValueError("max_nodes must be at least max_active")
+        if max_execution_attempts < 1:
+            raise ValueError("max_execution_attempts must be positive")
         self.executor = executor
         self.candidate_provider = candidate_provider
         self.max_active = int(max_active)
         self.max_nodes = int(max_nodes)
+        self.max_execution_attempts = int(max_execution_attempts)
         self.frontier_width = int(frontier_width)
         self.max_turns = int(max_turns)
         self.entity_display_provider = entity_display_provider
         self._display_cache: Dict[str, str] = {}
-        if self.max_turns < 2:
-            raise ValueError("max_turns must include at least one action and the answer")
+        if self.max_turns < 1:
+            raise ValueError("max_turns must permit at least one executable policy action")
         self.stats: Counter = Counter()
         self._execution_cache: Dict[
             Tuple[Tuple[str, ...], str], Optional[Tuple[str, ...]]
+        ] = {}
+        self._proposal_cache: Dict[
+            Tuple[str, Tuple[str, ...], str], Tuple[RelationOption, ...]
+        ] = {}
+        self._proposal_state_cache: Dict[
+            Tuple[str, Tuple[str, ...]], Tuple[RelationOption, ...]
         ] = {}
 
     def _resolve_display_labels(self, values: Sequence[str]) -> None:
@@ -507,6 +875,195 @@ class DemonstrationBuilder:
         self._execution_cache[key] = result
         self.stats["execution_cache_miss"] += 1
         return result
+
+    def _ranked_options(
+        self,
+        question: str,
+        state_before: Sequence[str],
+        decision: ProgramStatement,
+    ) -> Tuple[RelationOption, ...]:
+        """Cache the inference-time proposal frontier for one visible state."""
+        key = (
+            str(question).strip(),
+            tuple(str(item) for item in state_before),
+            str(decision.raw),
+        )
+        if key not in self._proposal_cache:
+            self._proposal_cache[key] = tuple(
+                self.candidate_provider(key[0], key[1], decision)
+            )
+        self._proposal_state_cache[(key[0], key[1])] = self._proposal_cache[key]
+        return self._proposal_cache[key]
+
+    def _audit_gold_program_proposals(
+        self, question: str, plan: GoldPlan
+    ) -> Dict[str, Any]:
+        """Measure exact gold-program reachability under the lazy runtime budgets."""
+        decisions = []
+        for join in plan.joins:
+            source = join.sources[0] if join.sources else _join_source(join.raw)
+            state_before = self._dependency_state(plan, source, before=join.index)
+            options = self._ranked_options(question, state_before, join)
+            position = next(
+                (
+                    index
+                    for index, option in enumerate(options)
+                    if option.relation == join.relation
+                ),
+                None,
+            )
+            pages_required = (
+                position // self.frontier_width + 1
+                if position is not None
+                else None
+            )
+            decisions.append(
+                {
+                    "decision_index": join.index,
+                    "relation": join.relation,
+                    "rank": options[position].rank if position is not None else None,
+                    "position": position + 1 if position is not None else None,
+                    "present": position is not None,
+                    "pages_required": pages_required,
+                    "catalog_actions": pages_required,
+                    "inspection_actions": 1 if position is not None else None,
+                    "within_budget": bool(
+                        position is not None
+                        and (pages_required or 0) + 2 <= self.max_turns
+                    ),
+                }
+            )
+
+        all_present = bool(decisions) and all(row["present"] for row in decisions)
+        decision_by_index = {
+            join.index: row for join, row in zip(plan.joins, decisions)
+        }
+        expression_tokens: Dict[str, Optional[str]] = {}
+        active_tokens: set[str] = set()
+        next_token = 0
+        actions = 0
+        execution_attempts = 0
+        nodes = 0
+        peak_active = 0
+        supported = True
+
+        def new_token(target: str) -> str:
+            nonlocal next_token, nodes, peak_active
+            token = f"N{next_token}"
+            next_token += 1
+            nodes += 1
+            active_tokens.add(token)
+            expression_tokens[target] = token
+            peak_active = max(peak_active, len(active_tokens))
+            return token
+
+        for statement in plan.statements:
+            if statement.kind in {"stop"}:
+                continue
+            if statement.kind == "start":
+                previous = expression_tokens.get(statement.target)
+                if previous in active_tokens:
+                    active_tokens.remove(previous)
+                    actions += 1  # Park an overwritten unresolved branch.
+                expression_tokens[statement.target] = None
+                continue
+            if statement.kind == "join":
+                decision = decision_by_index[statement.index]
+                if not decision["present"]:
+                    supported = False
+                    continue
+                parent = (
+                    expression_tokens.get(statement.sources[0])
+                    if statement.sources
+                    else None
+                )
+                if parent is not None:
+                    actions += 1  # Select
+                actions += int(decision["pages_required"]) + 1  # Find/Widen + Inspect
+                execution_attempts += 1
+                child = new_token(statement.target)
+                if parent is not None and parent in active_tokens:
+                    active_tokens.remove(parent)
+                    actions += 1  # Park after opening the child catalog.
+                active_tokens.add(child)
+                peak_active = max(peak_active, len(active_tokens))
+                continue
+            if statement.kind == "and":
+                parents = [expression_tokens.get(source) for source in statement.sources]
+                executable_parents = [value for value in parents if value is not None]
+                if len(executable_parents) == 2:
+                    actions += 1  # Combine
+                elif len(executable_parents) == 1:
+                    actions += 2  # Select + ontology-type Merge
+                else:
+                    supported = False
+                    continue
+                execution_attempts += 1
+                active_tokens.difference_update(executable_parents)
+                new_token(statement.target)
+                continue
+            if statement.kind in {"order", "compare", "time_constraint", "count"}:
+                parent = expression_tokens.get(statement.sources[0])
+                if parent is not None:
+                    actions += 1  # Select
+                elif statement.kind not in {"order", "compare"}:
+                    supported = False
+                    continue
+                actions += 1
+                execution_attempts += 1
+                if parent is not None:
+                    active_tokens.discard(parent)
+                new_token(statement.target)
+                continue
+            supported = False
+
+        target = expression_tokens.get(plan.target_expression)
+        if target is None:
+            supported = False
+        else:
+            actions += 1  # Commit
+        # The runtime grants ``max_turns`` executable policy decisions and, if
+        # the rollout is still active, generates the answer in one separate
+        # answer-only turn.  Keep both numbers explicit so the oracle ceiling
+        # cannot silently reserve one fewer action than inference receives.
+        turns_with_answer = actions + 1
+        budget_checks = {
+            "turns": actions <= self.max_turns,
+            "execution_attempts": execution_attempts <= self.max_execution_attempts,
+            "stored_nodes": nodes <= self.max_nodes,
+            "active_workspace": peak_active <= self.max_active,
+        }
+        runtime_reachable = all_present and supported and all(budget_checks.values())
+        self.stats["gold_program_proposal_audit_rows"] += 1
+        self.stats["gold_program_proposal_decisions"] += len(decisions)
+        self.stats["gold_program_all_relations_present"] += int(all_present)
+        self.stats["gold_program_all_relations_within_budget"] += int(
+            runtime_reachable
+        )
+        self.stats["gold_program_runtime_reachable"] += int(runtime_reachable)
+        self.stats["gold_program_relation_present"] += sum(
+            row["present"] for row in decisions
+        )
+        self.stats["gold_program_relation_within_budget"] += sum(
+            row["within_budget"] for row in decisions
+        )
+        for name, passed in budget_checks.items():
+            self.stats[f"gold_program_{name}_budget_hit"] += int(passed)
+        return {
+            "decisions": decisions,
+            "all_relations_present": all_present,
+            # Backward-compatible key now means the complete lazy protocol,
+            # not a relation-rank cutoff tied to active-node capacity.
+            "all_relations_within_budget": runtime_reachable,
+            "runtime_reachable": runtime_reachable,
+            "supported_program": supported,
+            "required_actions": actions,
+            "required_turns_with_answer": turns_with_answer,
+            "required_execution_attempts": execution_attempts,
+            "required_stored_nodes": nodes,
+            "required_peak_active": peak_active,
+            "budget_checks": budget_checks,
+        }
 
     def _pages_through_required_relation(
         self,
@@ -559,6 +1116,22 @@ class DemonstrationBuilder:
         question = str(row.get("question") or row.get("original_question") or "").strip()
         question_id = str(row.get("ID") or row.get("id") or _digest(question))
         plan = compile_gold_plan(row.get("function_list") or ())
+        public_contract = public_question_contract(question)
+        gold_has_count = any(statement.kind == "count" for statement in plan.statements)
+        self.stats["public_count_contract_rows"] += 1
+        self.stats["gold_count_rows"] += int(gold_has_count)
+        self.stats["public_count_required_rows"] += int(
+            public_contract.count_required is True
+        )
+        if gold_has_count and public_contract.count_required is not True:
+            # A teacher action that runtime cannot license from public input is
+            # ineligible rather than silently relying on private gold syntax.
+            self.stats["public_count_contract_false_negative"] += 1
+            return []
+        if not gold_has_count and public_contract.count_required is True:
+            # Conservative false positives only preserve more empty branches;
+            # report them because they reduce useful Prune supervision.
+            self.stats["public_count_contract_false_positive"] += 1
         annotated = row.get("answer")
         if annotated is None:
             annotated = row.get("answers")
@@ -575,6 +1148,7 @@ class DemonstrationBuilder:
             return []
         if gold_answers and executed_gold != gold_answers:
             return []
+        proposal_audit = self._audit_gold_program_proposals(question, plan)
         intersection_demos: List[HyperDemonstration] = []
         semantic_branch_indexes = set()
         terminal_type = self._terminal_type_constraint(plan)
@@ -623,20 +1197,42 @@ class DemonstrationBuilder:
                 if constrained is not None:
                     constrained_demos.append(constrained)
             demos = constrained_demos
+        certified_demos = []
+        for demo in demos:
+            certified = self._certify_irreversible_actions(
+                demo, plan, gold_answers
+            )
+            if certified is None:
+                continue
+            runtime_demo = self._to_lazy_runtime_demo(certified)
+            if runtime_demo is not None:
+                certified_demos.append(runtime_demo)
+        demos = certified_demos
         within_budget = []
         for demo in demos:
             if len(demo.hypotheses) > self.max_nodes:
                 self.stats["trajectory_node_budget_miss"] += 1
                 continue
-            # Every graph action occupies one model turn and the committed
-            # answer occupies a final turn of its own.
-            if len(demo.steps) + 1 > self.max_turns:
+            # ``max_turns`` counts graph actions.  The runtime emits the final
+            # answer in a distinct, answer-only generation afterwards.
+            if len(demo.steps) > self.max_turns:
                 self.stats["trajectory_turn_budget_miss"] += 1
                 continue
             within_budget.append(demo)
         demos = within_budget
-        candidate_entities = self._row_candidate_entities(row, plan, question_id)
+        candidate_entities, root_provenance = self._row_candidate_entities(
+            row, plan, question_id
+        )
         candidate_literals = question_candidate_literals(question)
+        requires_entity_root = any(
+            statement.kind == "start"
+            and statement.arguments
+            and statement.arguments[0].startswith(("m.", "g."))
+            for statement in plan.statements
+        )
+        if requires_entity_root and not candidate_entities:
+            self.stats["public_root_entity_missing"] += 1
+            return []
         public_sources = {
             str(source[-1])
             for source in (*candidate_entities, *candidate_literals)
@@ -660,15 +1256,410 @@ class DemonstrationBuilder:
         base_prompt = self._row_base_prompt(row)
         for demo in demos:
             demo.private_metadata["candidate_entities"] = candidate_entities
+            demo.private_metadata["root_entity_provenance"] = root_provenance
             demo.private_metadata["candidate_literals"] = candidate_literals
             demo.private_metadata["candidate_entity_order"] = "stable_question_hash"
             demo.private_metadata["base_prompt"] = base_prompt
             demo.private_metadata["max_active"] = self.max_active
             demo.private_metadata["max_nodes"] = self.max_nodes
+            demo.private_metadata["max_execution_attempts"] = (
+                self.max_execution_attempts
+            )
             demo.private_metadata["relation_page_size"] = self.frontier_width
             demo.private_metadata["relation_rank_cutoff"] = None
             demo.private_metadata["max_turns"] = self.max_turns
+            demo.private_metadata["gold_program_proposal_audit"] = proposal_audit
         return demos
+
+    def _certify_irreversible_actions(
+        self,
+        demo: HyperDemonstration,
+        plan: GoldPlan,
+        gold_answers: Tuple[str, ...],
+    ) -> Optional[HyperDemonstration]:
+        """Attach independently recomputable proofs to Prune and Commit.
+
+        Gold may certify a teacher target, but it must never be converted into
+        fabricated public evidence.  Unsupported nonempty branches therefore
+        remain unresolved, and answer equality alone is insufficient to Commit.
+        """
+        certified_steps: List[DemonstrationStep] = []
+        contract = public_question_contract(demo.question)
+        for step in demo.steps:
+            if step.action == "Prune":
+                node = demo.hypotheses[step.arguments[0]]
+                if node.denotation:
+                    self.stats["uncertified_nonempty_prune_rejected"] += 1
+                    return None
+                certificate = public_empty_prune_certificate(
+                    node.hypothesis_id,
+                    node.denotation,
+                    contract,
+                )
+                if certificate is None:
+                    self.stats["uncertified_empty_before_count_rejected"] += 1
+                    return None
+                step = replace(
+                    step,
+                    rationale_facts=("empty_execution", "empty_is_terminal"),
+                    certificate_kind=certificate.kind,
+                    certificate_evidence=certificate.evidence,
+                )
+                self.stats["certified_empty_prune"] += 1
+            elif step.action == "Commit":
+                node = demo.hypotheses[step.arguments[0]]
+                commit_certificate = certify_program_commit(
+                    node.function_state,
+                    node.target_expression,
+                    node.denotation,
+                    plan.executable_functions,
+                    plan.target_expression,
+                    gold_answers,
+                )
+                if not commit_certificate.answer_exact:
+                    self.stats["commit_answer_certificate_miss"] += 1
+                    return None
+                if not commit_certificate.intent_equivalent:
+                    self.stats["commit_intent_certificate_miss"] += 1
+                    return None
+                step = replace(
+                    step,
+                    rationale_facts=(
+                        "answer_exact",
+                        "gold_program_formally_equivalent",
+                    ),
+                    certificate_kind="answer_and_supported_query_equivalent",
+                    certificate_evidence=(
+                        "denotation:exact",
+                        "supported_query:bidirectional_containment",
+                    ),
+                )
+                self.stats["certified_commit"] += 1
+            certified_steps.append(step)
+
+        demo.steps = certified_steps
+        demo.private_metadata["gold_program"] = list(plan.executable_functions)
+        demo.private_metadata["gold_target_expression"] = plan.target_expression
+        demo.private_metadata["gold_intent_signature"] = logical_program_signature(
+            plan.executable_functions, plan.target_expression
+        )
+        demo.private_metadata["irreversible_action_contract"] = (
+            "proof_carrying_semantic_storage_split_v2"
+        )
+        return demo
+
+    def _to_lazy_runtime_demo(
+        self, demo: HyperDemonstration
+    ) -> Optional[HyperDemonstration]:
+        """Compile an eager oracle trace into the exact lazy runtime protocol.
+
+        Eager construction is useful for verifying candidate outcomes, but it
+        is not a policy interface.  At runtime Find/Widen expose symbolic
+        proposals, Inspect executes one proposal, and Park changes storage
+        without asserting that a branch is false.  This compiler is the only
+        boundary at which verified oracle traces become student trajectories.
+        """
+        referenced = {
+            argument
+            for step in demo.steps
+            for argument in step.arguments
+            if re.fullmatch(r"H\d+", str(argument))
+        }
+        required = set(referenced)
+        changed = True
+        while changed:
+            changed = False
+            for node_id in tuple(required):
+                node = demo.hypotheses.get(node_id)
+                if node is None:
+                    continue
+                parents = tuple(node.parent_ids) or (
+                    (node.parent_id,) if node.parent_id else ()
+                )
+                for parent_id in parents:
+                    if parent_id not in required:
+                        required.add(parent_id)
+                        changed = True
+
+        proposals: Dict[str, RelationProposal] = {}
+        frontiers: List[Dict[str, Any]] = []
+        steps: List[DemonstrationStep] = []
+        active: set[str] = set(demo.steps[0].visible_before if demo.steps else ())
+        parked: set[str] = set()
+        known: set[str] = set(active)
+        selected: Optional[str] = None
+        next_proposal = 0
+        execution_attempts = 0
+
+        def append_park(node_id: str, reason: str) -> None:
+            nonlocal selected
+            if node_id not in active:
+                return
+            steps.append(
+                DemonstrationStep(
+                    "Park",
+                    (node_id,),
+                    tuple(sorted(active)),
+                    (),
+                    (reason, "storage_only_not_semantic_rejection"),
+                )
+            )
+            active.remove(node_id)
+            parked.add(node_id)
+            if selected == node_id:
+                selected = None
+
+        def make_active(node_id: str, protected: Sequence[str] = ()) -> bool:
+            if node_id in active:
+                return True
+            if node_id not in parked:
+                return False
+            if len(active) >= self.max_active:
+                candidates = sorted(active.difference(protected))
+                if not candidates:
+                    return False
+                append_park(candidates[0], "free_visible_workspace_for_recall")
+            steps.append(
+                DemonstrationStep(
+                    "Recall",
+                    (node_id,),
+                    tuple(sorted(active)),
+                    (),
+                    ("resume_preserved_hypothesis",),
+                )
+            )
+            parked.remove(node_id)
+            active.add(node_id)
+            return True
+
+        def page_options(step: DemonstrationStep) -> Optional[Tuple[RelationOption, ...]]:
+            if not step.created:
+                return None
+            child = demo.hypotheses.get(step.created[0])
+            if child is None or child.relation is None:
+                return None
+            if child.parent_id:
+                parent = demo.hypotheses.get(child.parent_id)
+                if parent is None:
+                    return None
+                state_before = tuple(parent.function_state)
+            else:
+                state_before = tuple(child.function_state[:-1])
+            ranked = self._proposal_state_cache.get((demo.question, state_before))
+            if ranked is None:
+                return None
+            if len(step.relation_page) == 3:
+                start, stop, total = step.relation_page
+                if total != len(ranked) or not (0 <= start < stop <= total):
+                    return None
+            else:
+                start = 0
+                stop = min(self.frontier_width, len(ranked))
+            return tuple(ranked[start:stop])
+
+        def inspect_page(
+            eager: DemonstrationStep,
+            frontier: Dict[str, Any],
+            exposed_ids: Sequence[str],
+        ) -> bool:
+            nonlocal execution_attempts
+            children = [
+                demo.hypotheses[node_id]
+                for node_id in eager.created
+                if node_id in demo.hypotheses
+            ]
+            chosen = [child for child in children if child.hypothesis_id in required]
+            # Preserve one strong executable competitor when the gold-derived
+            # trace otherwise uses only one branch from this catalog.
+            if len(frontier["inspected"]) + len(chosen) < 2:
+                alternative = next(
+                    (
+                        child
+                        for child in children
+                        if child.hypothesis_id not in {item.hypothesis_id for item in chosen}
+                        and child.denotation
+                    ),
+                    None,
+                )
+                if alternative is not None:
+                    chosen.append(alternative)
+            relation_to_proposal = {
+                proposals[proposal_id].relation: proposal_id
+                for proposal_id in exposed_ids
+            }
+            for child in chosen:
+                if child.hypothesis_id in known:
+                    continue
+                proposal_id = relation_to_proposal.get(child.relation or "")
+                if proposal_id is None:
+                    return False
+                if execution_attempts >= self.max_execution_attempts:
+                    return False
+                if len(known) >= self.max_nodes:
+                    return False
+                if len(active) >= self.max_active:
+                    candidates = sorted(active.difference({child.parent_id or ""}))
+                    if not candidates:
+                        return False
+                    append_park(candidates[0], "free_visible_workspace_for_inspection")
+                steps.append(
+                    DemonstrationStep(
+                        "Inspect",
+                        (proposal_id,),
+                        tuple(sorted(active)),
+                        (child.hypothesis_id,),
+                        (
+                            "execute_visible_ranked_proposal",
+                            f"relation_rank:{proposals[proposal_id].rank}",
+                        ),
+                    )
+                )
+                execution_attempts += 1
+                known.add(child.hypothesis_id)
+                active.add(child.hypothesis_id)
+                frontier["inspected"].add(child.hypothesis_id)
+            return True
+
+        for eager in demo.steps:
+            if eager.action in {"Find_relation", "Widen"}:
+                options = page_options(eager)
+                if not options:
+                    self.stats["lazy_protocol_catalog_reconstruction_miss"] += 1
+                    return None
+                source = eager.arguments[0]
+                if eager.action == "Find_relation":
+                    frontier = {
+                        "frontier_id": f"F{len(frontiers)}",
+                        "source": source,
+                        "inspected": set(),
+                    }
+                    frontiers.append(frontier)
+                else:
+                    frontier = next(
+                        (
+                            item
+                            for item in reversed(frontiers)
+                            if item["source"] == source
+                        ),
+                        None,
+                    )
+                    if frontier is None or selected is not None:
+                        return None
+                exposed_ids = []
+                for option in options:
+                    proposal_id = f"P{next_proposal}"
+                    next_proposal += 1
+                    proposals[proposal_id] = RelationProposal(
+                        proposal_id=proposal_id,
+                        frontier_id=frontier["frontier_id"],
+                        source=source,
+                        relation=option.relation,
+                        score=float(option.score),
+                        rank=int(option.rank),
+                    )
+                    exposed_ids.append(proposal_id)
+                steps.append(
+                    replace(
+                        eager,
+                        visible_before=tuple(sorted(active)),
+                        created=(),
+                        exposed=tuple(exposed_ids),
+                    )
+                )
+                parent_id = selected if eager.action == "Find_relation" else None
+                selected = None
+                if parent_id is not None:
+                    append_park(parent_id, "preserve_parent_after_opening_child_catalog")
+                if not inspect_page(eager, frontier, exposed_ids):
+                    self.stats["lazy_protocol_inspection_budget_miss"] += 1
+                    return None
+                continue
+
+            if eager.action == "Select":
+                node_id = eager.arguments[0]
+                if not make_active(node_id):
+                    return None
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                selected = node_id
+                continue
+
+            if eager.action == "Park":
+                append_park(eager.arguments[0], "teacher_requested_storage_move")
+                continue
+
+            if eager.action == "Recall":
+                if not make_active(eager.arguments[0]):
+                    return None
+                continue
+
+            if eager.action == "Prune":
+                node_id = eager.arguments[0]
+                if not make_active(node_id):
+                    return None
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                active.remove(node_id)
+                if selected == node_id:
+                    selected = None
+                continue
+
+            if eager.action == "Combine":
+                left, right = eager.arguments
+                if not make_active(left, (right,)) or not make_active(right, (left,)):
+                    return None
+                if execution_attempts >= self.max_execution_attempts:
+                    return None
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                active.difference_update((left, right))
+                active.update(eager.created)
+                known.update(eager.created)
+                execution_attempts += 1
+                selected = None
+                continue
+
+            if eager.action in {"Merge", "Order", "Compare", "Time_constraint", "Count"}:
+                if execution_attempts >= self.max_execution_attempts:
+                    return None
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                if selected is not None:
+                    active.discard(selected)
+                active.update(eager.created)
+                known.update(eager.created)
+                execution_attempts += 1
+                selected = None
+                continue
+
+            if eager.action == "Commit":
+                node_id = eager.arguments[0]
+                if not make_active(node_id):
+                    return None
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                active = {node_id}
+                parked.clear()
+                selected = None
+                continue
+
+            if eager.action == "Abstain":
+                steps.append(replace(eager, visible_before=tuple(sorted(active))))
+                active.clear()
+                parked.clear()
+                selected = None
+                continue
+
+            return None
+
+        if not steps or steps[-1].action not in {"Commit", "Abstain"}:
+            return None
+        demo.steps = steps
+        demo.proposals = proposals
+        demo.hypotheses = {
+            node_id: node
+            for node_id, node in demo.hypotheses.items()
+            if node_id in known
+        }
+        demo.private_metadata["runtime_protocol"] = "lazy_relation_inspection_v1"
+        demo.private_metadata["execution_attempts"] = execution_attempts
+        demo.private_metadata["max_execution_attempts"] = self.max_execution_attempts
+        return demo
 
     def _candidate_future_value(
         self,
@@ -786,7 +1777,7 @@ class DemonstrationBuilder:
                     action_source = _action_source(state_before, statement.raw)
 
                 ranked = list(
-                    self.candidate_provider(question.strip(), state_before, statement)
+                    self._ranked_options(question, state_before, statement)
                 )
                 pages, required = self._pages_through_required_relation(
                     ranked, statement.relation or ""
@@ -1131,7 +2122,7 @@ class DemonstrationBuilder:
         # Gold labels may judge the resulting frontier, but must not shape the
         # semantic request that the student has to reproduce at inference.
         query = question.strip()
-        ranked_options = list(self.candidate_provider(query, state_before, join))
+        ranked_options = list(self._ranked_options(query, state_before, join))
         pages, gold_option = self._pages_through_required_relation(
             ranked_options, join.relation
         )
@@ -1256,6 +2247,8 @@ class DemonstrationBuilder:
             join.target == plan.target_expression
             and self._matches_terminal_answers(plan, gold, gold_answers)
         )
+        recovery_stratum = None
+        probe_outcome = None
         if terminal_gold:
             steps.extend(
                 [
@@ -1353,17 +2346,16 @@ class DemonstrationBuilder:
                 family = "adaptive_frontier_widen"
                 probe_relation = None
             else:
-                # Recovery candidates are higher-ranked natural proposals whose
-                # complete counterfactual program is not answer-equivalent.
+                # A higher-ranked nonempty alternative is a useful recovery
+                # intervention state.  Do not call it wrong by forcing the gold
+                # suffix onto it: its own natural continuation may still be
+                # useful, equivalent, or simply unresolved.
                 wrong_entries = []
                 for option, node in candidates:
-                    future = candidate_future_values[option.relation]
                     if (
                         option.relation == join.relation
                         or option.rank >= gold_option.rank
                         or not node.denotation
-                        or not future["execution_success"]
-                        or future["answer_exact"]
                     ):
                         continue
                     wrong_entries.append((option, node))
@@ -1390,8 +2382,10 @@ class DemonstrationBuilder:
                     DemonstrationStep(
                         "Select", (wrong.hypothesis_id,), created, (),
                         ("plausible_branch_requires_more_evidence",),
+                        supervision="intervention",
                     )
                 )
+                self.stats["recovery_intervention_select"] += 1
                 active = list(created)
                 wrong_page = self._expand_terminal_frontier(
                     wrong,
@@ -1439,53 +2433,46 @@ class DemonstrationBuilder:
                         ),
                     )
                 )
-                semantic_mismatch = bool(top_probe.denotation)
                 prune_ids = [
                     node_id
                     for node_id in wrong_children
                     if not hypotheses[node_id].denotation
                 ]
-                if semantic_mismatch and top_probe.hypothesis_id not in prune_ids:
-                    prune_ids.append(top_probe.hypothesis_id)
-                if not prune_ids:
-                    self.stats["recovery_probe_without_visible_failure"] += 1
-                    direct = self._build_direct_progress_demo(
-                        question_id,
-                        question,
-                        plan,
-                        join,
-                        next_join,
-                        candidates,
-                        gold_answers,
-                        gold_option,
-                        best_alternative_score,
-                        len(ranked_options),
-                    )
-                    if direct is not None:
-                        direct.private_metadata["candidate_future_values"] = candidate_future_values
-                    return direct
-                self.stats[
-                    "recovery_probe_visible_semantic_mismatch"
-                    if semantic_mismatch
-                    else "recovery_probe_visible_empty"
-                ] += 1
+                top_probe_answer_exact = self._matches_terminal_answers(
+                    plan, top_probe, gold_answers
+                )
+                top_probe_intent_exact = programs_are_intent_equivalent(
+                    top_probe.function_state,
+                    top_probe.target_expression,
+                    plan.executable_functions,
+                    plan.target_expression,
+                )
+                if top_probe_answer_exact and not top_probe_intent_exact:
+                    self.stats["recovery_answer_exact_without_intent_proof"] += 1
+                if top_probe.denotation:
+                    self.stats["recovery_probe_unresolved_nonempty"] += 1
+                else:
+                    self.stats["recovery_probe_visible_empty"] += 1
                 for child_id in prune_ids:
                     before = tuple(active)
                     active.remove(child_id)
-                    rationale = (
-                        (f"question_path_mismatch:{wrong.relation}",)
-                        if hypotheses[child_id].denotation
-                        else ("empty_execution",)
-                    )
                     steps.append(
                         DemonstrationStep(
-                            "Prune", (child_id,), before, (), rationale,
+                            "Prune",
+                            (child_id,),
+                            before,
+                            (),
+                            ("empty_execution", "empty_is_terminal"),
                         )
                     )
                 steps.append(
                     DemonstrationStep(
                         "Select", (gold.hypothesis_id,), tuple(active), (),
-                        ("return_after_top_probe_failed",),
+                        (
+                            "return_after_certified_failure"
+                            if not top_probe.denotation
+                            else "switch_while_preserving_unresolved_probe",
+                        ),
                     )
                 )
                 gold_page = self._expand_terminal_frontier(
@@ -1515,6 +2502,7 @@ class DemonstrationBuilder:
                 active.remove(gold.hypothesis_id)
                 active.extend(gold_children)
                 if len(active) > self.max_active:
+                    self.stats["non_destructive_recovery_budget_miss"] += 1
                     return None
                 steps.extend(
                     [
@@ -1533,9 +2521,15 @@ class DemonstrationBuilder:
                     ]
                 )
                 family = (
-                    "semantic_frontier_recovery"
-                    if semantic_mismatch
-                    else "delayed_frontier_recovery"
+                    "certified_empty_recovery"
+                    if not top_probe.denotation
+                    else "non_destructive_nonempty_recovery"
+                )
+                recovery_stratum = "immediate_linear"
+                probe_outcome = (
+                    "proved_false_empty"
+                    if not top_probe.denotation
+                    else "unresolved_nonempty"
                 )
                 probe_relation = "question_conditioned"
                 self.stats["recovery_built"] += 1
@@ -1565,6 +2559,8 @@ class DemonstrationBuilder:
                 "widen_sources": [source] if needs_widen else [],
                 "retrieval_intent_source": "question",
                 "probe_relation": probe_relation,
+                "probe_outcome": probe_outcome,
+                "recovery_stratum": recovery_stratum,
                 "decision_index": join.index,
             },
         )
@@ -1921,7 +2917,7 @@ class DemonstrationBuilder:
     ) -> List[ExecutedRelationPage]:
         """Execute stable relation pages through the required continuation."""
         options = list(
-            self.candidate_provider(question.strip(), parent.function_state, join)
+            self._ranked_options(question, parent.function_state, join)
         )
         pages, required = self._pages_through_required_relation(
             options, join.relation
@@ -1948,7 +2944,9 @@ class DemonstrationBuilder:
         for page_index, page in enumerate(pages):
             children: List[str] = []
             for option in page:
-                statement = replace_join_relation(join.raw, option.relation)
+                statement = replace_join_relation_and_source(
+                    join.raw, option.relation, parent.target_expression
+                )
                 state = list(parent.function_state) + [statement]
                 values = self._execute(state, join.target)
                 if values is None:
@@ -1991,7 +2989,7 @@ class DemonstrationBuilder:
         require_required_relation: bool = True,
     ) -> Optional[ExecutedRelationPage]:
         ranked_options = list(
-            self.candidate_provider(question.strip(), parent.function_state, join)
+            self._ranked_options(question, parent.function_state, join)
         )
         page = relation_page(
             ranked_options, offset=0, page_size=self.frontier_width
@@ -2013,7 +3011,9 @@ class DemonstrationBuilder:
             self.stats[f"{stat_scope}_natural_frontier"] += 1
         children: List[str] = []
         for option in options:
-            statement = replace_join_relation(join.raw, option.relation)
+            statement = replace_join_relation_and_source(
+                join.raw, option.relation, parent.target_expression
+            )
             state = list(parent.function_state) + [statement]
             values = self._execute(state, join.target)
             if values is None:
@@ -2077,7 +3077,7 @@ class DemonstrationBuilder:
         hypotheses: Dict[str, ExecutedHypothesis] = {}
         frontiers = []
         if same_frontier:
-            options = list(self.candidate_provider(query, left_state, left_join))
+            options = list(self._ranked_options(query, left_state, left_join))
             pages, required = self._pages_through_required_relations(
                 options, (left_join.relation, right_join.relation)
             )
@@ -2150,7 +3150,7 @@ class DemonstrationBuilder:
                 ("left", left_state, left_action_source, left_join),
                 ("right", right_state, right_action_source, right_join),
             ):
-                options = list(self.candidate_provider(query, state_before, join))
+                options = list(self._ranked_options(query, state_before, join))
                 pages, required = self._pages_through_required_relation(
                     options, join.relation
                 )
@@ -2363,7 +3363,7 @@ class DemonstrationBuilder:
             state_before = self._dependency_state(plan, source, before=join.index)
             if any("JOIN(" in raw or "AND(" in raw for raw in state_before):
                 return None
-            options = list(self.candidate_provider(query, state_before, join))
+            options = list(self._ranked_options(query, state_before, join))
             pages, required = self._pages_through_required_relation(
                 options, join.relation
             )
@@ -2825,7 +3825,7 @@ class DemonstrationBuilder:
             self.stats["trajectory_node_budget_miss"] += 1
             return None
         constrained_step_count = len(demo.steps) + 2
-        if constrained_step_count + 1 > self.max_turns:
+        if constrained_step_count > self.max_turns:
             self.stats["trajectory_turn_budget_miss"] += 1
             return None
 
@@ -2911,31 +3911,38 @@ class DemonstrationBuilder:
 
     def _row_candidate_entities(
         self, row: Mapping[str, Any], plan: GoldPlan, question_id: str
-    ) -> List[Tuple[str, str]]:
+    ) -> Tuple[List[Tuple[str, str]], str]:
+        """Return the benchmark-provided oracle topic entities.
+
+        BoG and the matched KGQA protocol assume correct initial entity
+        linking.  GrailQA records those entities as MID-valued START nodes in
+        the annotated program.  Linker output is used only to recover readable
+        labels for those oracle roots; it must not add unrelated candidates.
+        """
+        root_ids = []
+        for statement in plan.statements:
+            if (
+                statement.kind == "start"
+                and statement.arguments
+                and statement.arguments[0].startswith(("m.", "g."))
+            ):
+                root_ids.append(str(statement.arguments[0]))
+
         extra = row.get("extra_info") or {}
+        linked_names: Dict[str, str] = {}
         if isinstance(extra, Mapping):
             entities = extra.get("extracted_entities") or extra.get("candidate_entities")
             if entities:
-                values = [
-                    (str(item[0]), str(item[-1]))
+                linked_names = {
+                    str(item[-1]): str(item[0])
                     for item in entities
-                    if item
-                    and str(item[-1]).startswith(("m.", "g."))
-                ]
-            else:
-                values = []
-        else:
-            values = []
-        if not values:
-            for statement in plan.statements:
-                if statement.kind == "start":
-                    assignment = _ASSIGNMENT.match(statement.raw)
-                    start = _START.match(assignment.group(2)) if assignment else None
-                    if start is None:
-                        continue
-                    value = start.group(1)
-                    if value.startswith(("m.", "g.")):
-                        values.append((value, value))
+                    if item and str(item[-1]).startswith(("m.", "g."))
+                }
+
+        values = [(linked_names.get(identity, identity), identity) for identity in root_ids]
+        provenance = "oracle_gold_program" if values else "no_entity_root"
+        if values:
+            self.stats["oracle_root_entities_used"] += 1
 
         unique: Dict[str, str] = {}
         for name, identity in values:
@@ -2951,7 +3958,7 @@ class DemonstrationBuilder:
                     unique[identity] = self._display_cache[identity]
         ordered = [(name, identity) for identity, name in unique.items()]
         ordered.sort(key=lambda item: _digest(question_id, item[1]))
-        return ordered
+        return ordered, provenance
 
     @staticmethod
     def _row_base_prompt(row: Mapping[str, Any]) -> str:
@@ -2982,21 +3989,6 @@ class DemonstrationBuilder:
         visit(target, len(plan.statements) + 1 if before is None else before)
         return [statement.raw for statement in ordered]
 
-def _has_visible_path_mismatch(
-    demo: HyperDemonstration,
-    step: DemonstrationStep,
-    node: ExecutedHypothesis,
-) -> bool:
-    if demo.family not in {"semantic_frontier_recovery", "adaptive_frontier_widen"}:
-        return False
-    visible_relations = set(relation_path(node.function_state))
-    return any(
-        fact.split(":", 1)[1] in visible_relations
-        for fact in step.rationale_facts
-        if fact.startswith("question_path_mismatch:") and ":" in fact
-    )
-
-
 def _has_public_prune_reason(
     demo: HyperDemonstration,
     step: DemonstrationStep,
@@ -3005,17 +3997,46 @@ def _has_public_prune_reason(
     max_active: Optional[int] = None,
 ) -> bool:
     del active_count, max_active
-    capacity_facts = {
-        "frontier_capacity_eviction",
-        "frontier_capacity_reservation",
-    }.intersection(step.rationale_facts)
-    if capacity_facts:
-        # Historical v5 exports used capacity as a pruning rationale. Keep
-        # those artifacts readable, but never admit that behavior into the
-        # paged relation contract used by new SFT, RL, and inference runs.
-        return "relation_page_size" not in demo.private_metadata
-    return (
-        _has_visible_path_mismatch(demo, step, node)
+    if step.certificate_kind != "empty_monotone" or node.denotation:
+        return False
+    certificate = PruneCertificate(
+        kind=step.certificate_kind,
+        node_id=node.hypothesis_id,
+        evidence=tuple(step.certificate_evidence),
+        empty_preserving_completion=(
+            "public_count_obligation:false" in step.certificate_evidence
+        ),
+    )
+    return validate_public_prune_certificate(
+        node.hypothesis_id,
+        node.denotation,
+        public_question_contract(demo.question),
+        certificate,
+    )
+
+
+def _has_valid_commit_certificate(
+    demo: HyperDemonstration,
+    step: DemonstrationStep,
+    node: ExecutedHypothesis,
+) -> bool:
+    valid_kind = step.certificate_kind == "answer_and_supported_query_equivalent"
+    legacy_kind = (
+        step.certificate_kind == "answer_and_intent_exact"
+        and demo.private_metadata.get("runtime_protocol")
+        != "lazy_relation_inspection_v1"
+    )
+    if not (valid_kind or legacy_kind):
+        return False
+    gold_program = demo.private_metadata.get("gold_program")
+    gold_target = demo.private_metadata.get("gold_target_expression")
+    if not gold_program or not gold_target or node.denotation != demo.gold_answers:
+        return False
+    return programs_are_intent_equivalent(
+        node.function_state,
+        node.target_expression,
+        gold_program,
+        str(gold_target),
     )
 
 
@@ -3047,7 +4068,281 @@ class DemonstrationValidator:
         self.execution_cache[key] = result
         return result
 
+    def _validate_lazy(self, demo: HyperDemonstration) -> List[str]:
+        errors: List[str] = []
+        for node in demo.hypotheses.values():
+            replayed = self._replay(node.function_state, node.target_expression)
+            if replayed is None:
+                errors.append(f"{node.hypothesis_id}: replay execution failed")
+            elif replayed != node.denotation:
+                errors.append(f"{node.hypothesis_id}: replay mismatch")
+
+        active = set(demo.steps[0].visible_before if demo.steps else ())
+        parked: set[str] = set()
+        known = set(active)
+        selected: Optional[str] = None
+        committed: Optional[str] = None
+        abstained = False
+        proposal_status: Dict[str, str] = {}
+        frontiers: Dict[str, Dict[str, Any]] = {}
+        max_nodes = int(demo.private_metadata.get("max_nodes", 128))
+        max_execution_attempts = int(
+            demo.private_metadata.get("max_execution_attempts", 24)
+        )
+        execution_attempts = 0
+
+        def recall(node_id: str) -> None:
+            if node_id not in parked:
+                errors.append(f"Recall targets non-parked {node_id}")
+                return
+            if len(active) >= self.max_active:
+                errors.append("Recall exceeds active hypothesis budget")
+                return
+            parked.remove(node_id)
+            active.add(node_id)
+
+        for step in demo.steps:
+            if set(step.visible_before) != active:
+                errors.append(
+                    f"{step.action}: visible state {sorted(step.visible_before)} "
+                    f"does not match active state {sorted(active)}"
+                )
+            if step.supervision not in {"policy_target", "intervention"}:
+                errors.append(
+                    f"{step.action}: invalid supervision mode {step.supervision}"
+                )
+            if step.supervision == "intervention" and step.action != "Select":
+                errors.append(
+                    f"{step.action}: only a teacher-forced Select may be an intervention"
+                )
+            if step.action not in {"Find_relation", "Widen"} and step.exposed:
+                errors.append(f"{step.action}: only catalog actions may expose proposals")
+
+            if step.action in {"Find_relation", "Widen"}:
+                if step.created:
+                    errors.append(f"{step.action}: symbolic catalog action executed a node")
+                if not step.exposed:
+                    errors.append(f"{step.action}: no proposals were exposed")
+                    continue
+                page = [demo.proposals.get(value) for value in step.exposed]
+                if any(item is None for item in page):
+                    errors.append(f"{step.action}: unknown proposal id")
+                    continue
+                proposal_page = [item for item in page if item is not None]
+                frontier_ids = {item.frontier_id for item in proposal_page}
+                if len(frontier_ids) != 1:
+                    errors.append(f"{step.action}: page spans multiple frontiers")
+                    continue
+                frontier_id = next(iter(frontier_ids))
+                if any(item.source != step.arguments[0] for item in proposal_page):
+                    errors.append(f"{step.action}: proposal source mismatch")
+                if len(step.relation_page) != 3:
+                    errors.append(f"{step.action}: missing relation page cursor")
+                    continue
+                start, stop, total = step.relation_page
+                if stop - start != len(proposal_page) or not (0 <= start < stop <= total):
+                    errors.append(f"{step.action}: invalid relation page span")
+                if [item.rank for item in proposal_page] != list(
+                    range(start + 1, stop + 1)
+                ):
+                    errors.append(f"{step.action}: proposal ranks do not match page")
+                if any(item.proposal_id in proposal_status for item in proposal_page):
+                    errors.append(f"{step.action}: proposal exposed more than once")
+                for item in proposal_page:
+                    proposal_status[item.proposal_id] = "visible"
+
+                if step.action == "Find_relation":
+                    if len(step.arguments) != 1:
+                        errors.append(
+                            "Find_relation must expose only its source; relation ranking is environment-owned"
+                        )
+                    if start != 0:
+                        errors.append("Find_relation must open the first page")
+                    candidate_sources = {
+                        str(source[-1])
+                        for key in ("candidate_entities", "candidate_literals")
+                        for source in demo.private_metadata.get(key, ())
+                        if source
+                    }
+                    opens_new_root = (
+                        bool(active)
+                        and selected is None
+                        and step.arguments[0] in candidate_sources
+                    )
+                    if active and selected is None and not opens_new_root:
+                        errors.append("Find_relation requires Select or a public new root")
+                    parent_id = selected
+                    if parent_id is not None:
+                        expected = demo.hypotheses[parent_id].target_expression
+                        if step.arguments[0] != expected:
+                            errors.append(
+                                f"Find_relation source {step.arguments[0]} does not match "
+                                f"selected {parent_id} target {expected}"
+                            )
+                    frontiers[frontier_id] = {
+                        "source": step.arguments[0],
+                        "parent_id": parent_id,
+                        "exposed": stop,
+                        "total": total,
+                    }
+                    selected = None
+                else:
+                    if selected is not None:
+                        errors.append("Widen must occur before Select")
+                    frontier = frontiers.get(frontier_id)
+                    if frontier is None:
+                        errors.append("Widen targets an unopened frontier")
+                    elif (
+                        frontier["source"] != step.arguments[0]
+                        or frontier["exposed"] != start
+                        or frontier["total"] != total
+                    ):
+                        errors.append("Widen does not continue the stable catalog")
+                    else:
+                        frontier["exposed"] = stop
+                continue
+
+            if step.action == "Inspect":
+                if len(step.arguments) != 1:
+                    errors.append("Inspect requires one proposal")
+                    continue
+                proposal_id = step.arguments[0]
+                proposal = demo.proposals.get(proposal_id)
+                if proposal is None or proposal_status.get(proposal_id) != "visible":
+                    errors.append(f"Inspect targets unavailable {proposal_id}")
+                    continue
+                if len(step.created) != 1:
+                    errors.append("certified Inspect must create exactly one hypothesis")
+                    continue
+                node_id = step.created[0]
+                node = demo.hypotheses.get(node_id)
+                frontier = frontiers.get(proposal.frontier_id)
+                if node is None or frontier is None:
+                    errors.append("Inspect lacks a node or open frontier")
+                    continue
+                if node.relation != proposal.relation:
+                    errors.append(f"Inspect {proposal_id} relation mismatch")
+                if node.parent_id != frontier["parent_id"]:
+                    errors.append(f"Inspect {proposal_id} parent mismatch")
+                if node_id in known:
+                    errors.append(f"Inspect recreates known {node_id}")
+                if len(active) >= self.max_active:
+                    errors.append("Inspect exceeds active hypothesis budget")
+                known.add(node_id)
+                active.add(node_id)
+                proposal_status[proposal_id] = "inspected"
+                execution_attempts += 1
+            elif step.action == "Park":
+                node_id = step.arguments[0]
+                if node_id not in active:
+                    errors.append(f"Park targets inactive {node_id}")
+                else:
+                    active.remove(node_id)
+                    parked.add(node_id)
+                if selected == node_id:
+                    selected = None
+            elif step.action == "Recall":
+                recall(step.arguments[0])
+            elif step.action == "Select":
+                node_id = step.arguments[0]
+                if node_id not in active:
+                    errors.append(f"Select targets inactive {node_id}")
+                elif not demo.hypotheses[node_id].denotation:
+                    errors.append(f"Select targets empty {node_id}")
+                else:
+                    selected = node_id
+            elif step.action == "Prune":
+                node_id = step.arguments[0]
+                node = demo.hypotheses.get(node_id)
+                if node_id not in active or node is None:
+                    errors.append(f"Prune targets inactive {node_id}")
+                elif not _has_public_prune_reason(
+                    demo, step, node, len(active), self.max_active
+                ):
+                    errors.append(
+                        f"Prune {node_id} lacks a verified public contradiction certificate"
+                    )
+                active.discard(node_id)
+                if selected == node_id:
+                    selected = None
+            elif step.action == "Combine":
+                left, right = step.arguments
+                if left == right or left not in active or right not in active:
+                    errors.append("Combine requires two distinct active parents")
+                if len(step.created) != 1:
+                    errors.append("Combine must create exactly one hypothesis")
+                else:
+                    child = demo.hypotheses.get(step.created[0])
+                    if child is None or set(child.parent_ids) != {left, right}:
+                        errors.append("Combine child has wrong parents")
+                    active.difference_update((left, right))
+                    active.add(step.created[0])
+                    known.add(step.created[0])
+                selected = None
+                execution_attempts += 1
+            elif step.action in {"Merge", "Order", "Compare", "Time_constraint", "Count"}:
+                if len(step.created) != 1:
+                    errors.append(f"{step.action} must create exactly one hypothesis")
+                else:
+                    child = demo.hypotheses.get(step.created[0])
+                    if child is None:
+                        errors.append(f"{step.action} creates an unknown hypothesis")
+                    elif selected is not None and child.parent_id != selected:
+                        errors.append(f"{step.action} child has wrong parent")
+                    if selected is not None:
+                        active.discard(selected)
+                    active.add(step.created[0])
+                    known.add(step.created[0])
+                selected = None
+                execution_attempts += 1
+            elif step.action == "Commit":
+                node_id = step.arguments[0]
+                node = demo.hypotheses.get(node_id)
+                if node_id not in active or node is None:
+                    errors.append(f"Commit targets inactive {node_id}")
+                else:
+                    if node.denotation != demo.gold_answers:
+                        errors.append(f"Commit {node_id} does not return gold answers")
+                    if not _has_valid_commit_certificate(demo, step, node):
+                        errors.append(
+                            f"Commit {node_id} lacks exact answer-and-intent proof"
+                        )
+                    committed = node_id
+                active = {node_id} if node is not None else set()
+                parked.clear()
+                selected = None
+            elif step.action == "Abstain":
+                abstained = True
+                active.clear()
+                parked.clear()
+                selected = None
+            else:
+                errors.append(f"unsupported action {step.action}")
+
+            if len(known) > max_nodes:
+                errors.append(f"executed-node budget exceeded: {len(known)}/{max_nodes}")
+            if execution_attempts > max_execution_attempts:
+                errors.append(
+                    "execution-attempt budget exceeded: "
+                    f"{execution_attempts}/{max_execution_attempts}"
+                )
+            if len(active) > self.max_active:
+                errors.append(f"active hypothesis budget exceeded: {len(active)}")
+
+        expected_attempts = demo.private_metadata.get("execution_attempts")
+        if expected_attempts is not None and execution_attempts != int(expected_attempts):
+            errors.append(
+                f"execution-attempt count mismatch: {execution_attempts}/{expected_attempts}"
+            )
+        if committed is None and not abstained:
+            errors.append("lazy trajectory ends without Commit or Abstain")
+        if set(demo.hypotheses) != known:
+            errors.append("demonstration contains hypotheses never created by public actions")
+        return errors
+
     def validate(self, demo: HyperDemonstration) -> List[str]:
+        if demo.private_metadata.get("runtime_protocol") == "lazy_relation_inspection_v1":
+            return self._validate_lazy(demo)
         errors: List[str] = []
         for node in demo.hypotheses.values():
             replayed = self._replay(node.function_state, node.target_expression)
@@ -3068,6 +4363,14 @@ class DemonstrationValidator:
         frontiers: List[Dict[str, Any]] = []
         known_nodes = set(active)
         for step in demo.steps:
+            if step.supervision not in {"policy_target", "intervention"}:
+                errors.append(
+                    f"{step.action}: invalid supervision mode {step.supervision}"
+                )
+            if step.supervision == "intervention" and step.action != "Select":
+                errors.append(
+                    f"{step.action}: only a teacher-forced Select may be an intervention"
+                )
             hypothesis_arguments = (
                 step.arguments if step.action in {"Prune", "Select", "Combine", "Commit"} else ()
             )
@@ -3098,29 +4401,12 @@ class DemonstrationValidator:
                 if step.arguments[0] not in active:
                     errors.append(f"Prune targets inactive {step.arguments[0]}")
                 node = demo.hypotheses[step.arguments[0]]
-                if node.denotation:
-                    if (
-                        "frontier_capacity_eviction" in step.rationale_facts
-                        and len(active) != self.max_active
-                    ):
-                        errors.append(
-                            f"Prune {step.arguments[0]} uses capacity eviction when the "
-                            f"frontier is {len(active)}/{self.max_active}, not full"
-                        )
-                    elif (
-                        "frontier_capacity_reservation" in step.rationale_facts
-                        and len(active) >= self.max_active
-                    ):
-                        errors.append(
-                            f"Prune {step.arguments[0]} uses capacity reservation when the "
-                            f"frontier is already {len(active)}/{self.max_active}"
-                        )
-                    elif not _has_public_prune_reason(
-                        demo, step, node, len(active), self.max_active
-                    ):
-                        errors.append(
-                            f"Prune {step.arguments[0]} lacks visible contradictory evidence"
-                        )
+                if not _has_public_prune_reason(
+                    demo, step, node, len(active), self.max_active
+                ):
+                    errors.append(
+                        f"Prune {step.arguments[0]} lacks a verified public contradiction certificate"
+                    )
                 active.discard(step.arguments[0])
                 if selected == step.arguments[0]:
                     selected = None
@@ -3293,6 +4579,10 @@ class DemonstrationValidator:
                     errors.append(f"Commit targets inactive {step.arguments[0]}")
                 if node.denotation != demo.gold_answers:
                     errors.append(f"Commit {node.hypothesis_id} does not return gold answers")
+                if not _has_valid_commit_certificate(demo, step, node):
+                    errors.append(
+                        f"Commit {node.hypothesis_id} lacks exact answer-and-intent proof"
+                    )
                 committed = node.hypothesis_id
                 active = {node.hypothesis_id}
                 selected = None
@@ -3326,6 +4616,7 @@ class DemonstrationValidator:
 def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
     """Export public step supervision; private gold metadata is deliberately omitted."""
     records = []
+    proposal_status: Dict[str, str] = {}
     for index, step in enumerate(demo.steps):
         visible = []
         for hypothesis_id in step.visible_before:
@@ -3342,15 +4633,38 @@ def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
                     "function_state": list(node.function_state),
                 }
             )
-        records.append(
-            {
-                "demo_id": demo.demo_id,
-                "step": index,
-                "input": {"question": demo.question, "active_hypotheses": visible},
-                "target": {"action": step.action, "arguments": list(step.arguments)},
-                "metadata": {"family": demo.family, "trajectory_weight": 1.0 / len(demo.steps)},
-            }
-        )
+        visible_proposals = [
+            asdict(demo.proposals[proposal_id])
+            for proposal_id, status in proposal_status.items()
+            if status == "visible" and proposal_id in demo.proposals
+        ]
+        if step.supervision == "policy_target":
+            records.append(
+                {
+                    "demo_id": demo.demo_id,
+                    "step": index,
+                    "input": {
+                        "question": demo.question,
+                        "active_hypotheses": visible,
+                        "visible_proposals": visible_proposals,
+                    },
+                    "target": {"action": step.action, "arguments": list(step.arguments)},
+                    "metadata": {
+                        "family": demo.family,
+                        "trajectory_weight": 1.0 / max(
+                            1,
+                            sum(
+                                item.supervision == "policy_target"
+                                for item in demo.steps
+                            ),
+                        ),
+                    },
+                }
+            )
+        for proposal_id in step.exposed:
+            proposal_status[proposal_id] = "visible"
+        if step.action == "Inspect" and step.arguments:
+            proposal_status[step.arguments[0]] = "inspected"
     return records
 
 
@@ -3362,8 +4676,10 @@ def _public_graph(
     committed: Optional[str] = None,
     executions: int = 0,
     known_ids: Optional[Sequence[str]] = None,
+    parked_ids: Optional[Sequence[str]] = None,
 ) -> str:
     known = set(known_ids or ())
+    parked = set(parked_ids or ())
     nodes = []
     for node in demo.hypotheses.values():
         if node.hypothesis_id not in known:
@@ -3390,7 +4706,39 @@ def _public_graph(
         max_active=int(demo.private_metadata.get("max_active", 24)),
         node_count=len(known),
         execution_calls=executions,
+        parked_nodes=[node for node in nodes if node["node_id"] in parked],
+        execution_budget=int(
+            demo.private_metadata.get("max_execution_attempts", 24)
+        ),
     )
+
+
+def _public_proposal_catalogs(
+    demo: HyperDemonstration,
+    frontiers: Mapping[str, Mapping[str, Any]],
+    proposal_status: Mapping[str, str],
+) -> str:
+    blocks = []
+    for frontier_id, frontier in frontiers.items():
+        lines = [
+            "<proposal_catalog>",
+            f"source={frontier['source']} exposed={frontier['exposed']}/{frontier['total']} "
+            f"page_size={int(demo.private_metadata.get('relation_page_size', 6))}",
+        ]
+        for proposal in demo.proposals.values():
+            status = proposal_status.get(proposal.proposal_id)
+            if proposal.frontier_id != frontier_id or status != "visible":
+                continue
+            lines.append(
+                f"{proposal.proposal_id} rank={proposal.rank} "
+                f"relation={proposal.relation} score={proposal.score:.4f} status=visible"
+            )
+        lines.append(
+            "Use Inspect [ Pn ] to execute one visible proposal; Widen only reveals the next page."
+        )
+        lines.append("</proposal_catalog>")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
 
 
 def _action_text(step: DemonstrationStep) -> str:
@@ -3403,13 +4751,25 @@ def _action_text(step: DemonstrationStep) -> str:
         elif "continue_preserved_alternative" in step.rationale_facts:
             thought = "I will continue the preserved branch after the failed probe."
         else:
-            thought = "I will execute a bounded relation frontier and retain its alternatives."
+            thought = "I will open a ranked relation catalog without executing every option."
     elif step.action == "Widen":
         body = f"Widen [ {step.arguments[0]} ]"
         thought = (
             "The visible relation pages do not cover the question, so I will inspect "
             "the next ranked page before selecting a path."
         )
+    elif step.action == "Inspect":
+        body = f"Inspect [ {step.arguments[0]} ]"
+        thought = "I will spend one graph query to test this visible relation proposal."
+    elif step.action == "Park":
+        body = f"Park [ {step.arguments[0]} ]"
+        thought = "I will free visible workspace while preserving this unresolved hypothesis."
+    elif step.action == "Recall":
+        body = f"Recall [ {step.arguments[0]} ]"
+        thought = "I will restore this preserved hypothesis for further reasoning."
+    elif step.action == "Abstain":
+        body = "Abstain"
+        thought = "The search budget ended without a complete justified program."
     elif step.action == "Combine":
         body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
         thought = "Both active branches express required parts of the question."
@@ -3432,9 +4792,12 @@ def _action_text(step: DemonstrationStep) -> str:
         body = f"{step.action} [ {step.arguments[0]} ]"
         thoughts = {
             "Select": (
-                "The probe supplied negative evidence, so I will return to a preserved "
-                "alternative."
-                if "return_after_top_probe_failed" in step.rationale_facts
+                "The probe is still unresolved, so I will preserve it while inspecting "
+                "another active interpretation."
+                if "switch_while_preserving_unresolved_probe" in step.rationale_facts
+                else "The probe has a verified terminal contradiction, so I will return "
+                "to a preserved alternative."
+                if "return_after_certified_failure" in step.rationale_facts
                 else next(
                     (
                         "This relation best matches the question, so I will test it while "
@@ -3446,18 +4809,15 @@ def _action_text(step: DemonstrationStep) -> str:
                 )
             ),
             "Prune": (
-                "The frontier is full, so I will remove this lower-ranked branch to make room for a higher-priority continuation."
-                if "frontier_capacity_eviction" in step.rationale_facts
-                else "The current frontier does not have enough room for the incoming continuation, so I will remove a lower-ranked branch before expanding."
-                if "frontier_capacity_reservation" in step.rationale_facts
-                else "This visible relation path conflicts with what the question asks, so I will remove it."
-                if any(
-                    fact.startswith("question_path_mismatch:")
-                    for fact in step.rationale_facts
-                )
-                else "This hypothesis has an empty execution result, so it cannot answer the question."
+                "This hypothesis is empty and all remaining operations preserve "
+                "emptiness, so it is proved unable to answer the question."
+                if step.certificate_kind == "empty_monotone"
+                else "This hypothesis has a verified public contradiction."
             ),
-            "Commit": "This executable hypothesis covers the full question.",
+            "Commit": (
+                "This executable hypothesis has an exact answer and its logical "
+                "program covers the complete question."
+            ),
         }
         thought = thoughts[step.action]
     return f"<think>{thought}</think>\n<action>{body}</action>"
@@ -3465,7 +4825,7 @@ def _action_text(step: DemonstrationStep) -> str:
 
 def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
     """Export one complete policy trajectory in the runtime's multi-turn format."""
-    messages: List[Dict[str, str]] = [
+    messages: List[Dict[str, Any]] = [
         {
             "role": "user",
             "content": build_hyper_prompt(
@@ -3477,11 +4837,18 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
         }
     ]
     active: List[str] = list(demo.steps[0].visible_before if demo.steps else ())
+    parked: set[str] = set()
     selected: Optional[str] = None
     committed_id: Optional[str] = None
     known = set(active)
     executions = 0
     open_frontiers: List[Dict[str, Any]] = []
+    lazy_protocol = (
+        demo.private_metadata.get("runtime_protocol")
+        == "lazy_relation_inspection_v1"
+    )
+    lazy_frontiers: Dict[str, Dict[str, Any]] = {}
+    proposal_status: Dict[str, str] = {}
     if active:
         messages.append(
             {
@@ -3493,59 +4860,134 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                     selected=selected,
                     executions=executions,
                     known_ids=known,
+                    parked_ids=parked,
                 )
                 + "\n</information>",
             }
         )
     for step in demo.steps:
-        if tuple(active) != step.visible_before:
+        if set(active) != set(step.visible_before):
             raise ValueError(
                 f"trajectory {demo.demo_id} has inconsistent visible state before {step.action}"
             )
-        messages.append({"role": "assistant", "content": _action_text(step)})
+        action_message: Dict[str, Any] = {
+            "role": "assistant",
+            "content": _action_text(step),
+        }
+        if step.supervision == "intervention":
+            action_message["loss_mask"] = 0
+        messages.append(action_message)
         if step.action == "Find_relation":
-            if selected is not None and selected in active:
-                active.remove(selected)
-            active.extend(step.created)
-            known.update(step.created)
-            executions += len(step.created)
-            selected = None
-            event = "Executed the requested relation frontier."
-            if step.relation_page:
+            if lazy_protocol:
+                if step.created or not step.exposed:
+                    raise ValueError("lazy Find_relation must expose proposals only")
+                first = demo.proposals[step.exposed[0]]
                 start, stop, total = step.relation_page
                 if start != 0:
                     raise ValueError("Find_relation must expose the first relation page")
-                open_frontiers.append(
-                    {
-                        "source": step.arguments[0],
-                        "node_ids": list(step.created),
-                        "exposed": stop,
-                        "total": total,
-                    }
+                lazy_frontiers[first.frontier_id] = {
+                    "source": step.arguments[0],
+                    "parent_id": selected,
+                    "exposed": stop,
+                    "total": total,
+                }
+                for proposal_id in step.exposed:
+                    proposal_status[proposal_id] = "visible"
+                selected = None
+                event = (
+                    f"Opened a symbolic relation catalog from {step.arguments[0]}; "
+                    f"exposed proposals {start + 1}-{stop} of {total}. "
+                    "No graph query was executed."
                 )
+            else:
+                if selected is not None and selected in active:
+                    active.remove(selected)
+                active.extend(step.created)
+                known.update(step.created)
+                executions += len(step.created)
+                selected = None
+                event = "Executed the requested relation frontier."
+                if step.relation_page:
+                    start, stop, total = step.relation_page
+                    if start != 0:
+                        raise ValueError("Find_relation must expose the first relation page")
+                    open_frontiers.append(
+                        {
+                            "source": step.arguments[0],
+                            "node_ids": list(step.created),
+                            "exposed": stop,
+                            "total": total,
+                        }
+                    )
         elif step.action == "Widen":
+            if lazy_protocol:
+                if step.created or not step.exposed:
+                    raise ValueError("lazy Widen must expose proposals only")
+                first = demo.proposals[step.exposed[0]]
+                frontier = lazy_frontiers.get(first.frontier_id)
+                start, stop, total = step.relation_page
+                if (
+                    frontier is None
+                    or frontier["source"] != step.arguments[0]
+                    or frontier["exposed"] != start
+                    or frontier["total"] != total
+                ):
+                    raise ValueError("Widen does not continue an open stable proposal catalog")
+                frontier["exposed"] = stop
+                for proposal_id in step.exposed:
+                    proposal_status[proposal_id] = "visible"
+                event = (
+                    f"Widened the symbolic catalog from {step.arguments[0]}; "
+                    f"exposed proposals {start + 1}-{stop} of {total}. "
+                    "No graph query was executed."
+                )
+            else:
+                active.extend(step.created)
+                known.update(step.created)
+                executions += len(step.created)
+                event = (
+                    f"Widened the frontier from {step.arguments[0]} with "
+                    f"{len(step.created)} additional executable hypotheses."
+                )
+                if step.relation_page:
+                    start, stop, total = step.relation_page
+                    frontier = next(
+                        (
+                            item
+                            for item in reversed(open_frontiers)
+                            if item["source"] == step.arguments[0]
+                            and item["exposed"] == start
+                        ),
+                        None,
+                    )
+                    if frontier is None or frontier["total"] != total:
+                        raise ValueError("Widen does not continue an open stable relation page")
+                    frontier["node_ids"].extend(step.created)
+                    frontier["exposed"] = stop
+        elif step.action == "Inspect":
+            proposal_id = step.arguments[0]
+            if proposal_status.get(proposal_id) != "visible" or len(step.created) != 1:
+                raise ValueError("Inspect requires one visible proposal and one replayed node")
             active.extend(step.created)
             known.update(step.created)
-            executions += len(step.created)
+            proposal_status[proposal_id] = "inspected"
+            executions += 1
             event = (
-                f"Widened the frontier from {step.arguments[0]} with "
-                f"{len(step.created)} additional executable hypotheses."
+                f"Inspected {proposal_id} ({demo.proposals[proposal_id].relation}) "
+                f"and created {step.created[0]}."
             )
-            if step.relation_page:
-                start, stop, total = step.relation_page
-                frontier = next(
-                    (
-                        item
-                        for item in reversed(open_frontiers)
-                        if item["source"] == step.arguments[0]
-                        and item["exposed"] == start
-                    ),
-                    None,
-                )
-                if frontier is None or frontier["total"] != total:
-                    raise ValueError("Widen does not continue an open stable relation page")
-                frontier["node_ids"].extend(step.created)
-                frontier["exposed"] = stop
+        elif step.action == "Park":
+            node_id = step.arguments[0]
+            active.remove(node_id)
+            parked.add(node_id)
+            if selected == node_id:
+                selected = None
+            event = f"Parked {node_id} without making a semantic judgment."
+        elif step.action == "Recall":
+            node_id = step.arguments[0]
+            parked.remove(node_id)
+            active.append(node_id)
+            event = f"Recalled {node_id} to the visible workspace."
         elif step.action == "Select":
             selected = step.arguments[0]
             event = (
@@ -3554,7 +4996,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             )
         elif step.action == "Prune":
             node = demo.hypotheses[step.arguments[0]]
-            if node.denotation and not _has_public_prune_reason(
+            if not _has_public_prune_reason(
                 demo,
                 step,
                 node,
@@ -3562,9 +5004,11 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 int(demo.private_metadata.get("max_active", 24)),
             ):
                 raise ValueError(
-                    f"trajectory {demo.demo_id} prunes a nonempty branch without public evidence"
+                    f"trajectory {demo.demo_id} prunes without a verified public certificate"
                 )
             active.remove(step.arguments[0])
+            if selected == step.arguments[0]:
+                selected = None
             event = f"Pruned {step.arguments[0]}."
         elif step.action == "Combine":
             active.remove(step.arguments[0])
@@ -3603,7 +5047,13 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             selected = None
             event = f"Executed {step.action} into {step.created[0]}."
         elif step.action == "Commit":
+            node = demo.hypotheses[step.arguments[0]]
+            if not _has_valid_commit_certificate(demo, step, node):
+                raise ValueError(
+                    f"trajectory {demo.demo_id} commits without exact answer-and-intent proof"
+                )
             active = [step.arguments[0]]
+            parked.clear()
             committed_id = step.arguments[0]
             selected = None
             values = " ".join(demo.hypotheses[committed_id].denotation)
@@ -3611,6 +5061,11 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                 f"Committed {committed_id}. Return exactly these values in <answer>: "
                 f"{values}"
             )
+        elif step.action == "Abstain":
+            active = []
+            parked.clear()
+            selected = None
+            event = "Closed the search without a certified complete answer."
         else:
             raise ValueError(f"unsupported action {step.action}")
         messages.append(
@@ -3625,28 +5080,38 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         committed=(committed_id if step.action == "Commit" else None),
                         executions=executions,
                         known_ids=known,
+                        parked_ids=parked,
                     )
                     + (
                         "\n"
-                        + "\n".join(
-                            serialize_relation_page_state(
-                                str(frontier["source"]),
-                                exposed=int(frontier["exposed"]),
-                                total=int(frontier["total"]),
-                                page_size=int(
-                                    demo.private_metadata.get(
-                                        "relation_page_size", 6
-                                    )
-                                ),
+                        + (
+                            _public_proposal_catalogs(
+                                demo, lazy_frontiers, proposal_status
                             )
-                            for frontier in open_frontiers
-                            if committed_id is None
-                            and set(frontier["node_ids"]).intersection(active)
+                            if lazy_protocol
+                            else "\n".join(
+                                serialize_relation_page_state(
+                                    str(frontier["source"]),
+                                    exposed=int(frontier["exposed"]),
+                                    total=int(frontier["total"]),
+                                    page_size=int(
+                                        demo.private_metadata.get(
+                                            "relation_page_size", 6
+                                        )
+                                    ),
+                                )
+                                for frontier in open_frontiers
+                                if committed_id is None
+                                and set(frontier["node_ids"]).intersection(active)
+                            )
                         )
-                        if any(
-                            committed_id is None
-                            and set(frontier["node_ids"]).intersection(active)
-                            for frontier in open_frontiers
+                        if committed_id is None
+                        and (
+                            (lazy_protocol and lazy_frontiers)
+                            or any(
+                                set(frontier["node_ids"]).intersection(active)
+                                for frontier in open_frontiers
+                            )
                         )
                         else ""
                     )
@@ -3686,8 +5151,13 @@ def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
     trajectory = trajectory_sft_record(demo)
     records = []
     decision_index = 0
+    step_index = 0
     for message_index, message in enumerate(trajectory["messages"]):
         if message.get("role") != "assistant" or "<action>" not in message.get("content", ""):
+            continue
+        step = demo.steps[step_index]
+        step_index += 1
+        if step.supervision != "policy_target":
             continue
         prefix = [dict(item) for item in trajectory["messages"][: message_index + 1]]
         for prior in prefix:
@@ -3702,6 +5172,7 @@ def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
                 "extra_info": {
                     **trajectory["extra_info"],
                     "decision_index": decision_index,
+                    "trajectory_step_index": step_index - 1,
                     "target_is_graph_action": True,
                 },
             }

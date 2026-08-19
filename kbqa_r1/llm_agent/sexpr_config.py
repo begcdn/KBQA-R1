@@ -31,7 +31,8 @@ class SExprGenerationConfig:
     # compatibility and enabled explicitly in HyPER-R1 training/evaluation.
     hyper_r1_enable: bool = False
     hyper_r1_max_active: int = 24
-    hyper_r1_max_nodes: int = 24
+    hyper_r1_max_nodes: int = 128
+    hyper_r1_max_execution_attempts: int = 24
     # One complete ranked page. Repeated Widen actions expose later pages.
     hyper_r1_frontier_width: int = 6
     hyper_r1_relation_model: Optional[str] = None

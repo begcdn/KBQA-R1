@@ -11,18 +11,21 @@ HYPER_R1_INSTRUCTIONS = """
 
 HyPER-R1 executable hypothesis graph:
 - These instructions replace the legacy two-argument Find_relation format. Never write a relation name or free-text relation intent; relation proposals belong to the environment.
-- `Find_relation [ source ]` asks the environment to rank relations from the immutable question and that exact executable state. The environment executes a small frontier and returns H-numbered alternatives.
-- `Widen [ source ]` asks for the next ranked page from the same open frontier when the visible candidates do not cover the question. It is repeatable while another page exists and must occur before Select.
+- `Find_relation [ source ]` asks the environment to rank every structurally legal relation from the immutable question and that exact executable state. It exposes P-numbered symbolic proposals and executes nothing.
+- `Widen [ source ]` exposes the next stable proposal page. Browsing proposals does not consume graph-execution budget.
+- `Inspect [ Pn ]` executes exactly one visible proposal and creates an H-numbered hypothesis. Inspect only proposals that could discharge part of the question.
 - When a question requires an intersection, `Find_relation` may open a second root from another supplied candidate entity or candidate literal while earlier hypotheses remain active. Continuing an existing hypothesis still requires `Select` first.
 - Use exactly one `Select [ Hn ]` action to continue reasoning from a hypothesis.
-- Use `Prune [ Hn ]` only for a visible path or execution contradiction. An empty result is direct negative evidence; low rank, low confidence, and a merely different nonempty answer are not contradiction certificates.
+- `Park [ Hn ]` reversibly removes an unresolved hypothesis from the visible workspace; `Recall [ Hn ]` restores it. Parking is not evidence that a path is wrong.
+- Use `Prune [ Hn ]` only for a visible path or execution contradiction. An empty result is terminal negative evidence only when no pending `Count` obligation can turn it into the valid answer zero; otherwise Park it. Low rank, low confidence, and a merely different nonempty answer are not contradiction certificates.
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
 - Use `Merge [ expression | ontology_type ]` after Select when the question restricts a retained hypothesis to a Freebase type, such as `religion.religious_leader`. Infer the type from the question; it need not appear among Candidate Entities.
 - The existing executable logical actions remain available: `Order [ mode | expression_or_type | relation ]`, `Compare [ mode | relation | value ]`, `Time_constraint [ relation | time ]`, and `Count [ expression ]`. Select an existing hypothesis before applying a continuation operator; Compare and ontology-rooted Order may open an independent branch that can later be combined.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
+- If the execution or turn budget is exhausted and no complete hypothesis is justified, use `Abstain`; resource exhaustion never justifies Prune or Commit.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
 - Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
-- The executed-node and action budgets are fixed. Widen only when the extra evidence is needed; never manufacture room by deleting a still-plausible branch.
+- Proposal browsing, visible workspace, stored hypotheses, execution attempts, and policy turns have separate budgets. Never manufacture room by Pruning a still-plausible branch.
 Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. After Commit, perform no more graph actions and copy the committed values exactly into <answer>.
 """.rstrip()
 
@@ -112,14 +115,41 @@ def build_hyper_prompt(
 
 
 def dataset_candidate_entities(row: Dict[str, Any]) -> Sequence[Sequence[str]]:
-    """Read candidate entity label/identity pairs from supported dataset schemas."""
+    """Return oracle-linked topic entities for the shared SFT/RL protocol.
+
+    Processed GrailQA rows may cache ontology roots, literals, or additional
+    linker candidates beside the true topic entities.  When the annotated
+    function list is present, its MID-valued START nodes define the oracle
+    entity link.  Cached entities contribute display names only.
+    """
     extra = row.get("extra_info") if isinstance(row.get("extra_info"), dict) else {}
-    entities = extra.get("extracted_entities") or extra.get("candidate_entities") or ()
-    if entities:
-        return entities
     reward = row.get("reward_model")
     ground_truth = reward.get("ground_truth", {}) if isinstance(reward, dict) else {}
-    return ground_truth.get("candidate_entities") or ()
+    entities = (
+        extra.get("extracted_entities")
+        or extra.get("candidate_entities")
+        or ground_truth.get("candidate_entities")
+        or ()
+    )
+    names = {
+        str(entity[-1]): str(entity[0])
+        for entity in entities
+        if entity and str(entity[-1]).startswith(("m.", "g."))
+    }
+    functions = extra.get("function_list") or ground_truth.get("function_list") or ()
+    if functions:
+        roots = []
+        for function in functions:
+            roots.extend(
+                re.findall(r"START\('((?:m|g)\.[A-Za-z0-9_]+)'\)", str(function))
+            )
+        unique_roots = list(dict.fromkeys(roots))
+        return [[names.get(identity, identity), identity] for identity in unique_roots]
+    return [
+        [str(entity[0]), str(entity[-1])]
+        for entity in entities
+        if entity and str(entity[-1]).startswith(("m.", "g."))
+    ]
 
 
 _XSD = "http://www.w3.org/2001/XMLSchema#"

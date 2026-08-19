@@ -25,7 +25,9 @@ def demo(name, family):
 
 
 def test_curriculum_caps_repetitive_commits_but_keeps_all_core_behaviors():
-    recoveries = [demo(f"r{index}", "delayed_frontier_recovery") for index in range(2)]
+    recoveries = [
+        demo(f"r{index}", "certified_empty_recovery") for index in range(2)
+    ]
     progress = [demo("p0", "direct_frontier_progress")]
     conjunctions = [demo("c0", "conjunction")]
     commits = [demo(f"d{index}", "frontier_commit") for index in range(20)]

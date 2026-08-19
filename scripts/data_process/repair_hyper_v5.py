@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Repair HyPER-v5 rationale facts and re-export SFT data without graph execution."""
+"""Inspect the retired HyPER-v5 rationale repair.
+
+HyPER-v5 cannot be upgraded to proof-carrying supervision without replaying the
+graph and comparing its terminal program with the gold logical program.  The
+historical rationale transformation remains available for audit, but export is
+blocked for uncertified corpora rather than silently relabelling them as valid.
+"""
 
 from __future__ import annotations
 
@@ -138,6 +144,21 @@ def export_repaired_corpus(
     source_report_path: Path | None = None,
 ) -> Dict[str, Any]:
     demos = _read_demos(input_path)
+    uncertified = [
+        (demo.demo_id, step.action)
+        for demo in demos
+        for step in demo.steps
+        if step.action in {"Prune", "Commit"} and not step.certificate_kind
+    ]
+    if uncertified:
+        examples = ", ".join(
+            f"{demo_id}:{action}" for demo_id, action in uncertified[:3]
+        )
+        raise RuntimeError(
+            "HyPER-v5 cannot be made proof-carrying by a rationale-only repair; "
+            "rebuild the corpus with graph replay and logical-program certificates "
+            f"(uncertified examples: {examples})"
+        )
     repaired: List[HyperDemonstration] = []
     counts: Counter = Counter()
     for demo in demos:

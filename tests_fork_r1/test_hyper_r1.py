@@ -13,6 +13,7 @@ from kbqa_r1.hyper_r1 import (
     dependency_function_state,
     graph_action_token_mask,
     penalize_invalid_actions,
+    public_question_contract,
     result_display_labels,
     result_denotation_values,
     required_hyper_relation_model,
@@ -102,11 +103,97 @@ def test_empty_hypotheses_do_not_merge():
     assert first.is_active and second.is_active
 
 
+def test_public_question_contract_recognizes_count_without_phone_number_false_positive():
+    assert public_question_contract(
+        "How many people satisfy the condition?"
+    ).count_required is True
+    assert public_question_contract(
+        "What is the number of people satisfying the condition?"
+    ).count_required is True
+    assert public_question_contract(
+        "What is the phone number of the hotel?"
+    ).count_required is False
+
+
+def test_empty_count_branch_is_preserved_and_can_reach_zero_commit():
+    graph = HypothesisGraph(max_active=3, max_nodes=6)
+    graph.register_public_question(0, "How many people satisfy condition X?")
+    empty = add(graph, "r.people", [])
+
+    with pytest.raises(ValueError, match="Count can produce"):
+        graph.prune(0, empty.node_id)
+
+    graph.select(0, empty.node_id)
+    assert graph.execution_error(
+        0,
+        opens_frontier=False,
+        frontier_width=6,
+        operation="Count",
+    ) is None
+    assert "only be continued" in graph.execution_error(
+        0,
+        opens_frontier=True,
+        frontier_width=6,
+        operation="Find_relation",
+    )
+
+    graph.mark_expanded(0, empty.node_id)
+    counted = graph.add_executed(
+        sample_id=0,
+        function_state=(
+            "expression1 = JOIN('r.people', expression1)",
+            "expression1 = COUNT(expression1)",
+        ),
+        target_expression="expression1",
+        sexpr="(COUNT (JOIN r.people m.topic))",
+        denotation=("0",),
+        parent_id=empty.node_id,
+        operation="count",
+    )
+
+    assert graph.commit(0, counted.node_id).denotation == ("0",)
+
+
+def test_noncount_empty_prune_requires_and_records_public_certificate():
+    graph = HypothesisGraph(max_active=3)
+    graph.register_public_question(0, "Which people satisfy condition X?")
+    empty = add(graph, "r.people", [])
+
+    certificate = graph.prune(0, empty.node_id)
+
+    assert certificate.kind == "empty_monotone"
+    assert certificate.empty_preserving_completion is True
+    assert graph.state(0).prune_certificates[empty.node_id] == certificate
+    assert empty.semantic_status.value == "proved_false"
+
+
+def test_missing_public_question_fails_closed_for_empty_prune():
+    graph = HypothesisGraph(max_active=3)
+    empty = add(graph, "r.people", [])
+
+    with pytest.raises(ValueError, match="Count can produce"):
+        graph.prune(0, empty.node_id)
+
+
+def test_count_is_rejected_when_public_question_does_not_require_it():
+    graph = HypothesisGraph(max_active=3)
+    graph.register_public_question(0, "Which people satisfy condition X?")
+    answer = add(graph, "r.people", ["m.person"])
+    graph.select(0, answer.node_id)
+
+    assert "not licensed" in graph.execution_error(
+        0,
+        opens_frontier=False,
+        frontier_width=6,
+        operation="Count",
+    )
+
+
 def test_environment_enforces_hard_active_budget():
     graph = HypothesisGraph(max_active=2)
     low = add(graph, "r.low", ["m.low"], score=0.1)
     middle = add(graph, "r.middle", ["m.middle"], score=0.5)
-    with pytest.raises(RuntimeError, match="prune before exploring"):
+    with pytest.raises(RuntimeError, match="park a viable hypothesis"):
         add(graph, "r.high", ["m.high"], score=0.9)
 
     assert low.status == HypothesisStatus.ACTIVE
@@ -124,13 +211,13 @@ def test_commit_requires_nonempty_active_hypothesis():
     committed = graph.commit(0, answer.node_id)
     assert committed.status == HypothesisStatus.COMMITTED
     assert graph.state(0).committed_id == answer.node_id
-    assert empty.status == HypothesisStatus.PRUNED
+    assert empty.status == HypothesisStatus.CLOSED
     assert "committed" in graph.execution_error(
         0, opens_frontier=True, frontier_width=3
     ).lower()
 
 
-def test_executable_continuation_requires_select_and_a_complete_page_budget():
+def test_symbolic_relation_page_does_not_consume_hypothesis_capacity():
     graph = HypothesisGraph(max_active=4, max_nodes=8)
     first = add(graph, "r.first", ["m.first"])
     add(graph, "r.second", ["m.second"])
@@ -140,9 +227,36 @@ def test_executable_continuation_requires_select_and_a_complete_page_budget():
     )
     graph.select(0, first.node_id)
     assert graph.execution_error(0, opens_frontier=False, frontier_width=2) is None
-    assert "complete relation page" in graph.execution_error(
-        0, opens_frontier=True, frontier_width=4
+    assert graph.execution_error(0, opens_frontier=True, frontier_width=40) is None
+    assert len(graph.state(0).nodes) == 2
+
+
+def test_park_and_recall_change_storage_visibility_not_semantic_truth():
+    graph = HypothesisGraph(max_active=2)
+    first = add(graph, "r.first", ["m.first"])
+    second = add(graph, "r.second", ["m.second"])
+
+    graph.park(0, first.node_id)
+    assert first.status == HypothesisStatus.PARKED
+    assert first.semantic_status.value == "unresolved"
+    assert graph.available_active_slots(0) == 1
+    graph.recall(0, first.node_id)
+    assert first.status == HypothesisStatus.ACTIVE
+    assert {node.node_id for node in graph.active_nodes(0)} == {
+        first.node_id,
+        second.node_id,
+    }
+
+
+def test_execution_attempt_budget_is_separate_from_persistent_store():
+    graph = HypothesisGraph(
+        max_active=2, max_nodes=10, max_execution_attempts=2
     )
+    assert graph.record_execution_attempt(0) == 1
+    assert graph.record_execution_attempt(0) == 2
+    with pytest.raises(RuntimeError, match="execution budget exhausted"):
+        graph.record_execution_attempt(0)
+    assert graph.has_capacity(0, 5)
 
 
 def test_relation_source_is_bound_to_candidates_and_selected_state():
@@ -218,7 +332,7 @@ def test_non_frontier_execution_cannot_escape_exhausted_node_budget():
     add(graph, "r.second", ["m.second"])
     graph.select(0, first.node_id)
 
-    assert "node budget" in graph.execution_error(
+    assert "persistent hypothesis store" in graph.execution_error(
         0, opens_frontier=False, frontier_width=1
     ).lower()
 
@@ -429,6 +543,21 @@ def test_invalid_commit_cannot_keep_answer_reward():
     assert result[1].tolist() == [0.0, 0.0, -0.25]
 
 
+def test_abstention_is_safe_but_never_earns_answer_reward():
+    rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+    mask = torch.ones_like(rewards)
+    result = enforce_commit_reward(
+        rewards,
+        mask,
+        torch.tensor([False, False]),
+        abstained=torch.tensor([True, False]),
+        invalid_penalty=0.25,
+    )
+
+    assert result[0].tolist() == [0.0, 0.0, 0.0]
+    assert result[1].tolist() == [0.0, 0.0, -0.25]
+
+
 def test_invalid_action_tokens_cannot_keep_positive_advantage():
     advantages = torch.tensor([[0.8, -0.7, 0.1]])
     invalid = torch.tensor([[True, True, False]])
@@ -455,7 +584,7 @@ def test_execution_budget_only_charges_excess_over_sibling_rollout():
         rewards,
         mask,
         counts,
-        max_nodes=6,
+        max_execution_attempts=6,
         cost=0.12,
         group_ids=["question", "question"],
     )

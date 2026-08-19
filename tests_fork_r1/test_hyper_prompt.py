@@ -58,6 +58,52 @@ def test_candidate_entities_fall_back_to_reward_metadata():
     assert dataset_candidate_entities(row) == entities
 
 
+def test_candidate_entities_follow_gold_roots_and_drop_other_cached_values():
+    row = {
+        "extra_info": {
+            "function_list": [
+                "expression0 = START('m.topic')",
+                "expression1 = START('m.second')",
+                "expression2 = START('people.person')",
+            ],
+            "extracted_entities": [
+                ["Distractor", "m.other"],
+                ["Second Topic", "m.second"],
+                ["Person type", "people.person"],
+                ["Topic", "m.topic"],
+            ],
+        }
+    }
+
+    assert dataset_candidate_entities(row) == [
+        ["Topic", "m.topic"],
+        ["Second Topic", "m.second"],
+    ]
+
+
+def test_augmented_prompt_exposes_only_oracle_linked_topic_entities():
+    row = {
+        "prompt": [{"role": "user", "content": "Question: Who founded Topic?"}],
+        "extra_info": {
+            "function_list": [
+                "expression0 = START('m.topic')",
+                "expression1 = START('organization.organization')",
+            ],
+            "extracted_entities": [
+                ["Topic", "m.topic"],
+                ["Unrelated candidate", "m.distractor"],
+            ],
+        },
+    }
+
+    content = augment_dataset_row(row)["prompt"][0]["content"]
+
+    assert "Candidate Entities: ['Topic' (m.topic)]" in content
+    assert "m.distractor" not in content
+    assert "organization.organization" not in content
+    assert "START(" not in content
+
+
 def test_question_literals_are_public_and_deterministic():
     literals = question_candidate_literals(
         "What recipe takes at most 120.0 minutes and uses 1.5 of the ingredient?"

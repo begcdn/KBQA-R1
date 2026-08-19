@@ -639,7 +639,8 @@ class RayPPOTrainer:
             enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
             hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
             hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
-            hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+            hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
+            hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
             hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
             hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
             sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
@@ -847,7 +848,8 @@ class RayPPOTrainer:
                     enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
                     hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
                     hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
-                    hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+                    hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
+                    hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
                     hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
                     hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
                     sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
@@ -961,9 +963,26 @@ class RayPPOTrainer:
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             if self.config.algorithm.get("hyper_r1_enable", False):
-                if "hyper_r1_commit_valid" not in test_batch.batch:
+                required_hyper_fields = {
+                    "hyper_r1_commit_valid",
+                    "hyper_r1_commit_protocol_valid",
+                    "hyper_r1_commit_answer_exact",
+                    "hyper_r1_commit_intent_equivalent",
+                    "hyper_r1_gold_contract_available",
+                    "hyper_r1_abstained",
+                }
+                missing_hyper_fields = required_hyper_fields.difference(
+                    test_batch.batch.keys()
+                )
+                if missing_hyper_fields:
                     raise RuntimeError(
-                        "HyPER-R1 validation is missing hyper_r1_commit_valid"
+                        "HyPER-R1 validation is missing fields: "
+                        + ", ".join(sorted(missing_hyper_fields))
+                    )
+                if not bool(test_batch.batch["hyper_r1_gold_contract_available"].all()):
+                    raise RuntimeError(
+                        "HyPER-R1 validation cannot use answer-only Commit reward; "
+                        "every sample needs a gold logical program"
                     )
                 from kbqa_r1.hyper_r1 import enforce_commit_reward
 
@@ -972,6 +991,7 @@ class RayPPOTrainer:
                     reward_tensor,
                     validation_mask,
                     test_batch.batch["hyper_r1_commit_valid"],
+                    abstained=test_batch.batch["hyper_r1_abstained"],
                     invalid_penalty=float(
                         self.config.algorithm.get(
                             "hyper_r1_invalid_commit_penalty", 0.25
@@ -981,6 +1001,31 @@ class RayPPOTrainer:
                 reward_extra_infos_dict["hyper_r1_commit_valid"].extend(
                     float(value)
                     for value in test_batch.batch["hyper_r1_commit_valid"]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_commit_protocol_valid"].extend(
+                    float(value)
+                    for value in test_batch.batch[
+                        "hyper_r1_commit_protocol_valid"
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_commit_intent_equivalent"].extend(
+                    float(value)
+                    for value in test_batch.batch[
+                        "hyper_r1_commit_intent_equivalent"
+                    ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_abstained"].extend(
+                    float(value)
+                    for value in test_batch.batch["hyper_r1_abstained"]
                     .detach()
                     .cpu()
                     .tolist()
@@ -1522,7 +1567,8 @@ class RayPPOTrainer:
                                 enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
                                 hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
                                 hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
-                                hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 24),
+                                hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
+                                hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
                                 hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
                                 hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
                                 sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
@@ -1781,6 +1827,11 @@ class RayPPOTrainer:
                             required = {
                                 "hyper_r1_execution_counts",
                                 "hyper_r1_commit_valid",
+                                "hyper_r1_commit_protocol_valid",
+                                "hyper_r1_commit_answer_exact",
+                                "hyper_r1_commit_intent_equivalent",
+                                "hyper_r1_gold_contract_available",
+                                "hyper_r1_abstained",
                                 "hyper_r1_premature_answer",
                                 "response_mask",
                             }
@@ -1789,6 +1840,15 @@ class RayPPOTrainer:
                                 raise RuntimeError(
                                     "HyPER-R1 rollout fields are missing: "
                                     + ", ".join(sorted(missing))
+                                )
+                            if not bool(
+                                batch.batch[
+                                    "hyper_r1_gold_contract_available"
+                                ].all()
+                            ):
+                                raise RuntimeError(
+                                    "HyPER-R1 training cannot use answer-only Commit "
+                                    "reward; every rollout needs a gold logical program"
                                 )
                             from kbqa_r1.hyper_r1 import (
                                 charge_execution_budget,
@@ -1799,6 +1859,7 @@ class RayPPOTrainer:
                                 batch.batch["token_level_scores"],
                                 batch.batch["response_mask"],
                                 batch.batch["hyper_r1_commit_valid"],
+                                abstained=batch.batch["hyper_r1_abstained"],
                                 invalid_penalty=float(
                                     self.config.algorithm.get(
                                         "hyper_r1_invalid_commit_penalty", 0.25
@@ -1809,8 +1870,10 @@ class RayPPOTrainer:
                                 hyper_task_rewards,
                                 batch.batch["response_mask"],
                                 batch.batch["hyper_r1_execution_counts"],
-                                max_nodes=int(
-                                    self.config.get("hyper_r1", {}).get("max_nodes", 24)
+                                max_execution_attempts=int(
+                                    self.config.get("hyper_r1", {}).get(
+                                        "max_execution_attempts", 24
+                                    )
                                 ),
                                 cost=float(
                                     self.config.algorithm.get("hyper_r1_budget_cost", 0.05)
@@ -1853,6 +1916,30 @@ class RayPPOTrainer:
                         if self.config.algorithm.get("hyper_r1_enable", False):
                             metrics["hyper_r1/commit_valid_rate"] = float(
                                 batch.batch["hyper_r1_commit_valid"].float().mean().item()
+                            )
+                            metrics["hyper_r1/commit_protocol_valid_rate"] = float(
+                                batch.batch["hyper_r1_commit_protocol_valid"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/commit_answer_exact_rate"] = float(
+                                batch.batch["hyper_r1_commit_answer_exact"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/commit_intent_equivalent_rate"] = float(
+                                batch.batch["hyper_r1_commit_intent_equivalent"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/abstain_rate"] = float(
+                                batch.batch["hyper_r1_abstained"]
+                                .float()
+                                .mean()
+                                .item()
                             )
                             metrics["hyper_r1/mean_execution_attempts"] = float(
                                 batch.batch["hyper_r1_execution_counts"].float().mean().item()

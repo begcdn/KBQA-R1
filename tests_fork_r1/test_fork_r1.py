@@ -7,6 +7,7 @@ from kbqa_r1.fork_r1 import (
     RelationCandidate,
     append_intervened_join,
     apply_counterfactual_credit,
+    build_fork_decision,
     choose_hard_sibling,
     find_token_subsequence,
     select_intervention,
@@ -50,6 +51,25 @@ class ForkR1Test(unittest.TestCase):
             RelationCandidate("easy", 0.2),
         ]
         self.assertEqual(choose_hard_sibling("chosen", candidates).relation, "hard")
+
+    def test_hyper_catalog_allows_a_single_legal_relation(self):
+        catalog = build_fork_decision(
+            sample_id=0,
+            turn=0,
+            action_index=0,
+            step_number=0,
+            entity_argument="m.topic",
+            relation_prompt="question",
+            selected_relation=RelationCandidate("r.only", 0.9),
+            candidates=[RelationCandidate("r.only", 0.9)],
+            scores=[0.9],
+            state_before=(),
+            raw_action="Find_relation [ m.topic ]",
+            require_sibling=False,
+        )
+        self.assertIsNotNone(catalog)
+        self.assertEqual(catalog.ranked_relations[0].relation, "r.only")
+        self.assertEqual(catalog.resolver_margin, float("inf"))
 
     def test_intervention_targets_smallest_resolver_margin(self):
         selected = select_intervention(

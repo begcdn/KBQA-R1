@@ -45,6 +45,19 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
     def fit(self):  # noqa: C901 retain structure
         from pprint import pprint
 
+        filter_cfg = getattr(self.config.algorithm, "filter_groups", None)
+        filter_enabled = bool(filter_cfg and getattr(filter_cfg, "enable", False))
+        hyper_enabled = bool(
+            self.config.get("hyper_r1", {}).get("enable", False)
+            or self.config.algorithm.get("hyper_r1_enable", False)
+        )
+        if filter_enabled and hyper_enabled:
+            raise RuntimeError(
+                "HyPER-R1 cannot use the DAPO filtering loop: its early group "
+                "filter sees ungated answer reward. Use the base KBQA trainer "
+                "until filtering applies the formal Commit certificate first."
+            )
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -74,9 +87,6 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
             if self.config.global_profiler.steps is not None
             else False
         )
-
-        filter_cfg = getattr(self.config.algorithm, "filter_groups", None)
-        filter_enabled = bool(filter_cfg and getattr(filter_cfg, "enable", False))
 
         # If filtering not enabled, fall back to original trainer behavior.
         if not filter_enabled:
@@ -156,7 +166,8 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
                                     ),
                                     hyper_r1_enable=self.config.get("hyper_r1", {}).get("enable", False),
                                     hyper_r1_max_active=self.config.get("hyper_r1", {}).get("max_active", 24),
-                                    hyper_r1_max_nodes=self.config.get("hyper_r1", {}).get("max_nodes", 24),
+                                    hyper_r1_max_nodes=self.config.get("hyper_r1", {}).get("max_nodes", 128),
+                                    hyper_r1_max_execution_attempts=self.config.get("hyper_r1", {}).get("max_execution_attempts", 24),
                                     hyper_r1_frontier_width=self.config.get("hyper_r1", {}).get("frontier_width", 6),
                                     hyper_r1_relation_model=self.config.get("hyper_r1", {}).get("relation_model"),
                                     sparql_url=self.config.get("sparql", {}).get(

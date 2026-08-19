@@ -25,5 +25,6 @@ exec python3 "${REPO_ROOT}/scripts/data_process/build_hyper_demonstrations.py" \
   --workers "${HYPER_BUILD_WORKERS}" \
   --frontier-width 6 \
   --max-active 24 \
-  --max-nodes 24 \
-  --max-turns 16
+  --max-nodes 128 \
+  --max-execution-attempts 24 \
+  --max-turns 32
