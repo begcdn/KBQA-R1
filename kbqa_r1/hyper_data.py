@@ -934,7 +934,11 @@ class DemonstrationBuilder:
                 }
             )
 
-        all_present = bool(decisions) and all(row["present"] for row in decisions)
+        # Programs rooted directly in an ontology type can begin with an
+        # operator such as ARGMAX and require no relation frontier at all.
+        # In that case every required relation is present vacuously; the
+        # operator simulation and runtime budgets below decide reachability.
+        all_present = all(row["present"] for row in decisions)
         decision_by_index = {
             join.index: row for join, row in zip(plan.joins, decisions)
         }

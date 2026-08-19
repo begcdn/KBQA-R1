@@ -1489,6 +1489,26 @@ def test_full_program_proposal_audit_applies_the_complete_lazy_runtime_budget():
     assert builder.stats["gold_program_runtime_reachable"] == 0
 
 
+def test_operator_only_program_is_reachable_without_relation_decisions():
+    functions = [
+        "expression1 = START('location.location')",
+        "expression1 = ARG('ARGMAX', expression1, 'location.location.population')",
+    ]
+    builder = _DemonstrationBuilder(fake_executor, one_hop_candidates)
+
+    audit = builder._audit_gold_program_proposals(
+        "What location has the largest population?",
+        compile_gold_plan(functions),
+    )
+
+    assert audit["decisions"] == []
+    assert audit["all_relations_present"] is True
+    assert audit["supported_program"] is True
+    assert audit["runtime_reachable"] is True
+    assert audit["required_actions"] == 2
+    assert builder.stats["gold_program_runtime_reachable"] == 1
+
+
 def test_builder_never_exposes_gold_types_as_candidate_entities():
     row = {
         "ID": "no-type-leak",
