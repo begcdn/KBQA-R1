@@ -31,6 +31,7 @@ BASE_MODEL=${BASE_MODEL:-"/ossfs/workspace/aml2/aml_ri/fengyi/Llama-3.1-8B-Instr
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-4}
 TOTAL_STEPS=${TOTAL_STEPS:-5000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
+SAVE_FREQ=${SAVE_FREQ:-after_each_epoch}
 
 # HyPER decision states can exceed 16k tokens. The target action is at the end,
 # so silent right truncation would remove the supervision we intend to learn.
@@ -126,6 +127,7 @@ echo "GPUs          : ${NGPUS} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 echo "Total steps   : ${TOTAL_STEPS}"
 echo "Total epochs  : ${TOTAL_EPOCHS}"
 echo "Global batch  : ${GLOBAL_BATCH_SIZE}"
+echo "Save frequency: ${SAVE_FREQ}"
 echo "Sequence limit: ${SFT_MAX_LENGTH} (${SFT_TRUNCATION})"
 echo "Micro batch   : ${MICRO_BATCH_SIZE_PER_GPU}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
@@ -170,7 +172,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
   trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
-    trainer.save_freq=after_each_epoch \
+    trainer.save_freq=${SAVE_FREQ} \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_STEPS} \
     trainer.logger=['console','tensorboard'] \
@@ -201,7 +203,7 @@ else
     trainer.experiment_name="${EXP_NAME}" \
     trainer.total_training_steps=${TOTAL_STEPS} \
     trainer.total_epochs=${TOTAL_EPOCHS} \
-    trainer.save_freq=after_each_epoch \
+    trainer.save_freq=${SAVE_FREQ} \
     trainer.logger=['console','tensorboard'] \
     optim.lr=1e-5 \
     optim.warmup_steps_ratio=0.1 \
