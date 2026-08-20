@@ -2017,9 +2017,17 @@ class DemonstrationBuilder:
                     return None
                 recovered_here = None
                 if recovery_outcome is None:
+                    sibling_anchor = parent
+                    while (
+                        sibling_anchor.role == "type_constrained"
+                        and sibling_anchor.parent_id is not None
+                        and sibling_anchor.parent_id in hypotheses
+                    ):
+                        sibling_anchor = hypotheses[sibling_anchor.parent_id]
                     recovered_here = self._append_natural_recovery_probe(
                         question=question,
                         required_parent=parent,
+                        sibling_anchor=sibling_anchor,
                         continuation=None,
                         hypotheses=hypotheses,
                         active=active,
@@ -2659,6 +2667,7 @@ class DemonstrationBuilder:
         active: List[str],
         steps: List[DemonstrationStep],
         stat_scope: str,
+        sibling_anchor: Optional[ExecutedHypothesis] = None,
     ) -> Optional[str]:
         """Test a naturally preferred sibling, preserve uncertainty, and recover.
 
@@ -2669,12 +2678,18 @@ class DemonstrationBuilder:
         the public Count contract; nonempty results are parked, never called
         false merely because they differ from gold.
         """
+        # Unary semantic transforms such as a type constraint replace the
+        # required relation node in active memory. Their alternatives remain
+        # siblings of the pre-transform node, not of the transformed result.
+        # Keep the resume target separate from the node that identifies the
+        # naturally competing relation frontier.
+        anchor = sibling_anchor or required_parent
         siblings = [
             node
             for node_id in active
             if (node := hypotheses.get(node_id)) is not None
-            and node.hypothesis_id != required_parent.hypothesis_id
-            and node.parent_id == required_parent.parent_id
+            and node.hypothesis_id != anchor.hypothesis_id
+            and node.parent_id == anchor.parent_id
             and node.denotation
             and node.role
             not in {

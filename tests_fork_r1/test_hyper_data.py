@@ -216,6 +216,50 @@ def test_operator_program_teaches_count_after_retained_relation_frontier():
     assert any("Count [ expression1 ]" in message for message in assistant)
 
 
+def test_operator_recovery_uses_relation_siblings_below_type_constraint():
+    row = {
+        "ID": "typed-count-recovery",
+        "question": "How many subjects are connected to the topic?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+            "expression2 = START('domain.subject')",
+            "expression1 = AND(expression2, expression1)",
+            "expression1 = COUNT(expression1)",
+        ],
+        "answer": ["1"],
+    }
+
+    def executor(functions, target):
+        del target
+        text = "\n".join(functions)
+        if "COUNT(" in text:
+            return ["1"]
+        if "AND(" in text:
+            return ["m.answer"]
+        if text.count("JOIN(") >= 3:
+            return ["m.probe"]
+        if "r.gold2" in text:
+            return ["m.answer"]
+        if "r.alt2" in text:
+            return ["m.alternative"]
+        if "r.gold1" in text:
+            return ["m.prefix"]
+        if "r.alt1" in text:
+            return ["m.other_prefix"]
+        return []
+
+    demo = DemonstrationBuilder(executor, candidates).build(row)[0]
+
+    assert demo.family == "operator_program"
+    assert demo.private_metadata["recovery_stratum"] == "operator_adjacent"
+    assert demo.private_metadata["probe_outcome"] == "unresolved_nonempty"
+    assert "Merge" in semantic_actions(demo)
+    assert "Count" in semantic_actions(demo)
+    assert DemonstrationValidator(executor).validate(demo) == []
+
+
 def test_count_teacher_rejects_private_operator_not_licensed_by_public_question():
     row = {
         "ID": "hidden-count-program",
@@ -326,9 +370,12 @@ def test_operator_program_executes_explicit_type_constraint_before_count():
         "Select",
         "Merge",
         "Select",
+        "Find_relation",
+        "Select",
         "Count",
         "Commit",
     ]
+    assert demo.private_metadata["recovery_stratum"] == "operator_adjacent"
     merge = next(step for step in demo.steps if step.action == "Merge")
     assert merge.arguments == ("expression1", "exhibitions.exhibition_subject")
     assert builder.stats["operator_program_type_constraint"] == 1
