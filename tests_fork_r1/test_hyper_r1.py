@@ -115,6 +115,20 @@ def test_public_question_contract_recognizes_count_without_phone_number_false_po
     ).count_required is False
 
 
+def test_public_question_contract_recognizes_grailqa_count_paraphrases_and_typos():
+    questions = (
+        "What number of planets are orbiting in heliocentric orbits?",
+        "What is the amount of camera uncompressed formats for Fujifilm?",
+        "What is the quantity of film characters that are foxes?",
+        "What is the count of building complexes with this function?",
+        "How may composers were there in Steal Away?",
+        "Find many Olympic disciplines are there in the games.",
+        "What numer of bicycle models are the same type as this bike?",
+    )
+
+    assert all(public_question_contract(question).count_required for question in questions)
+
+
 def test_empty_count_branch_is_preserved_and_can_reach_zero_commit():
     graph = HypothesisGraph(max_active=3, max_nodes=6)
     graph.register_public_question(0, "How many people satisfy condition X?")

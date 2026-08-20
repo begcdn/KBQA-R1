@@ -130,7 +130,23 @@ def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
 
 
 _COUNT_QUESTION_PATTERNS = (
-    re.compile(r"\bhow\s+many\b", re.IGNORECASE),
+    # GrailQA contains generated paraphrases and recurring spelling mistakes.
+    # Keep this question-only: the live policy never sees the gold program.
+    re.compile(r"\bhow\s+(?:many|mant|may|much)\b", re.IGNORECASE),
+    re.compile(r"\bfind\s+many\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:number|numbers|numer|amount|quantity|count)\s+of\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bwhat\s+(?:number|numer|amount|quantity)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:total|numerical)\s+"
+        r"(?:number|numbers|amount|quantity|count)\b",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"^\s*(?:what|which)\s+(?:is|was|are|were)\s+the\s+"
         r"(?:total\s+)?(?:number|count)\s+of\b",
@@ -143,15 +159,27 @@ _COUNT_QUESTION_PATTERNS = (
     ),
 )
 
+_NON_COUNT_NUMERIC_ATTRIBUTE_PATTERNS = (
+    re.compile(
+        r"\b(?:phone|telephone|fax|model|serial|episode|season|jersey|catalog|"
+        r"identification|registration)\s+number\b",
+        re.IGNORECASE,
+    ),
+)
+
 
 def public_question_contract(question: str) -> PublicQuestionContract:
     """Derive the supported Count contract from student-visible question text."""
     text = str(question).strip()
     if not text:
         return PublicQuestionContract(question="", count_required=None)
+    asks_for_count = any(pattern.search(text) for pattern in _COUNT_QUESTION_PATTERNS)
+    asks_for_numeric_attribute = any(
+        pattern.search(text) for pattern in _NON_COUNT_NUMERIC_ATTRIBUTE_PATTERNS
+    )
     return PublicQuestionContract(
         question=text,
-        count_required=any(pattern.search(text) for pattern in _COUNT_QUESTION_PATTERNS),
+        count_required=asks_for_count and not asks_for_numeric_attribute,
     )
 
 

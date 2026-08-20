@@ -199,9 +199,13 @@ def test_operator_program_teaches_count_after_retained_relation_frontier():
     assert semantic_actions(demo) == [
         "Find_relation",
         "Select",
+        "Find_relation",
+        "Select",
         "Count",
         "Commit",
     ]
+    assert demo.private_metadata["recovery_stratum"] == "operator_adjacent"
+    assert demo.private_metadata["probe_outcome"] == "unresolved_nonempty"
     assert DemonstrationValidator(executor).validate(demo) == []
     rendered = trajectory_sft_record(demo)
     assistant = [
@@ -681,6 +685,56 @@ def test_three_hop_program_applies_terminal_type_after_public_progress():
     over_budget = DemonstrationBuilder(executor, provider, max_turns=8)
     assert over_budget.build(row) == []
     assert over_budget.stats["trajectory_turn_budget_miss"] == 1
+
+
+def test_deep_program_recovers_from_a_natural_nonempty_continuation():
+    row = {
+        "ID": "deep-recovery",
+        "question": "Which answer follows all three intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+            "expression1 = JOIN('r.gold3', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if all(relation in text for relation in ("r.gold1", "r.gold2", "r.gold3")):
+            return ["m.answer"]
+        if "r.gold1" in text and "r.gold2" in text:
+            return ["m.second"]
+        if "r.gold1" in text:
+            return ["m.plausible"]
+        return ["m.other"]
+
+    def provider(query, state, join):
+        text = "\n".join(state)
+        if join.relation == "r.gold2":
+            return [
+                RelationOption("r.detour", 0.95, 1),
+                RelationOption("r.gold2", 0.90, 2),
+            ]
+        if "r.detour" in text:
+            return [
+                RelationOption("r.probe", 0.95, 1),
+                RelationOption("r.probe_alt", 0.80, 2),
+            ]
+        return [
+            RelationOption(join.relation, 0.95, 1),
+            RelationOption(f"r.alt_{join.index}", 0.80, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, provider, max_turns=32).build(row)[0]
+
+    assert demo.family == "deep_frontier_progress"
+    assert demo.private_metadata["recovery_stratum"] == "deep"
+    assert demo.private_metadata["probe_outcome"] == "unresolved_nonempty"
+    assert [step.action for step in demo.steps].count("Find_relation") == 4
+    assert any(step.action == "Park" for step in demo.steps)
+    assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
 
 
 def test_four_hop_program_stays_within_the_training_turn_budget():
@@ -1175,6 +1229,55 @@ def test_widen_also_applies_to_a_selected_hypothesis_continuation():
     assert DemonstrationValidator(fake_executor, max_active=24).validate(demo) == []
 
 
+def test_post_widen_state_can_probe_and_recover_without_rejecting_nonempty_evidence():
+    row = {
+        "ID": "post-widen-recovery",
+        "question": "Which answer follows both intended relations?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+            "expression1 = JOIN('r.gold2', expression1)",
+        ],
+        "answer": ["m.answer"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "r.gold1" in text and "r.gold2" in text:
+            return ["m.answer"]
+        if "r.gold1" in text:
+            return ["m.gold_prefix"]
+        return ["m.plausible"]
+
+    def provider(query, state, join):
+        text = "\n".join(state)
+        if not any("JOIN(" in raw for raw in state):
+            return [
+                *[
+                    RelationOption(f"r.alt_{rank}", 1.0 - rank / 20, rank)
+                    for rank in range(1, 7)
+                ],
+                RelationOption("r.gold1", 0.60, 7),
+            ]
+        if "r.gold1" in text:
+            return [
+                RelationOption("r.gold2", 0.95, 1),
+                RelationOption("r.second_alt", 0.80, 2),
+            ]
+        return [
+            RelationOption("r.probe", 0.95, 1),
+            RelationOption("r.probe_alt", 0.80, 2),
+        ]
+
+    demo = DemonstrationBuilder(executor, provider, max_turns=32).build(row)[0]
+
+    assert demo.private_metadata["recovery_stratum"] == "post_widen"
+    assert demo.private_metadata["probe_outcome"] == "unresolved_nonempty"
+    assert [step.action for step in demo.steps].count("Widen") == 1
+    assert any(step.action == "Park" for step in demo.steps)
+    assert DemonstrationValidator(executor, max_active=24).validate(demo) == []
+
+
 def test_plausible_frontier_is_not_pruned_for_capacity():
     row = {
         "ID": "full-capacity-eviction",
@@ -1658,6 +1761,54 @@ def test_conjunction_requires_both_branches():
         "wrong parents" in error
         for error in DemonstrationValidator(fake_executor, max_active=6).validate(malformed)
     )
+
+
+def test_conjunction_recovers_before_irreversible_combine():
+    row = {
+        "ID": "conjunction-recovery",
+        "question": "Which entity satisfies both conditions?",
+        "function_list": [
+            "expression0 = START('m.topic')",
+            "expression1 = JOIN('r.left', expression0)",
+            "expression2 = JOIN('r.right', expression0)",
+            "expression3 = AND(expression1, expression2)",
+        ],
+        "answer": ["m.shared"],
+    }
+
+    def executor(functions, target):
+        text = "\n".join(functions)
+        if "AND(" in text:
+            return ["m.shared"]
+        if "r.left" in text:
+            return ["m.left", "m.shared"]
+        if "r.right" in text:
+            return ["m.right", "m.shared"]
+        return ["m.plausible"]
+
+    def provider(query, state, join):
+        if "r.detour" in "\n".join(state):
+            return [
+                RelationOption("r.probe", 0.95, 1),
+                RelationOption("r.probe_alt", 0.80, 2),
+            ]
+        return [
+            RelationOption("r.detour", 0.98, 1),
+            RelationOption("r.left", 0.90, 2),
+            RelationOption("r.right", 0.85, 3),
+        ]
+
+    conjunction = next(
+        demo
+        for demo in DemonstrationBuilder(executor, provider).build(row)
+        if demo.family == "conjunction"
+    )
+
+    assert conjunction.private_metadata["recovery_stratum"] == "conjunction"
+    assert conjunction.private_metadata["probe_outcome"] == "unresolved_nonempty"
+    assert semantic_actions(conjunction)[-2:] == ["Combine", "Commit"]
+    assert any(step.action == "Park" for step in conjunction.steps)
+    assert DemonstrationValidator(executor, max_active=24).validate(conjunction) == []
 
 
 def test_failed_conjunction_is_not_relabelled_as_complete_linear_branch():

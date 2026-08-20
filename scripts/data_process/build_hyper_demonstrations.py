@@ -100,6 +100,13 @@ def _question_split(question_id: str) -> str:
     return "validation" if bucket == 0 else "train"
 
 
+def _public_count_support_rate(stats) -> float:
+    """Coverage of gold Count programs licensed by the public question alone."""
+    gold_rows = int(stats.get("gold_count_rows", 0))
+    misses = int(stats.get("public_count_contract_false_negative", 0))
+    return (gold_rows - misses) / gold_rows if gold_rows else 1.0
+
+
 def _decision_contradictions(trajectory_rows):
     """Count identical student observations assigned different graph actions."""
     state_actions = {}
@@ -626,6 +633,7 @@ def main() -> None:
             else:
                 source_types["literal_or_name"] += 1
     proposal_stats = dict(sorted(proposal_stats.items()))
+    public_count_support_rate = _public_count_support_rate(proposal_stats)
     relation_total = proposal_stats.get("relation_decisions", 0)
     audited_programs = proposal_stats.get("gold_program_proposal_audit_rows", 0)
     audited_program_decisions = proposal_stats.get(
@@ -706,10 +714,6 @@ def main() -> None:
     decision_consistency = _decision_contradictions(train_rows)
     frontier_diagnostics = _frontier_diagnostics(train_demonstrations)
     family_difficulty = _frontier_difficulty_by_family(train_demonstrations)
-    recovery_count = (
-        families.get("certified_empty_recovery", 0)
-        + families.get("non_destructive_nonempty_recovery", 0)
-    )
     multi_hop_count = sum(
         any(node.depth > 0 for node in demo.hypotheses.values())
         for demo in train_demonstrations
@@ -719,6 +723,7 @@ def main() -> None:
         for demo in train_demonstrations
         if demo.private_metadata.get("recovery_stratum")
     )
+    recovery_count = sum(recovery_strata.values())
     required_recovery_strata = {
         "immediate_linear",
         "post_widen",
@@ -726,6 +731,7 @@ def main() -> None:
         "conjunction",
         "operator_adjacent",
     }
+    minimum_recovery_per_stratum = 50
     irreversible_steps = [
         step
         for demo in train_demonstrations
@@ -795,6 +801,10 @@ def main() -> None:
         "recovery_skill_is_present": recovery_count > 0,
         "recovery_state_coverage": required_recovery_strata.issubset(
             recovery_strata
+        )
+        and all(
+            recovery_strata[stratum] >= minimum_recovery_per_stratum
+            for stratum in required_recovery_strata
         ),
         "all_irreversible_actions_have_certificates": all(
             step.certificate_kind for step in irreversible_steps
@@ -844,12 +854,12 @@ def main() -> None:
         "no_conflicting_teacher_actions_for_same_observation": (
             decision_consistency["contradictory_states"] == 0
         ),
-        "public_count_contract_matches_gold_count_programs": (
-            proposal_stats.get("public_count_contract_false_negative", 0) == 0
+        "public_count_contract_covers_gold_count_programs": (
+            public_count_support_rate >= 0.99
         ),
     }
     report = {
-        "quality_schema": "hyper_r1_v12_public_count_prune_parity",
+        "quality_schema": "hyper_r1_v13_state_covered_recovery",
         "input": args.input,
         "relation_model": args.relation_model,
         "accepted_demonstrations": len(demonstrations),
@@ -1068,6 +1078,9 @@ def main() -> None:
             "recovery_trajectories": recovery_count,
             "recovery_strata": dict(sorted(recovery_strata.items())),
             "required_recovery_strata": sorted(required_recovery_strata),
+            "minimum_trajectories_per_recovery_stratum": (
+                minimum_recovery_per_stratum
+            ),
             "intervention_actions": len(intervention_steps),
             "certified_irreversible_actions": sum(
                 bool(step.certificate_kind) for step in irreversible_steps
@@ -1090,12 +1103,20 @@ def main() -> None:
                 "conservative_false_positives": proposal_stats.get(
                     "public_count_contract_false_positive", 0
                 ),
+                "gold_program_support_rate": public_count_support_rate,
+                "minimum_required_support_rate": 0.99,
+                "policy": (
+                    "exclude gold Count programs that cannot be licensed from the "
+                    "student-visible question; never infer Count from private syntax"
+                ),
             },
         },
         "quality_assessment": {
             "structurally_ready_for_sft": all(quality_checks.values()),
             "checks": quality_checks,
-            "minimum_recovery_trajectories": None,
+            "minimum_recovery_trajectories": (
+                len(required_recovery_strata) * minimum_recovery_per_stratum
+            ),
             "multi_hop_training_trajectories": multi_hop_count,
             "deep_input_rows": deep_input_rows,
             "deep_training_trajectories": deep_training_trajectories,

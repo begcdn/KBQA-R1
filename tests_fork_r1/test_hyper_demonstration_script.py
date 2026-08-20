@@ -70,6 +70,21 @@ def test_question_split_keeps_all_trajectories_for_a_question_together():
     } == {"train", "validation"}
 
 
+def test_public_count_support_gate_tolerates_only_unlicensed_annotation_noise():
+    assert MODULE._public_count_support_rate(
+        {
+            "gold_count_rows": 2304,
+            "public_count_contract_false_negative": 17,
+        }
+    ) > 0.99
+    assert MODULE._public_count_support_rate(
+        {
+            "gold_count_rows": 2271,
+            "public_count_contract_false_negative": 299,
+        }
+    ) < 0.99
+
+
 def test_decision_consistency_detects_conflicting_actions_for_same_state():
     shared = [{"role": "user", "content": "same state"}]
     rows = [

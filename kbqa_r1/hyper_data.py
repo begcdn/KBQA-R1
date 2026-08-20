@@ -1698,6 +1698,7 @@ class DemonstrationBuilder:
         start_states: Dict[str, Tuple[str, str]] = {}
         widen_sources: List[str] = []
         proposal_relations: List[str] = []
+        recovery_outcome = None
 
         def add_node(
             state: Sequence[str],
@@ -2012,7 +2013,22 @@ class DemonstrationBuilder:
                 state_before = [start[0]]
                 target = source
             else:
-                if parent is None or not select_parent(
+                if parent is None:
+                    return None
+                recovered_here = None
+                if recovery_outcome is None:
+                    recovered_here = self._append_natural_recovery_probe(
+                        question=question,
+                        required_parent=parent,
+                        continuation=None,
+                        hypotheses=hypotheses,
+                        active=active,
+                        steps=steps,
+                        stat_scope="operator_adjacent_recovery",
+                    )
+                    if recovered_here is not None:
+                        recovery_outcome = recovered_here
+                if recovered_here is None and not select_parent(
                     parent, "apply_required_logical_operator"
                 ):
                     return None
@@ -2102,6 +2118,10 @@ class DemonstrationBuilder:
                 "proposal_recall_within_budget": True,
                 "widen_sources": widen_sources,
                 "path_hops": len(plan.joins),
+                "probe_outcome": recovery_outcome,
+                "recovery_stratum": (
+                    "operator_adjacent" if recovery_outcome else None
+                ),
             },
         )
 
@@ -2314,15 +2334,25 @@ class DemonstrationBuilder:
                 if required_prunes:
                     self.stats["trajectory_node_budget_miss"] += 1
                     return None
-                steps.append(
-                    DemonstrationStep(
-                        "Select",
-                        (gold.hypothesis_id,),
-                        tuple(active),
-                        (),
-                        (f"question_relation_match:{gold.relation}",),
-                    )
+                probe_outcome = self._append_natural_recovery_probe(
+                    question=question,
+                    required_parent=gold,
+                    continuation=next_join,
+                    hypotheses=hypotheses,
+                    active=active,
+                    steps=steps,
+                    stat_scope="post_widen_recovery",
                 )
+                if probe_outcome is None:
+                    steps.append(
+                        DemonstrationStep(
+                            "Select",
+                            (gold.hypothesis_id,),
+                            tuple(active),
+                            (),
+                            (f"question_relation_match:{gold.relation}",),
+                        )
+                    )
                 before_expansion = tuple(active)
                 active.remove(gold.hypothesis_id)
                 active.extend(gold_children)
@@ -2347,8 +2377,18 @@ class DemonstrationBuilder:
                         ),
                     ]
                 )
-                family = "adaptive_frontier_widen"
-                probe_relation = None
+                if probe_outcome is None:
+                    family = "adaptive_frontier_widen"
+                    probe_relation = None
+                else:
+                    family = (
+                        "certified_empty_recovery"
+                        if probe_outcome == "proved_false_empty"
+                        else "non_destructive_nonempty_recovery"
+                    )
+                    probe_relation = "question_conditioned"
+                    recovery_stratum = "post_widen"
+                    self.stats["recovery_built"] += 1
             else:
                 # A higher-ranked nonempty alternative is a useful recovery
                 # intervention state.  Do not call it wrong by forcing the gold
@@ -2585,6 +2625,185 @@ class DemonstrationBuilder:
             return False
         return True
 
+    @staticmethod
+    def _natural_probe_statement(parent: ExecutedHypothesis) -> ProgramStatement:
+        """Create a structurally legal, question-ranked continuation slot.
+
+        The placeholder relation is never executed or shown to the student.
+        The normal candidate provider fills the slot from the public question
+        and executable parent state, exactly as it does during inference.
+        """
+        numbers = [
+            int(number)
+            for raw in parent.function_state
+            for number in re.findall(r"expression(\d+)", raw)
+        ]
+        target = f"expression{max(numbers, default=0) + 1}"
+        raw = f"{target} = JOIN('__question_conditioned_probe__', {parent.target_expression})"
+        return ProgramStatement(
+            index=-1,
+            target=target,
+            kind="join",
+            sources=(parent.target_expression,),
+            relation="__question_conditioned_probe__",
+            raw=raw,
+        )
+
+    def _append_natural_recovery_probe(
+        self,
+        *,
+        question: str,
+        required_parent: ExecutedHypothesis,
+        continuation: Optional[ProgramStatement],
+        hypotheses: Dict[str, ExecutedHypothesis],
+        active: List[str],
+        steps: List[DemonstrationStep],
+        stat_scope: str,
+    ) -> Optional[str]:
+        """Test a naturally preferred sibling, preserve uncertainty, and recover.
+
+        Gold identifies the branch the teacher must eventually resume, but it
+        does not fabricate the competing action or its outcome. The competing
+        sibling and continuation both come from the inference-time ranker and
+        are executed against the graph. Empty results may be pruned only under
+        the public Count contract; nonempty results are parked, never called
+        false merely because they differ from gold.
+        """
+        siblings = [
+            node
+            for node_id in active
+            if (node := hypotheses.get(node_id)) is not None
+            and node.hypothesis_id != required_parent.hypothesis_id
+            and node.parent_id == required_parent.parent_id
+            and node.denotation
+            and node.role
+            not in {
+                "gold",
+                "required_branch",
+                "required_program_branch",
+                "combined",
+                "type_constrained",
+            }
+            and "policy_choice" in node.provenance
+        ]
+        if not siblings:
+            return None
+        sibling = sorted(siblings, key=lambda node: node.hypothesis_id)[0]
+        if len(steps) + 4 > self.max_turns:
+            self.stats[f"{stat_scope}_turn_budget_miss"] += 1
+            return None
+
+        trial_hypotheses = dict(hypotheses)
+        probe_statement = continuation or self._natural_probe_statement(sibling)
+        probe_page = self._expand_terminal_frontier(
+            sibling,
+            probe_statement,
+            trial_hypotheses,
+            question,
+            stat_scope=stat_scope,
+            require_required_relation=False,
+        )
+        if probe_page is None:
+            return None
+        probe_children = [
+            trial_hypotheses[node_id]
+            for node_id in probe_page.node_ids
+            if node_id in trial_hypotheses
+        ]
+        if not probe_children:
+            return None
+        probe = next(
+            (
+                node
+                for node in probe_children
+                if "policy_choice" in node.provenance
+            ),
+            probe_children[0],
+        )
+        if len(trial_hypotheses) > self.max_nodes:
+            self.stats[f"{stat_scope}_node_budget_miss"] += 1
+            return None
+
+        trial_active = list(active)
+        trial_steps = [
+            DemonstrationStep(
+                "Select",
+                (sibling.hypothesis_id,),
+                tuple(trial_active),
+                (),
+                ("plausible_higher_ranked_branch_requires_evidence",),
+                supervision="intervention",
+            )
+        ]
+        before_probe = tuple(trial_active)
+        trial_active.remove(sibling.hypothesis_id)
+        # Eager construction executes the page for verification, while the
+        # lazy runtime materializes only the inspected proposal as a node.
+        trial_active.append(probe.hypothesis_id)
+        trial_steps.append(
+            DemonstrationStep(
+                "Find_relation",
+                (sibling.target_expression,),
+                before_probe,
+                probe_page.node_ids,
+                ("test_question_conditioned_continuation",),
+                (probe_page.start, probe_page.stop, probe_page.total),
+            )
+        )
+
+        can_prune = public_empty_prune_certificate(
+            probe.hypothesis_id,
+            probe.denotation,
+            public_question_contract(question),
+        ) is not None
+        if can_prune:
+            trial_steps.append(
+                DemonstrationStep(
+                    "Prune",
+                    (probe.hypothesis_id,),
+                    tuple(trial_active),
+                    (),
+                    ("empty_execution", "empty_is_terminal"),
+                )
+            )
+            outcome = "proved_false_empty"
+        else:
+            trial_steps.append(
+                DemonstrationStep(
+                    "Park",
+                    (probe.hypothesis_id,),
+                    tuple(trial_active),
+                    (),
+                    (
+                        "preserve_unresolved_probe",
+                        "storage_only_not_semantic_rejection",
+                    ),
+                )
+            )
+            outcome = (
+                "empty_preserved_for_count"
+                if not probe.denotation
+                else "unresolved_nonempty"
+            )
+        trial_active.remove(probe.hypothesis_id)
+        trial_steps.append(
+            DemonstrationStep(
+                "Select",
+                (required_parent.hypothesis_id,),
+                tuple(trial_active),
+                (),
+                ("resume_gold_supported_hypothesis_after_probe",),
+            )
+        )
+
+        hypotheses.clear()
+        hypotheses.update(trial_hypotheses)
+        active[:] = trial_active
+        steps.extend(trial_steps)
+        self.stats[f"{stat_scope}_built"] += 1
+        self.stats[f"{stat_scope}_{outcome}"] += 1
+        return outcome
+
     def _build_deep_progress_demo(
         self,
         *,
@@ -2619,6 +2838,7 @@ class DemonstrationBuilder:
         widen_sources = [
             step.arguments[0] for step in steps if step.action == "Widen"
         ]
+        recovery_outcome = None
 
         for continuation in following_joins:
             # Runtime checks capacity before replacing the selected parent, so
@@ -2631,15 +2851,29 @@ class DemonstrationBuilder:
                 protected=(current_gold.hypothesis_id,),
             ):
                 return None
-            steps.append(
-                DemonstrationStep(
-                    "Select",
-                    (current_gold.hypothesis_id,),
-                    tuple(active),
-                    (),
-                    (f"question_relation_match:{current_gold.relation}",),
+            recovered_here = None
+            if recovery_outcome is None and current_gold.depth > 0:
+                recovered_here = self._append_natural_recovery_probe(
+                    question=question,
+                    required_parent=current_gold,
+                    continuation=continuation,
+                    hypotheses=hypotheses,
+                    active=active,
+                    steps=steps,
+                    stat_scope="deep_recovery",
                 )
-            )
+                if recovered_here is not None:
+                    recovery_outcome = recovered_here
+            if recovered_here is None:
+                steps.append(
+                    DemonstrationStep(
+                        "Select",
+                        (current_gold.hypothesis_id,),
+                        tuple(active),
+                        (),
+                        (f"question_relation_match:{current_gold.relation}",),
+                    )
+                )
             child_pages = self._expand_terminal_frontier_batches(
                 current_gold,
                 continuation,
@@ -2752,6 +2986,8 @@ class DemonstrationBuilder:
                 "widen_sources": widen_sources,
                 "retrieval_intent_source": "question",
                 "probe_relation": None,
+                "probe_outcome": recovery_outcome,
+                "recovery_stratum": "deep" if recovery_outcome else None,
                 "decision_index": join.index,
                 "path_hops": 1 + len(following_joins),
             },
@@ -3294,6 +3530,15 @@ class DemonstrationBuilder:
                     )
                 )
                 active.extend(created)
+        recovery_outcome = self._append_natural_recovery_probe(
+            question=question,
+            required_parent=left,
+            continuation=None,
+            hypotheses=hypotheses,
+            active=active,
+            steps=steps,
+            stat_scope="conjunction_recovery",
+        )
         steps.extend(
             [
                 DemonstrationStep(
@@ -3330,6 +3575,8 @@ class DemonstrationBuilder:
                     "right": ranks["right"],
                 },
                 "conjunction_roots": len(frontiers),
+                "probe_outcome": recovery_outcome,
+                "recovery_stratum": "conjunction" if recovery_outcome else None,
             },
         )
 
@@ -3587,6 +3834,25 @@ class DemonstrationBuilder:
             required_terminals.append(hypotheses[current.hypothesis_id])
 
         left, right = required_terminals
+        recovery_outcome = self._append_natural_recovery_probe(
+            question=question,
+            required_parent=left,
+            continuation=None,
+            hypotheses=hypotheses,
+            active=active,
+            steps=steps,
+            stat_scope="conjunction_recovery",
+        )
+        if recovery_outcome is None:
+            recovery_outcome = self._append_natural_recovery_probe(
+                question=question,
+                required_parent=right,
+                continuation=None,
+                hypotheses=hypotheses,
+                active=active,
+                steps=steps,
+                stat_scope="conjunction_recovery",
+            )
         combined_state, combined_target = combine_function_states(
             left.function_state,
             left.target_expression,
@@ -3670,6 +3936,8 @@ class DemonstrationBuilder:
                 "widen_sources": widen_sources,
                 "path_hops": sum(len(chain) for chain in branch_chains)
                 + len(tail),
+                "probe_outcome": recovery_outcome,
+                "recovery_stratum": "conjunction" if recovery_outcome else None,
             },
         )
 
@@ -4655,6 +4923,9 @@ def step_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
                     "target": {"action": step.action, "arguments": list(step.arguments)},
                     "metadata": {
                         "family": demo.family,
+                        "recovery_stratum": demo.private_metadata.get(
+                            "recovery_stratum"
+                        ),
                         "trajectory_weight": 1.0 / max(
                             1,
                             sum(
@@ -5139,6 +5410,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             "demo_id": demo.demo_id,
             "question_id": demo.question_id,
             "family": demo.family,
+            "recovery_stratum": demo.private_metadata.get("recovery_stratum"),
             "replay_verified": True,
             "gold_injected_into_proposals": False,
         },
