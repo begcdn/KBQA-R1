@@ -19,9 +19,9 @@ import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-if report.get("quality_schema") != "hyper_r1_v12_public_count_prune_parity":
+if report.get("quality_schema") != "hyper_r1_v13_state_covered_recovery":
     raise SystemExit(
-        "HyPER-R1 corpus predates public Count-aware Prune parity; "
+        "HyPER-R1 corpus is not the validated state-covered recovery corpus; "
         "rebuild it."
     )
 expected_contract = {

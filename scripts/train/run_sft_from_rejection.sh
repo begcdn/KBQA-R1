@@ -32,9 +32,12 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-4}
 TOTAL_STEPS=${TOTAL_STEPS:-5000}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
 
-# Max tokens per GPU used by dynamic batcher (must be >= longest sequence length)
-# Defaults to 16k to match data.max_length override; adjust based on memory.
-MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-16384}
+# HyPER decision states can exceed 16k tokens. The target action is at the end,
+# so silent right truncation would remove the supervision we intend to learn.
+SFT_MAX_LENGTH=${SFT_MAX_LENGTH:-32768}
+SFT_TRUNCATION=${SFT_TRUNCATION:-error}
+MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-${SFT_MAX_LENGTH}}
+MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-4}
 
 # -----------------------------
 # GPU detection and config
@@ -123,6 +126,8 @@ echo "GPUs          : ${NGPUS} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 echo "Total steps   : ${TOTAL_STEPS}"
 echo "Total epochs  : ${TOTAL_EPOCHS}"
 echo "Global batch  : ${GLOBAL_BATCH_SIZE}"
+echo "Sequence limit: ${SFT_MAX_LENGTH} (${SFT_TRUNCATION})"
+echo "Micro batch   : ${MICRO_BATCH_SIZE_PER_GPU}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "========================================"
 
@@ -155,10 +160,10 @@ if [[ "${TRAINER}" == "engine" ]]; then
     data.pad_mode=no_padding \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     checkpoint.save_contents=['hf_model'] \
-    data.max_length=16384 \
-    data.truncation=right \
+    data.max_length=${SFT_MAX_LENGTH} \
+    data.truncation=${SFT_TRUNCATION} \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
-    data.micro_batch_size_per_gpu=4 \
+    data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.path="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
     model.use_remove_padding=true \
@@ -184,10 +189,10 @@ else
     data.messages_key=messages \
     data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU} \
     trainer.checkpoint.save_contents=['hf_model'] \
-    data.max_length=16384 \
-    data.truncation=right \
+    data.max_length=${SFT_MAX_LENGTH} \
+    data.truncation=${SFT_TRUNCATION} \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
-    data.micro_batch_size_per_gpu=4 \
+    data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.partial_pretrain="${BASE_MODEL}" \
     model.enable_gradient_checkpointing=true \
     use_remove_padding=true \
