@@ -134,10 +134,16 @@ echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "========================================"
 
 # -----------------------------
-# torch.distributed launcher
+# torch.distributed launcher. Use the active Python environment so a global
+# torchrun cannot silently launch the trainer with a different site-packages.
 # -----------------------------
-TORCHRUN=${TORCHRUN:-torchrun}
-MASTER_PORT=${MASTER_PORT:-$(python3 - <<'PY'
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
+if [[ -n "${TORCHRUN:-}" ]]; then
+  read -r -a TORCHRUN_CMD <<< "${TORCHRUN}"
+else
+  TORCHRUN_CMD=("${PYTHON_BIN}" -m torch.distributed.run)
+fi
+MASTER_PORT=${MASTER_PORT:-$(${PYTHON_BIN} - <<'PY'
 import random; print(random.randint(20000,29999))
 PY
 )}
@@ -155,7 +161,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     VAL_OVERRIDES+=("data.val_files=['${VAL_PARQUET}']" "trainer.test_freq=after_each_epoch")
   fi
   # sft_trainer (engine config: sft_trainer_engine.yaml)
-  ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.sft_trainer \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
     "${VAL_OVERRIDES[@]}" \
     data.messages_key=messages \
@@ -185,7 +191,7 @@ else
     VAL_OVERRIDES+=("data.val_files=['${VAL_PARQUET}']" "trainer.test_freq=after_each_epoch")
   fi
   # fsdp_sft_trainer (legacy path; no data.pad_mode key)
-  ${TORCHRUN} --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.fsdp_sft_trainer \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=${NGPUS} --master_port=${MASTER_PORT} -m verl.trainer.fsdp_sft_trainer \
     data.train_files="['${TRAIN_PARQUET}']" \
     "${VAL_OVERRIDES[@]}" \
     data.messages_key=messages \
