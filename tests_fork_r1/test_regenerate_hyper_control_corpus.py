@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 from kbqa_r1.hyper_data import (
@@ -178,3 +179,30 @@ def test_streaming_parquet_sink_compresses_and_publishes_atomically(tmp_path):
     assert parquet.metadata.num_rows == 1
     assert parquet.metadata.row_group(0).column(1).compression == "SNAPPY"
     assert not path.with_suffix(".parquet.tmp").exists()
+
+
+def test_source_contract_is_embedded_for_truthful_control_training(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    demonstrations = source / "demonstrations.jsonl"
+    demonstrations.write_text("", encoding="utf-8")
+    report = {
+        "quality_schema": "hyper_r1_v13_state_covered_recovery",
+        "relation_page_size": 6,
+        "relation_rank_cutoff": None,
+        "max_active": 24,
+        "max_nodes": 128,
+        "max_execution_attempts": 24,
+        "max_turns": 32,
+        "quality_assessment": {"structurally_ready_for_sft": True},
+        "proposal_recall": {"relation_at_frontier": 0.9},
+        "families": {"frontier_commit": 1},
+    }
+    (source / "report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    contract = MODULE._load_source_contract(demonstrations)
+
+    assert contract["quality_schema"] == report["quality_schema"]
+    assert contract["max_turns"] == 32
+    assert contract["quality_assessment"]["structurally_ready_for_sft"]
+    assert len(contract["report_sha256"]) == 64

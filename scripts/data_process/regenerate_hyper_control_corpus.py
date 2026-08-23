@@ -42,6 +42,38 @@ _EXECUTING_ACTIONS = {
     "Count",
 }
 
+_SOURCE_CONTRACT_FIELDS = (
+    "quality_schema",
+    "relation_page_size",
+    "relation_rank_cutoff",
+    "max_active",
+    "max_nodes",
+    "max_execution_attempts",
+    "max_turns",
+    "quality_assessment",
+    "proposal_recall",
+    "families",
+)
+
+
+def _load_source_contract(input_path: Path) -> dict:
+    report_path = input_path.parent / "report.json"
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            f"source corpus contract is missing: {report_path}"
+        )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    missing = [field for field in _SOURCE_CONTRACT_FIELDS if field not in report]
+    if missing:
+        raise ValueError(
+            "source corpus report is missing contract fields: "
+            + ", ".join(missing)
+        )
+    contract = {field: report[field] for field in _SOURCE_CONTRACT_FIELDS}
+    contract["report"] = str(report_path)
+    contract["report_sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    return contract
+
 
 def _read_demos(path: Path) -> list[HyperDemonstration]:
     with path.open(encoding="utf-8") as handle:
@@ -452,6 +484,7 @@ def _valid_invalid_recovery(row: dict) -> bool:
 
 
 def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
+    source_contract = _load_source_contract(input_path)
     source_demonstrations = 0
     action_counts: Counter = Counter()
     for demo in _iter_demos(input_path):
@@ -573,7 +606,9 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
+        "quality_schema": "hyper_r1_v17_truthful_control",
         "source": str(input_path),
+        "source_contract": source_contract,
         "output": str(output),
         "source_demonstrations": source_demonstrations,
         "output_demonstrations": source_demonstrations + counters["abstain"],

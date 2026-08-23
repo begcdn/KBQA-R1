@@ -19,7 +19,32 @@ import json
 import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-if report.get("quality_schema") != "hyper_r1_v13_state_covered_recovery":
+schema = report.get("quality_schema")
+if schema == "hyper_r1_v17_truthful_control":
+    assertions = report.get("assertions", {})
+    failed_assertions = [name for name, passed in assertions.items() if not passed]
+    contradictions = report.get("decision_consistency", {}).get(
+        "contradictory_states", -1
+    )
+    if failed_assertions or contradictions != 0:
+        raise SystemExit(
+            "HyPER-R1 truthful-control corpus failed its invariants: "
+            + json.dumps(
+                {
+                    "failed_assertions": failed_assertions,
+                    "contradictory_states": contradictions,
+                },
+                sort_keys=True,
+            )
+        )
+    structural_report = report.get("source_contract", {})
+    if structural_report.get("quality_schema") != (
+        "hyper_r1_v13_state_covered_recovery"
+    ):
+        raise SystemExit("HyPER-R1 truthful-control source contract is invalid")
+elif schema == "hyper_r1_v13_state_covered_recovery":
+    structural_report = report
+else:
     raise SystemExit(
         "HyPER-R1 corpus is not the validated state-covered recovery corpus; "
         "rebuild it."
@@ -33,16 +58,16 @@ expected_contract = {
     "max_turns": 32,
 }
 contract_mismatches = {
-    key: {"expected": expected, "actual": report.get(key)}
+    key: {"expected": expected, "actual": structural_report.get(key)}
     for key, expected in expected_contract.items()
-    if report.get(key) != expected
+    if structural_report.get(key) != expected
 }
 if contract_mismatches:
     raise SystemExit(
         "HyPER-R1 corpus does not match the training/inference contract: "
         + json.dumps(contract_mismatches, sort_keys=True)
     )
-quality = report.get("quality_assessment", {})
+quality = structural_report.get("quality_assessment", {})
 if not quality.get("structurally_ready_for_sft", False):
     failed = [
         name for name, passed in quality.get("checks", {}).items() if not passed
@@ -56,11 +81,15 @@ if quality.get("deep_training_trajectories", 0) < quality.get(
     raise SystemExit("HyPER-R1 corpus lacks enough verified deep trajectories for SFT")
 print("HyPER-R1 corpus passed structural checks.")
 print(json.dumps({
-    "accepted_demonstrations": report.get("accepted_demonstrations"),
-    "training_demonstrations": report.get("training_demonstrations"),
-    "validation_rows": report.get("validation_rows"),
-    "families": report.get("families"),
-    "proposal_recall": report.get("proposal_recall"),
+    "quality_schema": schema,
+    "training_demonstrations": report.get(
+        "train_demonstrations", structural_report.get("training_demonstrations")
+    ),
+    "validation_rows": report.get(
+        "validation_decisions", structural_report.get("validation_rows")
+    ),
+    "families": structural_report.get("families"),
+    "proposal_recall": structural_report.get("proposal_recall"),
     "deep_training_trajectories": quality.get("deep_training_trajectories"),
     "minimum_deep_trajectories": quality.get("minimum_deep_trajectories"),
 }, indent=2))
