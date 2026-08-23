@@ -8,8 +8,10 @@ REPO_ROOT=${REPO_ROOT:-"$(cd "$(dirname "$0")/.." && pwd)"}
 DATASET_TYPE=${DATASET_TYPE:-grailqa}
 : "${MODEL_PATH:?Set MODEL_PATH to the checkpoint being evaluated}"
 : "${TEST_FILE:?Set TEST_FILE to the held-out parquet}"
+: "${HYPER_RELATION_MODEL:?Set HYPER_RELATION_MODEL to the v15 relation ranker}"
 
 export REPO_ROOT DATASET_TYPE MODEL_PATH
+export HYPER_RELATION_MODEL
 export BASE_MODEL="${MODEL_PATH}"
 export OUTPUT_DIR=${OUTPUT_DIR:-"${REPO_ROOT}/runs/hyper_r1_eval"}
 export HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-true}

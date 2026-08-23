@@ -50,3 +50,17 @@ def test_summarize_recomputes_f1_without_format_bonus():
         ]
     )
     assert report["overall"]["mean_f1"] == 1.0
+
+
+def test_summarize_prefers_committed_denotation_f1_over_legacy_text_f1():
+    report = summarize(
+        [
+            {
+                "hyper_r1_commit_answer_f1": 0.8,
+                "mid_f1": 0.0,
+                "output": "no legacy answer tag",
+            }
+        ]
+    )
+
+    assert report["overall"]["mean_f1"] == pytest.approx(0.8)

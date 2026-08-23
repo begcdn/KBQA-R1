@@ -224,6 +224,14 @@ class SExprBatchUtils:
         max_len = min(self.config.max_prompt_length, effective_len)
         response_lengths = self.tensor_fn.create_attention_mask(responses).sum(dim=1)
         tail_truncated = response_lengths > self.config.max_prompt_length
+        if bool(tail_truncated.any()):
+            logger.error(
+                "HyPER-R1 accumulated response length exceeded the configured limit: "
+                "required_max=%d configured_max=%d affected=%d",
+                int(response_lengths.max().item()),
+                int(self.config.max_prompt_length),
+                int(tail_truncated.sum().item()),
+            )
         if 'hyper_tail_truncated' in right_side:
             tail_truncated = tail_truncated | right_side['hyper_tail_truncated'].to(
                 device=tail_truncated.device, dtype=torch.bool
@@ -298,8 +306,6 @@ class SExprBatchUtils:
             accumulated_log_probs = accumulated_log_probs.gather(1, sorted_indices)
             result['rollout_log_probs'] = accumulated_log_probs[:, :max_len]
             
-            import logging
-            logger = logging.getLogger(__name__)
             logger.info(f"[MISMATCH FIX] Updated rollout_log_probs in update_right_side, "
                        f"cur_turn shape: {cur_turn_log_probs.shape}, "
                        f"accumulated shape before truncate: {accumulated_log_probs.shape}, "

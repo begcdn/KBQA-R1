@@ -36,6 +36,7 @@ class SExprGenerationConfig:
     # One complete ranked page. Repeated Widen actions expose later pages.
     hyper_r1_frontier_width: int = 6
     hyper_r1_relation_model: Optional[str] = None
+    hyper_r1_relation_device: Optional[str] = None
     
     # GPU utilization management
     gpu_utilization_config: Optional[GPUUtilizationConfig] = None  # GPU utilization manager configuration

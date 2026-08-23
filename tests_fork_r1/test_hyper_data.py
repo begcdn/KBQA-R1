@@ -4,6 +4,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationBuilder as _DemonstrationBuilder,
     DemonstrationValidator,
     IneligibleProgram,
+    compile_optional_gold_plan,
     ProgramExecutionError,
     RelationOption,
     certify_program_commit,
@@ -163,6 +164,13 @@ def test_compile_requires_stop_to_be_terminal():
         assert "terminal" in str(exc)
     else:
         raise AssertionError("statements after STOP must be rejected")
+
+
+def test_optional_gold_program_failure_removes_only_semantic_metadata():
+    assert compile_optional_gold_plan(["not a supported program"]) is None
+    plan = compile_optional_gold_plan(["expression1 = START('m.topic')"])
+    assert plan is not None
+    assert plan.target_expression == "expression1"
 
 
 def test_operator_program_teaches_count_after_retained_relation_frontier():
@@ -594,6 +602,8 @@ def test_builds_replayable_certified_empty_recovery():
     assert "stored=0" in graph_observations[0]
     assert "execution_attempts=0/24" in graph_observations[0]
     assert "<proposal_catalog>" in graph_observations[0]
+    assert "Available proposal targets: Inspect=[" in graph_observations[0]
+    assert "Available targets: Select=" in graph_observations[0]
     assert "H3" not in graph_observations[0]
 
     assert len(demos) == 1
@@ -1086,6 +1096,7 @@ def test_answer_equality_does_not_prove_logical_program_equivalence():
         ["m.answer"],
     )
     assert certificate.answer_exact
+    assert certificate.answer_f1 == 1.0
     assert not certificate.intent_equivalent
     assert not certificate.valid
 
@@ -2139,6 +2150,39 @@ def test_builder_and_validator_share_execution_cache():
 
     assert validator.validate(demo) == []
     assert len(calls) == calls_after_build
+
+
+def test_lazy_validator_rejects_unjustified_abstain_and_post_terminal_action():
+    row = {
+        "ID": "terminal-contract",
+        "question": "Which answer follows the intended relation?",
+        "function_list": [
+            "expression1 = START('m.topic')",
+            "expression1 = JOIN('r.gold1', expression1)",
+        ],
+        "answer": ["m.gold_prefix"],
+    }
+    demo = DemonstrationBuilder(fake_executor, one_hop_candidates).build(row)[0]
+    terminal = demo.steps[-1]
+    abstain = replace(
+        terminal,
+        action="Abstain",
+        arguments=(),
+        certificate_kind=None,
+        certificate_evidence=(),
+    )
+    premature = replace(demo, steps=[*demo.steps[:-1], abstain])
+    premature_errors = DemonstrationValidator(fake_executor).validate(premature)
+
+    assert "Abstain requires an exhausted execution or turn budget" in premature_errors
+    assert any(
+        error.startswith("Abstain leaves a gold-denoting active hypothesis")
+        for error in premature_errors
+    )
+
+    post_terminal = replace(demo, steps=[*demo.steps, terminal])
+    post_terminal_errors = DemonstrationValidator(fake_executor).validate(post_terminal)
+    assert any("action appears after a terminal decision" in error for error in post_terminal_errors)
 
 
 def test_reverse_relation_rewrite_is_preserved():

@@ -20,6 +20,7 @@ from .hyper_r1 import (
     combine_function_states,
     public_empty_prune_certificate,
     public_question_contract,
+    proposal_action_targets,
     relation_path,
     serialize_frontier,
     validate_public_prune_certificate,
@@ -303,6 +304,16 @@ def compile_gold_plan(function_list: Sequence[str]) -> GoldPlan:
     if not executable or final_target is None:
         raise IneligibleProgram("program has no executable result")
     return GoldPlan(tuple(statements), tuple(executable), final_target)
+
+
+def compile_optional_gold_plan(function_list: Sequence[str]) -> Optional[GoldPlan]:
+    """Compile optional semantic metadata without weakening answer supervision."""
+    if not function_list:
+        return None
+    try:
+        return compile_gold_plan(function_list)
+    except IneligibleProgram:
+        return None
 
 
 def logical_program_signature(
@@ -599,6 +610,7 @@ def programs_are_intent_equivalent(
 @dataclass(frozen=True)
 class ProgramCommitCertificate:
     answer_exact: bool
+    answer_f1: float
     intent_equivalent: bool
 
     @property
@@ -614,11 +626,11 @@ def certify_program_commit(
     gold_target: str,
     gold_answers: Sequence[str],
 ) -> ProgramCommitCertificate:
-    """Require both denotational correctness and formal query equivalence."""
+    """Measure answer quality and conservatively prove formal equivalence."""
+    answer_f1 = answer_set_f1(candidate_answers, gold_answers)
     return ProgramCommitCertificate(
-        answer_exact=(
-            normalize_values(candidate_answers) == normalize_values(gold_answers)
-        ),
+        answer_exact=answer_f1 == 1.0,
+        answer_f1=answer_f1,
         intent_equivalent=programs_are_intent_equivalent(
             candidate_functions,
             candidate_target,
@@ -1217,8 +1229,7 @@ class DemonstrationBuilder:
             if len(demo.hypotheses) > self.max_nodes:
                 self.stats["trajectory_node_budget_miss"] += 1
                 continue
-            # ``max_turns`` counts graph actions.  The runtime emits the final
-            # answer in a distinct, answer-only generation afterwards.
+            # ``max_turns`` counts graph actions; a legal Commit is terminal.
             if len(demo.steps) > self.max_turns:
                 self.stats["trajectory_turn_budget_miss"] += 1
                 continue
@@ -4376,6 +4387,7 @@ class DemonstrationValidator:
         max_execution_attempts = int(
             demo.private_metadata.get("max_execution_attempts", 24)
         )
+        max_turns = int(demo.private_metadata.get("max_turns", 24))
         execution_attempts = 0
 
         def recall(node_id: str) -> None:
@@ -4388,7 +4400,10 @@ class DemonstrationValidator:
             parked.remove(node_id)
             active.add(node_id)
 
-        for step in demo.steps:
+        for step_index, step in enumerate(demo.steps):
+            if committed is not None or abstained:
+                errors.append(f"{step.action}: action appears after a terminal decision")
+                break
             if set(step.visible_before) != active:
                 errors.append(
                     f"{step.action}: visible state {sorted(step.visible_before)} "
@@ -4599,6 +4614,22 @@ class DemonstrationValidator:
                 parked.clear()
                 selected = None
             elif step.action == "Abstain":
+                budget_exhausted = (
+                    execution_attempts >= max_execution_attempts
+                    or step_index + 1 >= max_turns
+                )
+                if not budget_exhausted:
+                    errors.append("Abstain requires an exhausted execution or turn budget")
+                complete_active = [
+                    node_id
+                    for node_id in active
+                    if demo.hypotheses[node_id].denotation == demo.gold_answers
+                ]
+                if complete_active:
+                    errors.append(
+                        "Abstain leaves a gold-denoting active hypothesis: "
+                        + ",".join(sorted(complete_active))
+                    )
                 abstained = True
                 active.clear()
                 parked.clear()
@@ -4978,6 +5009,7 @@ def _public_graph(
             {
                 "node_id": node.hypothesis_id,
                 "function_state": node.function_state,
+                "target_expression": node.target_expression,
                 "denotation": node.denotation,
                 "denotation_labels": dict(node.denotation_labels),
                 "parent_id": node.parent_id,
@@ -4996,10 +5028,20 @@ def _public_graph(
         max_active=int(demo.private_metadata.get("max_active", 24)),
         node_count=len(known),
         execution_calls=executions,
+        max_nodes=int(demo.private_metadata.get("max_nodes", 128)),
         parked_nodes=[node for node in nodes if node["node_id"] in parked],
         execution_budget=int(
             demo.private_metadata.get("max_execution_attempts", 24)
         ),
+        count_completion_possible=public_question_contract(
+            demo.question
+        ).count_completion_possible,
+        candidate_sources=[
+            str(candidate[-1])
+            for key in ("candidate_entities", "candidate_literals")
+            for candidate in demo.private_metadata.get(key, ())
+            if candidate
+        ],
     )
 
 
@@ -5007,6 +5049,11 @@ def _public_proposal_catalogs(
     demo: HyperDemonstration,
     frontiers: Mapping[str, Mapping[str, Any]],
     proposal_status: Mapping[str, str],
+    *,
+    active_count: int,
+    selected: Optional[str],
+    known_count: int,
+    executions: int,
 ) -> str:
     blocks = []
     for frontier_id, frontier in frontiers.items():
@@ -5023,6 +5070,32 @@ def _public_proposal_catalogs(
                 f"{proposal.proposal_id} rank={proposal.rank} "
                 f"relation={proposal.relation} score={proposal.score:.4f} status=visible"
             )
+        visible_ids = [
+            proposal.proposal_id
+            for proposal in demo.proposals.values()
+            if proposal.frontier_id == frontier_id
+            and proposal_status.get(proposal.proposal_id) == "visible"
+        ]
+        visible_ids, widen_source = proposal_action_targets(
+            visible_ids,
+            str(frontier["source"]),
+            exposed=int(frontier["exposed"]),
+            total=int(frontier["total"]),
+            selected_id=selected,
+            active_count=active_count,
+            max_active=int(demo.private_metadata.get("max_active", 24)),
+            node_count=known_count,
+            max_nodes=int(demo.private_metadata.get("max_nodes", 128)),
+            execution_attempts=executions,
+            execution_budget=int(
+                demo.private_metadata.get("max_execution_attempts", 24)
+            ),
+        )
+        lines.append(
+            "Available proposal targets: "
+            f"Inspect=[{','.join(visible_ids) if visible_ids else 'none'}]; "
+            f"Widen=[{widen_source or 'none'}]."
+        )
         lines.append(
             "Use Inspect [ Pn ] to execute one visible proposal; Widen only reveals the next page."
         )
@@ -5348,8 +5421,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             selected = None
             values = " ".join(demo.hypotheses[committed_id].denotation)
             event = (
-                f"Committed {committed_id}. Return exactly these values in <answer>: "
-                f"{values}"
+                f"Committed {committed_id}. Final answer values: {values}"
             )
         elif step.action == "Abstain":
             active = []
@@ -5376,7 +5448,13 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         "\n"
                         + (
                             _public_proposal_catalogs(
-                                demo, lazy_frontiers, proposal_status
+                                demo,
+                                lazy_frontiers,
+                                proposal_status,
+                                active_count=len(active),
+                                selected=selected,
+                                known_count=len(known),
+                                executions=executions,
                             )
                             if lazy_protocol
                             else "\n".join(
@@ -5410,14 +5488,11 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             }
         )
     committed = demo.hypotheses[committed_id] if committed_id else None
-    if committed is None or committed.denotation != demo.gold_answers:
+    abstained = bool(demo.steps and demo.steps[-1].action == "Abstain")
+    if committed is None and not abstained:
+        raise ValueError(f"trajectory {demo.demo_id} has no terminal Commit or Abstain")
+    if committed is not None and committed.denotation != demo.gold_answers:
         raise ValueError(f"trajectory {demo.demo_id} did not finish on verified answers")
-    messages.append(
-        {
-            "role": "assistant",
-            "content": "<answer>" + " ".join(committed.denotation) + "</answer>",
-        }
-    )
     return {
         "messages": messages,
         "data_source": "hyper_r1_verified_frontier",
@@ -5428,6 +5503,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             "recovery_stratum": demo.private_metadata.get("recovery_stratum"),
             "replay_verified": True,
             "gold_injected_into_proposals": False,
+            "terminal_action": "Abstain" if abstained else "Commit",
         },
     }
 

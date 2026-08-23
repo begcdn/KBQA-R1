@@ -69,6 +69,7 @@ export hyper_r1_relation_model=${hyper_r1_relation_model:-"${HYPER_RELATION_MODE
 export hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 export hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 export hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
+export hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus:-0.1}
 export hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
 export max_turns=${max_turns:-32}
 # The released format bonus validates the old linear S-expression protocol.

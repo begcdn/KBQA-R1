@@ -18,6 +18,8 @@ from kbqa_r1.answer_utils import extract_last_answer_values
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
+                              proposal_action_targets,
+                              public_frontier_signature,
                               result_denotation_values,
                               result_display_labels,
                               required_hyper_relation_model)
@@ -109,6 +111,7 @@ class SExprLLMGenerationManager:
         self.is_validation = is_validation
         self.hyper_r1_enable = bool(getattr(config, "hyper_r1_enable", False))
         self.hyper_relation_model = required_hyper_relation_model(config)
+        self.hyper_relation_device = getattr(config, "hyper_r1_relation_device", None)
         self.hyper_graph = HypothesisGraph(
             max_active=int(getattr(config, "hyper_r1_max_active", 24)),
             max_nodes=int(getattr(config, "hyper_r1_max_nodes", 128)),
@@ -183,6 +186,9 @@ class SExprLLMGenerationManager:
                 similarity_model_path=(
                     self.hyper_relation_model if self.hyper_r1_enable else None
                 ),
+                similarity_model_device=(
+                    self.hyper_relation_device if self.hyper_r1_enable else None
+                ),
             )
             
             # Initialize action processor
@@ -251,14 +257,7 @@ class SExprLLMGenerationManager:
         )
 
     def _load_hyper_gold_contracts(self, gen_batch, batch_size: int) -> None:
-        """Load private training contracts used only to score terminal Commit.
-
-        These values are never serialized into model observations.  When a
-        reward-model field is present, every HyPER rollout must carry a valid
-        gold function list; silently falling back to answer-only reward would
-        recreate the spurious-program supervision this method is designed to
-        avoid.
-        """
+        """Load private answers and optional programs for terminal reward."""
         self._hyper_gold_contracts.clear()
         reward_rows = gen_batch.non_tensor_batch.get("reward_model")
         if reward_rows is None:
@@ -270,7 +269,7 @@ class SExprLLMGenerationManager:
             )
 
         from kbqa_r1.hyper_data import (
-            compile_gold_plan,
+            compile_optional_gold_plan,
             normalize_gold_answers,
         )
 
@@ -285,12 +284,9 @@ class SExprLLMGenerationManager:
             functions = _metadata_sequence(ground_truth.get("function_list"))
             if not functions:
                 functions = _metadata_sequence(extra.get("function_list"))
-            if not functions:
-                raise RuntimeError(
-                    "HyPER-R1 requires a gold function_list for every rewarded "
-                    f"rollout; sample {sample_id} has none"
-                )
-            plan = compile_gold_plan(functions)
+            # Unsupported optional syntax disables only the equivalence bonus;
+            # answer F1 remains available from the committed denotation.
+            plan = compile_optional_gold_plan(functions)
             gold_answers = ()
             for raw_answers in (
                 ground_truth.get("target"),
@@ -312,8 +308,8 @@ class SExprLLMGenerationManager:
                     f"rollout; sample {sample_id} has none"
                 )
             self._hyper_gold_contracts[sample_id] = {
-                "function_list": plan.executable_functions,
-                "target_expression": plan.target_expression,
+                "function_list": plan.executable_functions if plan else (),
+                "target_expression": plan.target_expression if plan else "",
                 "answers": gold_answers,
             }
 
@@ -338,11 +334,22 @@ class SExprLLMGenerationManager:
             return {
                 "gold_contract_available": contract is not None,
                 "answer_exact": False,
+                "answer_f1": 0.0,
                 "intent_equivalent": False,
                 "valid": False,
             }
 
-        from kbqa_r1.hyper_data import certify_program_commit
+        from kbqa_r1.hyper_data import answer_set_f1, certify_program_commit
+
+        answer_f1 = answer_set_f1(node.denotation, contract["answers"])
+        if not contract["function_list"]:
+            return {
+                "gold_contract_available": False,
+                "answer_exact": answer_f1 == 1.0,
+                "answer_f1": answer_f1,
+                "intent_equivalent": False,
+                "valid": False,
+            }
 
         certificate = certify_program_commit(
             node.function_state,
@@ -355,6 +362,7 @@ class SExprLLMGenerationManager:
         return {
             "gold_contract_available": True,
             "answer_exact": certificate.answer_exact,
+            "answer_f1": certificate.answer_f1,
             "intent_equivalent": certificate.intent_equivalent,
             "valid": certificate.valid,
         }
@@ -441,7 +449,14 @@ class SExprLLMGenerationManager:
             "<information>\n"
             + message
             + "\n"
-            + self.hyper_graph.serialize(sample_id)
+            + self.hyper_graph.serialize(
+                sample_id,
+                candidate_sources=[
+                    str(entity[-1])
+                    for entity in self.state_manager.get_sample_entities(sample_id)
+                    if entity
+                ],
+            )
             + ("\n" + page_state if page_state else "")
             + "\n</information>"
         )
@@ -473,6 +488,7 @@ class SExprLLMGenerationManager:
     def _open_relation_page_state(self, sample_id: int) -> str:
         """Serialize only exposed symbolic proposals; execution remains lazy."""
         states = []
+        graph = self.hyper_graph.state(sample_id)
         for frontier in self._hyper_frontiers.get(sample_id, ()):
             if frontier.get("closed"):
                 continue
@@ -491,6 +507,29 @@ class SExprLLMGenerationManager:
                     f"{proposal_id} rank={proposal['rank']} relation={candidate.relation} "
                     f"score={float(candidate.score):.4f} status={proposal['status']}"
                 )
+            visible_ids = [
+                str(proposal_id)
+                for proposal_id, proposal in frontier.get("proposals", {}).items()
+                if proposal.get("status") == "visible"
+            ]
+            visible_ids, widen_source = proposal_action_targets(
+                visible_ids,
+                str(frontier["source"]),
+                exposed=exposed,
+                total=total,
+                selected_id=graph.selected_id,
+                active_count=len(self.hyper_graph.active_nodes(sample_id)),
+                max_active=self.hyper_graph.max_active,
+                node_count=len(graph.nodes),
+                max_nodes=self.hyper_graph.max_nodes,
+                execution_attempts=graph.execution_attempts,
+                execution_budget=self.hyper_graph.max_execution_attempts,
+            )
+            lines.append(
+                "Available proposal targets: "
+                f"Inspect=[{','.join(visible_ids) if visible_ids else 'none'}]; "
+                f"Widen=[{widen_source or 'none'}]."
+            )
             lines.append(
                 "Use Inspect [ Pn ] to execute one visible proposal; Widen only reveals the next page."
             )
@@ -550,38 +589,18 @@ class SExprLLMGenerationManager:
             }
         )
 
-    def _open_widen_signature(self, sample_id: int) -> Tuple[Tuple[object, ...], ...]:
-        signatures = []
-        for frontier in self._hyper_frontiers.get(sample_id, ()):
-            if frontier.get("closed"):
-                continue
-            start = int(frontier["next_offset"])
-            ranked = frontier["decision"].frontier(
-                len(frontier["decision"].ranked_relations)
-            )
-            page = relation_page(
-                ranked,
-                offset=start,
-                page_size=self.hyper_frontier_width,
-            )
-            if not page.items:
-                continue
-            signatures.append(
-                (
-                    str(frontier["source"]),
-                    page.start,
-                    page.stop,
-                    page.total,
-                    tuple(candidate.relation for candidate in page.items),
-                )
-            )
-        return tuple(sorted(signatures, key=repr))
+    def _public_frontier_signature(
+        self, sample_id: int
+    ) -> Tuple[Tuple[object, ...], ...]:
+        return public_frontier_signature(
+            self._hyper_frontiers.get(sample_id, ()), self.hyper_frontier_width
+        )
 
     def _decision_state_key(self, sample_id: int, turn: int) -> str:
         return self.hyper_graph.decision_state_key(
             sample_id,
             turn=turn,
-            legal_context=self._open_widen_signature(sample_id),
+            legal_context=self._public_frontier_signature(sample_id),
         )
 
     def _annotate_action_token_spans(
@@ -1076,10 +1095,16 @@ class SExprLLMGenerationManager:
                     active_before=active_before,
                     selected_before=selected_before,
                 )
+                self._hyper_protocol_valid_answer_turns[sample_id] = int(turn)
+                certificate = self._certify_hyper_commit(sample_id)
+                self._hyper_commit_certificates[sample_id] = certificate
+                # A legal Commit is terminal. Gold-program equivalence remains
+                # private reward metadata and cannot veto an alternative path.
+                self._hyper_valid_answer_turns[sample_id] = int(turn)
                 values = " ".join(node.denotation)
                 return self._hyper_info(
                     sample_id,
-                    f"Committed {node.node_id}. Return exactly these values in <answer>: {values}",
+                    f"Committed {node.node_id}. Final answer values: {values}",
                     is_final_turn,
                 )
 
@@ -1281,6 +1306,9 @@ class SExprLLMGenerationManager:
         commit_answer_exact = torch.zeros(
             batch_size, dtype=torch.bool, device=responses.device
         )
+        commit_answer_f1 = torch.zeros(
+            batch_size, dtype=torch.float32, device=responses.device
+        )
         commit_intent_equivalent = torch.zeros(
             batch_size, dtype=torch.bool, device=responses.device
         )
@@ -1305,11 +1333,14 @@ class SExprLLMGenerationManager:
             commit_answer_exact[sample_id] = bool(
                 certificate.get("answer_exact", False)
             )
+            commit_answer_f1[sample_id] = float(
+                certificate.get("answer_f1", 0.0)
+            )
             commit_intent_equivalent[sample_id] = bool(
                 certificate.get("intent_equivalent", False)
             )
             gold_contract_available[sample_id] = (
-                sample_id in self._hyper_gold_contracts
+                bool(self._hyper_gold_contracts.get(sample_id, {}).get("function_list"))
             )
             abstained[sample_id] = bool(graph.abstained)
             premature_answer[sample_id] = sample_id in self._hyper_premature_answers
@@ -1332,6 +1363,7 @@ class SExprLLMGenerationManager:
         output.batch["hyper_r1_commit_valid"] = commit_valid
         output.batch["hyper_r1_commit_protocol_valid"] = commit_protocol_valid
         output.batch["hyper_r1_commit_answer_exact"] = commit_answer_exact
+        output.batch["hyper_r1_commit_answer_f1"] = commit_answer_f1
         output.batch["hyper_r1_commit_intent_equivalent"] = commit_intent_equivalent
         output.batch["hyper_r1_gold_contract_available"] = gold_contract_available
         output.batch["hyper_r1_abstained"] = abstained
@@ -1514,14 +1546,9 @@ class SExprLLMGenerationManager:
                     self._hyper_protocol_valid_answer_turns[i] = int(turn)
                     certificate = self._certify_hyper_commit(i)
                     self._hyper_commit_certificates[i] = certificate
-                    # Private gold is a reward-side verifier, never an
-                    # observation. A semantically spurious Commit therefore
-                    # terminates normally but cannot earn task reward.
-                    if (
-                        not certificate["gold_contract_available"]
-                        or certificate["valid"]
-                    ):
-                        self._hyper_valid_answer_turns[i] = int(turn)
+                    # Private gold is reward-side metadata, never an
+                    # observation or a gate on alternative executable paths.
+                    self._hyper_valid_answer_turns[i] = int(turn)
                 logger.info(f"[SEXPR] Sample {i}: Completed (found answer)")
                 logger.info(f"[SEXPR] Sample {i}: prediction: {pred}")
                 # Clear the linear executor state. The hypothesis graph remains
@@ -1538,8 +1565,10 @@ class SExprLLMGenerationManager:
                     observation = self._process_sexpr_prediction(pred, i, turn=turn)
                     observation = SExprUtils.ensure_leading_newline_info(observation)
                     local_next_obs = observation
-                    if self.hyper_r1_enable and self.hyper_graph.state(i).abstained:
-                        local_done = True
+                    if self.hyper_r1_enable:
+                        graph = self.hyper_graph.state(i)
+                        if graph.abstained or graph.committed_id is not None:
+                            local_done = True
                     
                     # Check if the observation contains timeout error
                     if self._is_timeout_error(observation):
@@ -1625,6 +1654,11 @@ class SExprLLMGenerationManager:
         
         if not actions:
             logger.info(f"[SEXPR] Sample {index}: No valid actions found in prediction")
+            logger.info(
+                "[SEXPR] Sample %s raw prediction: %r",
+                index,
+                prediction[:2000],
+            )
             info_block = "<information>\nNo valid actions found. Please provide reasoning actions.\n</information>"
             return self.result_processor._add_guidance_prompt(info_block, is_final_turn)
 

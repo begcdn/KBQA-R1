@@ -33,6 +33,8 @@ def _number(row: dict, key: str, fallback: float = 0.0) -> float:
 
 
 def _f1(row: dict) -> float:
+    if "hyper_r1_commit_answer_f1" in row:
+        return _number(row, "hyper_r1_commit_answer_f1")
     if "mid_f1" in row:
         return _number(row, "mid_f1")
     ground_truth = row.get("gts")
@@ -67,7 +69,9 @@ def _f1(row: dict) -> float:
                 )
             best = max(best, score)
         return best
-    raise ValueError("validation row has neither mid_f1 nor output/gold answers")
+    raise ValueError(
+        "validation row has neither committed-answer F1, mid_f1, nor output/gold answers"
+    )
 
 
 def summarize(rows: Iterable[dict]) -> dict:

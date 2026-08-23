@@ -13,6 +13,8 @@ from kbqa_r1.hyper_r1 import (
     dependency_function_state,
     graph_action_token_mask,
     penalize_invalid_actions,
+    proposal_action_targets,
+    public_frontier_signature,
     public_question_contract,
     result_display_labels,
     result_denotation_values,
@@ -396,7 +398,106 @@ def test_serialization_exposes_compact_executable_state():
     assert node.node_id in text
     assert "people.person.place_of_birth" in text
     assert "m.city" in text
+    assert f"Select=[{node.node_id}]" in text
+    assert f"Park=[{node.node_id}]" in text
+    assert f"Commit(nonempty active)=[{node.node_id}]" in text
     assert "Actions: Select, Find_relation [ source ], Widen [ source ]" in text
+
+
+def test_selected_expression_is_the_only_advertised_continuation_source():
+    graph = HypothesisGraph(max_active=3)
+    node = add(graph, "r.answer", ["m.answer"])
+    graph.select(0, node.node_id)
+
+    assert "Find_relation sources=[expression1]" in graph.serialize(0)
+
+
+def test_unselected_graph_exposes_only_supplied_entity_roots():
+    graph = HypothesisGraph(max_active=3)
+    node = add(graph, "r.answer", ["m.answer"])
+
+    observation = graph.serialize(
+        0,
+        candidate_sources=(
+            "m.topic",
+            "m.other_topic",
+            "1.5^^http://www.w3.org/2001/XMLSchema#float",
+        ),
+    )
+    assert (
+        "Find_relation sources=[m.topic,m.other_topic,"
+        "1.5^^http://www.w3.org/2001/XMLSchema#float]"
+    ) in observation
+
+    graph.select(0, node.node_id)
+    selected = graph.serialize(
+        0, candidate_sources=("m.topic", "m.other_topic")
+    )
+    assert "Find_relation sources=[expression1]" in selected
+    assert "Find_relation sources=[m.topic" not in selected
+
+
+def test_action_affordances_match_select_prune_and_recall_legality():
+    graph = HypothesisGraph(max_active=2, max_nodes=4)
+    graph.register_public_question(0, "Which people satisfy the condition?")
+    empty = add(graph, "r.empty", [])
+    parked = add(graph, "r.parked", ["m.parked"])
+    graph.park(0, parked.node_id)
+
+    line = next(
+        value
+        for value in graph.serialize(0).splitlines()
+        if value.startswith("Available targets:")
+    )
+    assert "Select=[none]" in line
+    assert f"Park=[{empty.node_id}]" in line
+    assert f"Prune candidates=[{empty.node_id}]" in line
+    assert f"Recall=[{parked.node_id}]" in line
+
+    active = add(graph, "r.active", ["m.active"])
+    full_line = next(
+        value
+        for value in graph.serialize(0).splitlines()
+        if value.startswith("Available targets:")
+    )
+    assert "Recall=[none]" in full_line
+    with pytest.raises(RuntimeError, match="workspace is full"):
+        graph.recall(0, parked.node_id)
+    assert active.node_id in full_line
+
+
+def test_proposal_affordances_respect_selection_and_resource_budgets():
+    inspect, widen = proposal_action_targets(
+        ("P0", "P1"),
+        "expression1",
+        exposed=2,
+        total=4,
+        selected_id=None,
+        active_count=1,
+        max_active=2,
+        node_count=2,
+        max_nodes=4,
+        execution_attempts=1,
+        execution_budget=3,
+    )
+    assert inspect == ("P0", "P1")
+    assert widen == "expression1"
+
+    inspect, widen = proposal_action_targets(
+        ("P0",),
+        "expression1",
+        exposed=1,
+        total=4,
+        selected_id="H0",
+        active_count=2,
+        max_active=2,
+        node_count=4,
+        max_nodes=4,
+        execution_attempts=3,
+        execution_budget=3,
+    )
+    assert inspect == ()
+    assert widen is None
 
 
 def test_serialization_pairs_readable_labels_with_stable_entity_ids():
@@ -509,6 +610,33 @@ def test_decision_state_distinguishes_hidden_widen_choices():
     )
 
 
+def test_public_frontier_signature_keeps_fully_exposed_catalogs_distinct():
+    candidate = SimpleNamespace(relation="r.visible", score=0.9)
+    frontier = {
+        "closed": False,
+        "source": "m.first",
+        "next_offset": 1,
+        "decision": SimpleNamespace(ranked_relations=[candidate]),
+        "proposals": {
+            "P0": {
+                "candidate": candidate,
+                "rank": 1,
+                "status": "visible",
+            }
+        },
+    }
+    first = public_frontier_signature([frontier], 6)
+    frontier["source"] = "m.second"
+    second = public_frontier_signature([frontier], 6)
+    frontier["source"] = "m.first"
+    frontier["proposals"]["P0"]["status"] = "failed"
+    failed = public_frontier_signature([frontier], 6)
+
+    assert first
+    assert first != second
+    assert first != failed
+
+
 def test_combine_action_key_is_parent_order_invariant():
     graph = HypothesisGraph(max_active=3)
     left = add(graph, "r.left", ["m.left"])
@@ -546,15 +674,53 @@ def test_hypothesis_graph_supports_three_hop_continuation():
     ]
 
 
-def test_invalid_commit_cannot_keep_answer_reward():
+def test_illegal_commit_cannot_keep_answer_reward():
     rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
     mask = torch.tensor([[1, 1, 1], [1, 1, 1]])
     result = enforce_commit_reward(
-        rewards, mask, torch.tensor([True, False]), invalid_penalty=0.25
+        rewards,
+        mask,
+        torch.tensor([True, False]),
+        torch.tensor([1.0, 1.0]),
+        invalid_penalty=0.25,
     )
 
     assert result[0].tolist() == [0.0, 0.0, 1.0]
     assert result[1].tolist() == [0.0, 0.0, -0.25]
+
+
+def test_answer_correct_alternative_is_not_vetoed_by_intent_certificate():
+    rewards = torch.full((2, 3), 0.9)
+    mask = torch.ones_like(rewards)
+
+    result = enforce_commit_reward(
+        rewards,
+        mask,
+        torch.tensor([True, True]),
+        torch.tensor([1.0, 0.5]),
+        commit_intent_equivalent=torch.tensor([False, True]),
+        semantic_bonus=0.1,
+    )
+
+    assert result[0].tolist() == [0.0, 0.0, 1.0]
+    assert result[1].tolist() == pytest.approx([0.0, 0.0, 0.6])
+
+
+def test_semantic_certificate_is_only_a_positive_bonus():
+    rewards = torch.zeros((2, 2))
+    mask = torch.ones_like(rewards)
+
+    result = enforce_commit_reward(
+        rewards,
+        mask,
+        torch.tensor([True, True]),
+        torch.tensor([0.0, 0.0]),
+        commit_intent_equivalent=torch.tensor([False, True]),
+        semantic_bonus=0.1,
+    )
+
+    assert result[0].tolist() == [0.0, 0.0]
+    assert result[1].tolist() == pytest.approx([0.0, 0.1])
 
 
 def test_abstention_is_safe_but_never_earns_answer_reward():
@@ -564,6 +730,7 @@ def test_abstention_is_safe_but_never_earns_answer_reward():
         rewards,
         mask,
         torch.tensor([False, False]),
+        torch.tensor([0.0, 0.0]),
         abstained=torch.tensor([True, False]),
         invalid_penalty=0.25,
     )

@@ -465,6 +465,11 @@ class TaskRunner:
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer_kbqa import Role
 
+        # Validation computes executable rollouts and rewards only. Loading a
+        # second 8B reference model wastes memory and can prevent evaluation on
+        # a single inference GPU; GRPO training still creates it normally.
+        if config.trainer.get("val_only", False):
+            return
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"

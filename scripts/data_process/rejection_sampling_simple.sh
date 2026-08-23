@@ -104,11 +104,17 @@ TRAIN_FILES_STR+="]"
 MAX_SAMPLES=${MAX_SAMPLES:-3}           # 每个样本最多采样次数
 REWARD_THRESHOLD=${REWARD_THRESHOLD:-0.8}  # 奖励阈值
 NUM_SAMPLES=${NUM_SAMPLES:-null}         # null processes the full split
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
+FSDP_MODEL_DTYPE=${FSDP_MODEL_DTYPE:-fp32}
 HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
 HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-24}
 HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-128}
 HYPER_R1_MAX_EXECUTION_ATTEMPTS=${HYPER_R1_MAX_EXECUTION_ATTEMPTS:-24}
 HYPER_R1_FRONTIER_WIDTH=${HYPER_R1_FRONTIER_WIDTH:-6}
+HYPER_RELATION_MODEL=${HYPER_RELATION_MODEL:-}
+HYPER_RELATION_DEVICE=${HYPER_RELATION_DEVICE:-cpu}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-14336}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-1024}
 
 # GPU 配置
 NNODES=${NNODES:-1}
@@ -117,7 +123,9 @@ TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-8}
 if (( NGPUS_PER_NODE < 4 )); then
     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-32}
     MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-2}
-    MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-8192}
+MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-8192}
+ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL:-true}
+INCREMENTAL_VALIDATION_DUMP=${INCREMENTAL_VALIDATION_DUMP:-false}
 else
     VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-1024}
     MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-48}
@@ -126,7 +134,7 @@ fi
 
 # 生成时间戳
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-EXPERIMENT_NAME="rejection_sampling_${DATASET_TYPE}_${TIMESTAMP}"
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"rejection_sampling_${DATASET_TYPE}_${TIMESTAMP}"}
 
 # 创建输出目录
 mkdir -p "${OUTPUT_DIR}"
@@ -184,9 +192,9 @@ python3 -m verl.trainer.main_ppo_kbqa \
     data.return_raw_chat=true \
     data.filter_overlong_prompts=true \
     data.truncation='left' \
-    data.train_batch_size=512 \
+    data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.val_batch_size=${VAL_BATCH_SIZE} \
-    data.max_prompt_length=14336 \
+    data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=1024 \
     data.max_start_length=2048 \
     data.max_obs_length=4196 \
@@ -196,6 +204,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.offload_policy=true \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=${FSDP_MODEL_DTYPE} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.actor.use_dynamic_bsz=true \
@@ -215,8 +224,10 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_BATCHED_TOKENS} \
+    actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
+    actor_rollout_ref.rollout.enable_chunked_prefill=${ENABLE_CHUNKED_PREFILL} \
     actor_rollout_ref.rollout.n=${MAX_SAMPLES} \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=0.9 \
@@ -234,6 +245,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     trainer.validation_data_dir="${VALIDATION_DUMP_DIR}" \
     trainer.rollout_data_dir="${ROLLOUT_DUMP_DIR}" \
     trainer.log_val_generations=1000 \
+    +trainer.incremental_validation_dump=${INCREMENTAL_VALIDATION_DUMP} \
     +trainer.max_val_samples=${NUM_SAMPLES} \
     sexpr_config.enable_sexpr_mode=true \
     sexpr_config.enable_action_reasoning=true \
@@ -248,6 +260,8 @@ python3 -m verl.trainer.main_ppo_kbqa \
     hyper_r1.max_nodes=${HYPER_R1_MAX_NODES} \
     hyper_r1.max_execution_attempts=${HYPER_R1_MAX_EXECUTION_ATTEMPTS} \
     hyper_r1.frontier_width=${HYPER_R1_FRONTIER_WIDTH} \
+    hyper_r1.relation_model="${HYPER_RELATION_MODEL}" \
+    +hyper_r1.relation_device="${HYPER_RELATION_DEVICE}" \
     max_turns=${SEXPR_MAX_TURNS} \
     use_odbc=true \
     use_aioodbc=false \

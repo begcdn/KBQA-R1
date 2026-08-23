@@ -207,6 +207,7 @@ hyper_r1_relation_model=${hyper_r1_relation_model:-}
 hyper_r1_credit_weight=${hyper_r1_credit_weight:-1.0}
 hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
+hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus:-0.1}
 hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
 structure_format_score=${structure_format_score:-0.1}
 
@@ -305,6 +306,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     algorithm.hyper_r1_credit_weight=${hyper_r1_credit_weight} \
     algorithm.hyper_r1_budget_cost=${hyper_r1_budget_cost} \
     algorithm.hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty} \
+    algorithm.hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus} \
     algorithm.hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.dtype=float16 \

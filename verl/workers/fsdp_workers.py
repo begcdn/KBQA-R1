@@ -92,6 +92,11 @@ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManage
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+
+def direct_validation_load_format(load_format: str) -> str:
+    """Load checkpoint weights when no actor exists to synchronize them."""
+    return "auto" if str(load_format).startswith("dummy") else str(load_format)
+
 device_name = get_device_name()
 
 
@@ -612,19 +617,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
-        # Full params
-        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.FULL_STATE_DICT,
-                state_dict_config=FullStateDictConfig(),
-            )
-        elif fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                state_dict_config=ShardedStateDictConfig(),
-            )
+        # Hybrid training synchronizes FSDP weights into vLLM. A direct
+        # validation rollout has no FSDP model because vLLM loaded the Hugging
+        # Face checkpoint itself.
+        if hasattr(self, "actor_module_fsdp"):
+            if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.actor_module_fsdp,
+                    state_dict_type=StateDictType.FULL_STATE_DICT,
+                    state_dict_config=FullStateDictConfig(),
+                )
+            elif fsdp_version(self.actor_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.actor_module_fsdp,
+                    state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                    state_dict_config=ShardedStateDictConfig(),
+                )
 
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
@@ -742,6 +750,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
+        from verl.utils.model import get_generation_config
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -750,8 +759,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
+        trust_remote_code = self.config.model.get("trust_remote_code", False)
 
-        if self._is_actor or self._is_rollout:
+        direct_validation_rollout = (
+            self._is_rollout and not self._is_actor and self.config.get("validation_only", False)
+        )
+
+        if self._is_actor or (self._is_rollout and not direct_validation_rollout):
             # we need the model for actor and rollout
             if self._is_actor:
                 optim_config = self.config.actor.optim
@@ -761,6 +775,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fsdp_config = FSDPEngineConfig()
 
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            model_build_role = "actor" if self._is_actor else "ref"
             (
                 self.actor_module_fsdp,
                 self.actor_optimizer,
@@ -776,7 +791,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 enable_gradient_checkpointing=self.config.model.get("enable_gradient_checkpointing", False),
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
-                role="actor",
+                role=model_build_role,
                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
             )
 
@@ -791,6 +806,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+
+        elif direct_validation_rollout:
+            # vLLM loads a Hugging Face validation checkpoint directly. Building
+            # an FSDP copy first duplicates the model and can exceed a 24 GiB
+            # inference GPU before validation begins.
+            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            with open_dict(self.config.rollout):
+                self.config.rollout.load_format = direct_validation_load_format(
+                    self.config.rollout.load_format
+                )
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+            self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+            self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
@@ -837,7 +865,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
-        if not self._is_actor and self._is_rollout:
+        if not self._is_actor and self._is_rollout and not direct_validation_rollout:
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
 

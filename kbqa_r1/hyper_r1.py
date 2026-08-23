@@ -39,6 +39,41 @@ class HypothesisSemanticStatus(str, Enum):
     PROVED_COMPLETE = "proved_complete"
 
 
+def public_frontier_signature(
+    frontiers: Sequence[Mapping[str, Any]], page_size: int
+) -> Tuple[Tuple[object, ...], ...]:
+    """Canonicalize every proposal catalog visible to the policy."""
+    signatures = []
+    for frontier in frontiers:
+        if frontier.get("closed"):
+            continue
+        total = len(frontier["decision"].ranked_relations)
+        exposed = min(int(frontier["next_offset"]), total)
+        proposals = tuple(
+            sorted(
+                (
+                    str(proposal_id),
+                    int(proposal["rank"]),
+                    str(proposal["candidate"].relation),
+                    f"{float(proposal['candidate'].score):.4f}",
+                    str(proposal["status"]),
+                )
+                for proposal_id, proposal in frontier.get("proposals", {}).items()
+                if proposal.get("status") in {"visible", "failed"}
+            )
+        )
+        signatures.append(
+            (
+                str(frontier["source"]),
+                exposed,
+                total,
+                int(page_size),
+                proposals,
+            )
+        )
+    return tuple(sorted(signatures, key=repr))
+
+
 class HypothesisEdgeKind(str, Enum):
     EXPANSION = "expansion"
     CONTRAST = "contrast"
@@ -291,6 +326,31 @@ def _node_source(provenance: Sequence[str]) -> str:
     return "derived"
 
 
+def proposal_action_targets(
+    visible_ids: Sequence[str],
+    source: str,
+    *,
+    exposed: int,
+    total: int,
+    selected_id: Optional[str],
+    active_count: int,
+    max_active: int,
+    node_count: int,
+    max_nodes: int,
+    execution_attempts: int,
+    execution_budget: int,
+) -> Tuple[Tuple[str, ...], Optional[str]]:
+    """Return proposal actions that the live manager can execute now."""
+    can_inspect = (
+        active_count < max_active
+        and node_count < max_nodes
+        and execution_attempts < execution_budget
+    )
+    inspect = tuple(str(value) for value in visible_ids) if can_inspect else ()
+    widen = str(source) if selected_id is None and exposed < total else None
+    return inspect, widen
+
+
 def serialize_frontier(
     nodes: Sequence[Mapping[str, Any]],
     *,
@@ -300,13 +360,17 @@ def serialize_frontier(
     max_active: int,
     node_count: int,
     execution_calls: int,
+    max_nodes: Optional[int] = None,
     parked_nodes: Sequence[Mapping[str, Any]] = (),
     execution_budget: Optional[int] = None,
+    count_completion_possible: bool = True,
+    candidate_sources: Sequence[str] = (),
     max_answers: int = 4,
 ) -> str:
     """Canonical policy observation shared by demonstrations and live rollouts."""
     active = set(active_ids)
     visible = active | ({committed_id} if committed_id else set())
+    node_by_id = {str(node["node_id"]): node for node in nodes}
     lines = [
         "<hypothesis_graph>",
         f"active={len(active)} capacity={max_active} stored={node_count} "
@@ -338,6 +402,59 @@ def serialize_frontier(
             f"source={_node_source(provenance)} depth={int(node.get('depth', 0))} "
             f"path={path} answers={len(denotation)}: {answers}"
         )
+    ordered_active = [str(node_id) for node_id in active_ids]
+    select_targets = [
+        node_id
+        for node_id in ordered_active
+        if count_completion_possible
+        or normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+    ]
+    commit_targets = [
+        node_id
+        for node_id in ordered_active
+        if normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+    ]
+    parked_ids = [str(node["node_id"]) for node in parked_nodes]
+    recall_targets = parked_ids if len(ordered_active) < max_active else []
+    prune_targets = [
+        node_id
+        for node_id in ordered_active
+        if not count_completion_possible
+        and not normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+    ]
+    has_node_capacity = max_nodes is None or node_count < max_nodes
+    has_execution_budget = (
+        execution_budget is None or execution_calls < execution_budget
+    )
+    combine_targets = []
+    if has_node_capacity and has_execution_budget:
+        combine_targets = [
+            f"{left}|{right}"
+            for index, left in enumerate(ordered_active)
+            for right in ordered_active[index + 1 :]
+        ]
+    relation_sources = list(
+        dict.fromkeys(str(value) for value in candidate_sources if str(value))
+    )
+    if selected_id is not None:
+        selected_target = str(
+            node_by_id.get(str(selected_id), {}).get("target_expression", "")
+        ).strip()
+        relation_sources = [selected_target] if selected_target else []
+    if committed_id is not None:
+        relation_sources = []
+    show = lambda values: ",".join(values) if values else "none"
+    lines.append(
+        "Available targets: "
+        f"Select=[{show(select_targets)}]; "
+        f"Park=[{show(ordered_active)}]; "
+        f"Commit(nonempty active)=[{show(commit_targets)}]; "
+        f"Combine=[{show(combine_targets)}]; "
+        f"Prune candidates=[{show(prune_targets)}]; "
+        f"Recall=[{show(recall_targets)}]; "
+        f"Find_relation sources=[{show(relation_sources)}]. "
+        "Do not use an ID or source absent from its action-specific list."
+    )
     lines.append(
         "Actions: Select, Find_relation [ source ], Widen [ source ], Inspect [ Pn ], "
         "Park, Recall, Combine, Prune, Commit, or Abstain. Widen exposes symbolic "
@@ -678,7 +795,7 @@ class HypothesisGraph:
         """Return why an executable policy action is illegal in this state."""
         graph = self.state(sample_id)
         if graph.committed_id is not None:
-            return "The graph is committed. Return the committed values in <answer>."
+            return "The graph is already committed; no further action is allowed."
         if graph.abstained:
             return "The graph is closed after Abstain."
         active = self.active_nodes(sample_id)
@@ -948,7 +1065,12 @@ class HypothesisGraph:
             current = graph.nodes[current].parent_id
         return lineage
 
-    def serialize(self, sample_id: int, max_answers: int = 4) -> str:
+    def serialize(
+        self,
+        sample_id: int,
+        max_answers: int = 4,
+        candidate_sources: Sequence[str] = (),
+    ) -> str:
         """Compact policy observation; names remain the executor's responsibility."""
         graph = self.state(sample_id)
         return serialize_frontier(
@@ -959,8 +1081,11 @@ class HypothesisGraph:
             max_active=self.max_active,
             node_count=len(graph.nodes),
             execution_calls=graph.execution_attempts,
+            max_nodes=self.max_nodes,
             parked_nodes=[node.__dict__ for node in self.parked_nodes(sample_id)],
             execution_budget=self.max_execution_attempts,
+            count_completion_possible=self.count_completion_possible(sample_id),
+            candidate_sources=candidate_sources,
             max_answers=max_answers,
         )
 
@@ -1085,26 +1210,50 @@ def penalize_invalid_actions(
 def enforce_commit_reward(
     token_rewards: torch.Tensor,
     response_mask: torch.Tensor,
-    commit_valid: torch.Tensor,
+    commit_protocol_valid: torch.Tensor,
+    commit_answer_f1: torch.Tensor,
+    commit_intent_equivalent: Optional[torch.Tensor] = None,
     abstained: Optional[torch.Tensor] = None,
     invalid_penalty: float = 0.25,
+    semantic_bonus: float = 0.1,
 ) -> torch.Tensor:
-    """Reward certified Commit, permit safe abstention, penalize false claims."""
+    """Reward answer quality without vetoing alternative executable programs.
+
+    Formal gold-program equivalence is a one-sided auxiliary signal: proving it
+    earns a bonus, while failure to prove it never removes answer reward.
+    """
     if token_rewards.shape != response_mask.shape:
         raise ValueError("token_rewards and response_mask must have the same shape")
-    if commit_valid.ndim != 1 or commit_valid.shape[0] != token_rewards.shape[0]:
-        raise ValueError("commit_valid must contain one value per rollout")
+    if (
+        commit_protocol_valid.ndim != 1
+        or commit_protocol_valid.shape[0] != token_rewards.shape[0]
+    ):
+        raise ValueError("commit_protocol_valid must contain one value per rollout")
+    if commit_answer_f1.ndim != 1 or commit_answer_f1.shape[0] != token_rewards.shape[0]:
+        raise ValueError("commit_answer_f1 must contain one value per rollout")
+    if commit_intent_equivalent is None:
+        commit_intent_equivalent = torch.zeros_like(
+            commit_protocol_valid, dtype=torch.bool
+        )
+    if (
+        commit_intent_equivalent.ndim != 1
+        or commit_intent_equivalent.shape[0] != token_rewards.shape[0]
+    ):
+        raise ValueError("commit_intent_equivalent must contain one value per rollout")
     if abstained is None:
-        abstained = torch.zeros_like(commit_valid, dtype=torch.bool)
+        abstained = torch.zeros_like(commit_protocol_valid, dtype=torch.bool)
     if abstained.ndim != 1 or abstained.shape[0] != token_rewards.shape[0]:
         raise ValueError("abstained must contain one value per rollout")
-    result = token_rewards.clone()
-    valid = commit_valid.to(dtype=torch.bool)
-    safe_abstention = abstained.to(dtype=torch.bool) & ~valid
-    invalid = ~valid & ~safe_abstention
-    result[~valid] = 0
+    result = torch.zeros_like(token_rewards)
+    legal_commit = commit_protocol_valid.to(dtype=torch.bool)
+    safe_abstention = abstained.to(dtype=torch.bool) & ~legal_commit
+    invalid = ~legal_commit & ~safe_abstention
+    answer_f1 = commit_answer_f1.to(dtype=result.dtype).clamp(0.0, 1.0)
+    intent = commit_intent_equivalent.to(dtype=result.dtype)
+    terminal_reward = answer_f1 + float(semantic_bonus) * intent
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
     rows = torch.arange(result.shape[0], device=result.device)
+    result[rows[legal_commit], lengths[legal_commit]] = terminal_reward[legal_commit]
     result[rows[invalid], lengths[invalid]] = -abs(float(invalid_penalty))
     return result
 

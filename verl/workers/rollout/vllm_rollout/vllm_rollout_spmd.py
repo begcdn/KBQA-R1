@@ -347,6 +347,13 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         logger.info("**********start vllm generate**********")
+        debug_vllm_io = os.getenv("HYPER_DEBUG_VLLM_IO", "0").lower() in ("1", "true", "yes")
+        if debug_vllm_io and vllm_inputs:
+            engine_tokenizer = self.inference_engine.get_tokenizer()
+            logger.warning(
+                "[HYPER-VLLM-IO] prompt suffix: %r",
+                engine_tokenizer.decode(vllm_inputs[0]["prompt_token_ids"][-512:]),
+            )
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
@@ -364,6 +371,13 @@ class vLLMRollout(BaseRollout):
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
+                    if debug_vllm_io and not response:
+                        engine_tokenizer = self.inference_engine.get_tokenizer()
+                        logger.warning("[HYPER-VLLM-IO] response ids: %s", response_ids[:32])
+                        logger.warning(
+                            "[HYPER-VLLM-IO] response text: %r",
+                            engine_tokenizer.decode(response_ids[:512]),
+                        )
                     response.append(response_ids)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []

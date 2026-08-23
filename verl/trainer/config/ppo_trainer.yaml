@@ -86,8 +86,12 @@ algorithm:
   # Cost per execution beyond the cheapest sibling rollout for that question.
   hyper_r1_budget_cost: 0.05
 
-  # Penalty when no committed hypothesis exactly grounds the final answer.
+  # Penalty when the rollout never makes a legal Commit or Abstain action.
   hyper_r1_invalid_commit_penalty: 0.25
+
+  # One-sided bonus for proving formal gold-program equivalence. Failure to
+  # prove equivalence never removes answer F1 from an executable Commit.
+  hyper_r1_semantic_bonus: 0.1
 
   # Token-local penalty for malformed or environment-rejected actions.
   hyper_r1_invalid_action_penalty: 0.25

@@ -60,6 +60,21 @@ class SimCSE(object):
 
         self._move_model_to(self.device)
 
+    def fork_index(self) -> "SimCSE":
+        """Create an independent search index backed by the same encoder."""
+        fork = object.__new__(type(self))
+        fork.tokenizer = self.tokenizer
+        fork.model = self.model
+        fork.device = self.device
+        fork._device_lock = self._device_lock
+        fork._current_device = self._current_device
+        fork.index = None
+        fork.is_faiss_index = False
+        fork.num_cells = self.num_cells
+        fork.num_cells_in_search = self.num_cells_in_search
+        fork.pooler = self.pooler
+        return fork
+
     def _move_model_to(self, target_device: str) -> None:
         """Move underlying torch model to target device once, guarding with a lock."""
         if target_device is None:

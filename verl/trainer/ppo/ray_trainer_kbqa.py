@@ -24,6 +24,7 @@ import os
 import re
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pprint import pprint
@@ -72,6 +73,37 @@ from verl.utils.tracking import ValidationGenerationsLogger
 module_logger = logging.getLogger(__name__)
 module_logger.setLevel(os.getenv("VERL_LOG_LEVEL", "INFO"))
 torch.autograd.set_detect_anomaly(True)
+
+
+def _validation_metadata_id(metadata):
+    if isinstance(metadata, Mapping):
+        value = metadata.get("id")
+        return str(value) if value is not None else None
+    return None
+
+
+def _load_completed_validation_ids(path):
+    completed = set()
+    if not os.path.isfile(path):
+        return completed
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            sample_id = _validation_metadata_id(row.get("metadata"))
+            if sample_id:
+                completed.add(sample_id)
+    return completed
+
+
+def _normalize_generated_batch_dtypes(batch):
+    """Normalize integral generation fields without destroying score precision."""
+    for key, value in list(batch.items()):
+        if not torch.is_floating_point(value):
+            batch[key] = value.long()
+    return batch
 
 @dataclass
 class ResourcePoolManager:
@@ -500,10 +532,12 @@ class RayPPOTrainer:
         reward_extra_infos_dict,
         dump_path,
         metadata=None,
+        filename=None,
+        append=False,
     ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, filename or f"{self.global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -527,8 +561,10 @@ class RayPPOTrainer:
             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
-        with open(filename, "w") as f:
+        with open(filename, "a" if append else "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
         print(f"Dumped generations to {filename}")
 
@@ -599,8 +635,10 @@ class RayPPOTrainer:
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
-        # For agent loop, we need reward model keys to compute score.
-        if self.async_rollout_mode:
+        # HyPER's terminal certificate needs private gold metadata, but the
+        # generation manager never serializes these fields into model input.
+        # Keep the same metadata handoff used by the async agent loop.
+        if self.async_rollout_mode or self.config.get("hyper_r1", {}).get("enable", False):
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
@@ -643,6 +681,7 @@ class RayPPOTrainer:
             hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
             hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
             hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
+            hyper_r1_relation_device=self.config.get('hyper_r1', {}).get('relation_device'),
             sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
             use_odbc=self.config.get('use_odbc', False),
             use_aioodbc=self.config.get('use_aioodbc', True),
@@ -698,6 +737,14 @@ class RayPPOTrainer:
         sample_uids = []
         sample_metadata = []
         max_val_samples = getattr(self.config.trainer, "max_val_samples", None)
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        incremental_dump = bool(self.config.trainer.get("incremental_validation_dump", False))
+        progress_path = os.path.join(val_data_dir, "progress.jsonl") if val_data_dir else None
+        completed_ids = (
+            _load_completed_validation_ids(progress_path)
+            if incremental_dump and progress_path
+            else set()
+        )
 
         # 统计总的 validation 样本数，用于 tqdm total
         # 1) 如果用户显式设置了 max_val_samples，则以此为 total
@@ -707,7 +754,7 @@ class RayPPOTrainer:
         except Exception:
             total_val_samples = None
 
-        processed_samples = 0
+        processed_samples = len(completed_ids)
 
         # 仅在 driver 上显示 tqdm；val_only=true 时也生效
         use_tqdm = total_val_samples is not None
@@ -732,6 +779,20 @@ class RayPPOTrainer:
                 )
                 break
             test_batch = DataProto.from_single_dict(test_data)
+
+            if completed_ids:
+                metadata_values = test_batch.non_tensor_batch.get("extra_info")
+                if metadata_values is not None:
+                    keep_indices = [
+                        index
+                        for index, metadata_value in enumerate(metadata_values)
+                        if _validation_metadata_id(metadata_value) not in completed_ids
+                    ]
+                    if not keep_indices:
+                        continue
+                    test_batch = test_batch[keep_indices]
+
+            batch_dump_start = len(sample_scores)
 
             # Correctly compute original batch size (before repeat). Using len(test_data)
             # would count dict keys instead of samples, causing the cap to be ignored.
@@ -852,6 +913,7 @@ class RayPPOTrainer:
                     hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
                     hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
                     hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
+                    hyper_r1_relation_device=self.config.get('hyper_r1', {}).get('relation_device'),
                     sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                     use_odbc=self.config.get('use_odbc', False),
                     use_aioodbc=self.config.get('use_aioodbc', True),
@@ -901,9 +963,9 @@ class RayPPOTrainer:
                     initial_input_ids=first_input_ids,
                 )
                 
-                # Convert all batch tensors to long
-                for key in test_output_gen_batch_padded.batch.keys():
-                    test_output_gen_batch_padded.batch[key] = test_output_gen_batch_padded.batch[key].long()
+                # Token and mask tensors are integral, but HyPER's committed-answer
+                # F1 and other rollout statistics must retain fractional values.
+                _normalize_generated_batch_dtypes(test_output_gen_batch_padded.batch)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -967,8 +1029,8 @@ class RayPPOTrainer:
                     "hyper_r1_commit_valid",
                     "hyper_r1_commit_protocol_valid",
                     "hyper_r1_commit_answer_exact",
+                    "hyper_r1_commit_answer_f1",
                     "hyper_r1_commit_intent_equivalent",
-                    "hyper_r1_gold_contract_available",
                     "hyper_r1_abstained",
                 }
                 missing_hyper_fields = required_hyper_fields.difference(
@@ -979,23 +1041,25 @@ class RayPPOTrainer:
                         "HyPER-R1 validation is missing fields: "
                         + ", ".join(sorted(missing_hyper_fields))
                     )
-                if not bool(test_batch.batch["hyper_r1_gold_contract_available"].all()):
-                    raise RuntimeError(
-                        "HyPER-R1 validation cannot use answer-only Commit reward; "
-                        "every sample needs a gold logical program"
-                    )
                 from kbqa_r1.hyper_r1 import enforce_commit_reward
 
                 validation_mask = compute_response_mask(test_batch)
                 reward_tensor = enforce_commit_reward(
                     reward_tensor,
                     validation_mask,
-                    test_batch.batch["hyper_r1_commit_valid"],
+                    test_batch.batch["hyper_r1_commit_protocol_valid"],
+                    test_batch.batch["hyper_r1_commit_answer_f1"],
+                    commit_intent_equivalent=test_batch.batch[
+                        "hyper_r1_commit_intent_equivalent"
+                    ],
                     abstained=test_batch.batch["hyper_r1_abstained"],
                     invalid_penalty=float(
                         self.config.algorithm.get(
                             "hyper_r1_invalid_commit_penalty", 0.25
                         )
+                    ),
+                    semantic_bonus=float(
+                        self.config.algorithm.get("hyper_r1_semantic_bonus", 0.1)
                     ),
                 )
                 reward_extra_infos_dict["hyper_r1_commit_valid"].extend(
@@ -1010,6 +1074,20 @@ class RayPPOTrainer:
                     for value in test_batch.batch[
                         "hyper_r1_commit_protocol_valid"
                     ]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_commit_answer_exact"].extend(
+                    float(value)
+                    for value in test_batch.batch["hyper_r1_commit_answer_exact"]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                reward_extra_infos_dict["hyper_r1_commit_answer_f1"].extend(
+                    float(value)
+                    for value in test_batch.batch["hyper_r1_commit_answer_f1"]
                     .detach()
                     .cpu()
                     .tolist()
@@ -1052,6 +1130,25 @@ class RayPPOTrainer:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+            if incremental_dump and val_data_dir:
+                batch_dump_end = len(sample_scores)
+                batch_extra_infos = {
+                    key: values[batch_dump_start:batch_dump_end]
+                    for key, values in reward_extra_infos_dict.items()
+                    if len(values) >= batch_dump_end
+                }
+                self._dump_generations(
+                    inputs=sample_inputs[batch_dump_start:batch_dump_end],
+                    outputs=sample_outputs[batch_dump_start:batch_dump_end],
+                    gts=sample_gts[batch_dump_start:batch_dump_end],
+                    scores=sample_scores[batch_dump_start:batch_dump_end],
+                    reward_extra_infos_dict=batch_extra_infos,
+                    dump_path=val_data_dir,
+                    metadata=sample_metadata[batch_dump_start:batch_dump_end],
+                    filename="progress.jsonl",
+                    append=True,
+                )
 
             # Increment processed samples by the true number of samples in this batch (before repeat)
             processed_samples += int(original_batch_size)
@@ -1096,7 +1193,6 @@ class RayPPOTrainer:
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             self._dump_generations(
                 inputs=sample_inputs,
@@ -1153,10 +1249,16 @@ class RayPPOTrainer:
         # create actor and rollout
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            validation_only = self.config.trainer.get("val_only", False)
+            worker_role = "rollout" if validation_only else "actor_rollout"
+            worker_config = self.config.actor_rollout_ref
+            if validation_only:
+                with open_dict(worker_config):
+                    worker_config.validation_only = True
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                config=worker_config,
+                role=worker_role,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -1571,6 +1673,7 @@ class RayPPOTrainer:
                                 hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
                                 hyper_r1_frontier_width=self.config.get('hyper_r1', {}).get('frontier_width', 6),
                                 hyper_r1_relation_model=self.config.get('hyper_r1', {}).get('relation_model'),
+                                hyper_r1_relation_device=self.config.get('hyper_r1', {}).get('relation_device'),
                                 sparql_url=self.config.get('sparql', {}).get('url', 'http://localhost:8000/execute'),
                                 use_odbc=self.config.get('use_odbc', False),
                                 use_aioodbc=self.config.get('use_aioodbc', True),
@@ -1829,8 +1932,8 @@ class RayPPOTrainer:
                                 "hyper_r1_commit_valid",
                                 "hyper_r1_commit_protocol_valid",
                                 "hyper_r1_commit_answer_exact",
+                                "hyper_r1_commit_answer_f1",
                                 "hyper_r1_commit_intent_equivalent",
-                                "hyper_r1_gold_contract_available",
                                 "hyper_r1_abstained",
                                 "hyper_r1_premature_answer",
                                 "response_mask",
@@ -1841,15 +1944,6 @@ class RayPPOTrainer:
                                     "HyPER-R1 rollout fields are missing: "
                                     + ", ".join(sorted(missing))
                                 )
-                            if not bool(
-                                batch.batch[
-                                    "hyper_r1_gold_contract_available"
-                                ].all()
-                            ):
-                                raise RuntimeError(
-                                    "HyPER-R1 training cannot use answer-only Commit "
-                                    "reward; every rollout needs a gold logical program"
-                                )
                             from kbqa_r1.hyper_r1 import (
                                 charge_execution_budget,
                                 enforce_commit_reward,
@@ -1858,11 +1952,20 @@ class RayPPOTrainer:
                             hyper_task_rewards = enforce_commit_reward(
                                 batch.batch["token_level_scores"],
                                 batch.batch["response_mask"],
-                                batch.batch["hyper_r1_commit_valid"],
+                                batch.batch["hyper_r1_commit_protocol_valid"],
+                                batch.batch["hyper_r1_commit_answer_f1"],
+                                commit_intent_equivalent=batch.batch[
+                                    "hyper_r1_commit_intent_equivalent"
+                                ],
                                 abstained=batch.batch["hyper_r1_abstained"],
                                 invalid_penalty=float(
                                     self.config.algorithm.get(
                                         "hyper_r1_invalid_commit_penalty", 0.25
+                                    )
+                                ),
+                                semantic_bonus=float(
+                                    self.config.algorithm.get(
+                                        "hyper_r1_semantic_bonus", 0.1
                                     )
                                 ),
                             )
@@ -1925,6 +2028,12 @@ class RayPPOTrainer:
                             )
                             metrics["hyper_r1/commit_answer_exact_rate"] = float(
                                 batch.batch["hyper_r1_commit_answer_exact"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/commit_answer_f1"] = float(
+                                batch.batch["hyper_r1_commit_answer_f1"]
                                 .float()
                                 .mean()
                                 .item()

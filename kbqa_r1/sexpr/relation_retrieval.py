@@ -39,11 +39,12 @@ class RelationRetrieval:
     
     def __init__(self, similarity_model=None, relation_config: dict = None,
                  sparql_config: SPARQLConfig = None, dataset: str = "WebQSP",
-                 similarity_model_path: str = None):
+                 similarity_model_path: str = None,
+                 similarity_model_device: str = None):
         """Initialize relation retrieval and all SimCSE backends.
 
-        We intentionally allocate **separate** SimCSE instances for each index to
-        avoid index pollution on a shared model instance (SimCSE.index is mutable).
+        Each search space owns a separate mutable index while all four share the
+        same immutable encoder weights.
 
         Instances:
         - simcse_rel:        global relation_list index
@@ -60,17 +61,18 @@ class RelationRetrieval:
 
         if SIMCSE_AVAILABLE:
             if similarity_model is None:
-                # Keep independent instances because every SimCSE object owns one
-                # mutable index. An explicit path bypasses the legacy fallback.
+                # An explicit path bypasses the legacy fallback. Forked index
+                # holders preserve independent mutable indexes without loading
+                # four copies of the same RoBERTa encoder.
                 loader = (
-                    (lambda: SimCSE(similarity_model_path))
+                    (lambda: SimCSE(similarity_model_path, device=similarity_model_device))
                     if similarity_model_path
                     else get_default_simcse_model
                 )
                 self.simcse_rel = loader()
-                self.simcse_lit = loader()
-                self.simcse_name = loader()
-                self.simcse_literal_plain = loader()
+                self.simcse_lit = self.simcse_rel.fork_index()
+                self.simcse_name = self.simcse_rel.fork_index()
+                self.simcse_literal_plain = self.simcse_rel.fork_index()
                 logger.info("Successfully loaded default SimCSE models for relations, literals, name and literal_plain")
 
         #     else:

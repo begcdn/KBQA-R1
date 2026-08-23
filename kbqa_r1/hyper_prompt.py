@@ -21,12 +21,13 @@ HyPER-R1 executable hypothesis graph:
 - Use `Combine [ Hn | Hm ]` to intersect two active hypotheses.
 - Use `Merge [ expression | ontology_type ]` after Select when the question restricts a retained hypothesis to a Freebase type, such as `religion.religious_leader`. Infer the type from the question; it need not appear among Candidate Entities.
 - The existing executable logical actions remain available: `Order [ mode | expression_or_type | relation ]`, `Compare [ mode | relation | value ]`, `Time_constraint [ relation | time ]`, and `Count [ expression ]`. Select an existing hypothesis before applying a continuation operator; Compare and ontology-rooted Order may open an independent branch that can later be combined.
-- Use `Commit [ Hn ]` when one hypothesis expresses the complete question. After the environment confirms it, return its values inside <answer>.
+- Use `Commit [ Hn ]` when one hypothesis expresses the complete question. Commit is terminal; the environment returns that hypothesis's values.
 - If the execution or turn budget is exhausted and no complete hypothesis is justified, use `Abstain`; resource exhaustion never justifies Prune or Commit.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
+- Every observation lists current action targets. Never reuse a hypothesis or proposal ID that is absent from the corresponding target list, even if it appeared earlier in the conversation.
 - Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
 - Proposal browsing, visible workspace, stored hypotheses, execution attempts, and policy turns have separate budgets. Never manufacture room by Pruning a still-plausible branch.
-Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. After Commit, perform no more graph actions and copy the committed values exactly into <answer>.
+Preserve plausible alternatives until later execution distinguishes them. Select is not Commit: selecting one hypothesis for expansion does not reject the others. Commit ends the search.
 """.rstrip()
 
 
@@ -115,36 +116,19 @@ def build_hyper_prompt(
 
 
 def dataset_candidate_entities(row: Dict[str, Any]) -> Sequence[Sequence[str]]:
-    """Return oracle-linked topic entities for the shared SFT/RL protocol.
+    """Return the explicit topic-entity field shared by SFT and RL.
 
-    Processed GrailQA rows may cache ontology roots, literals, or additional
-    linker candidates beside the true topic entities.  When the annotated
-    function list is present, its MID-valued START nodes define the oracle
-    entity link.  Cached entities contribute display names only.
+    Oracle entity linking is a declared benchmark setting, but the runtime
+    prompt builder must not recover those entities from private gold programs.
+    Corpus construction stores the oracle roots in these public candidate
+    fields before training or evaluation begins.
     """
     extra = row.get("extra_info") if isinstance(row.get("extra_info"), dict) else {}
-    reward = row.get("reward_model")
-    ground_truth = reward.get("ground_truth", {}) if isinstance(reward, dict) else {}
     entities = (
         extra.get("extracted_entities")
         or extra.get("candidate_entities")
-        or ground_truth.get("candidate_entities")
         or ()
     )
-    names = {
-        str(entity[-1]): str(entity[0])
-        for entity in entities
-        if entity and str(entity[-1]).startswith(("m.", "g."))
-    }
-    functions = extra.get("function_list") or ground_truth.get("function_list") or ()
-    if functions:
-        roots = []
-        for function in functions:
-            roots.extend(
-                re.findall(r"START\('((?:m|g)\.[A-Za-z0-9_]+)'\)", str(function))
-            )
-        unique_roots = list(dict.fromkeys(roots))
-        return [[names.get(identity, identity), identity] for identity in unique_roots]
     return [
         [str(entity[0]), str(entity[-1])]
         for entity in entities

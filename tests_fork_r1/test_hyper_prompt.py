@@ -49,36 +49,28 @@ def test_augment_rl_prompt_uses_available_entity_names():
     assert "['m.apple' (m.apple)]" not in content
 
 
-def test_candidate_entities_fall_back_to_reward_metadata():
+def test_candidate_entities_do_not_read_private_reward_metadata():
     entities = [["Apple Inc.", "m.apple"]]
     row = {
         "reward_model": {"ground_truth": {"candidate_entities": entities}},
     }
 
-    assert dataset_candidate_entities(row) == entities
+    assert dataset_candidate_entities(row) == []
 
 
-def test_candidate_entities_follow_gold_roots_and_drop_other_cached_values():
+def test_candidate_entities_ignore_private_gold_program_roots():
     row = {
         "extra_info": {
             "function_list": [
-                "expression0 = START('m.topic')",
-                "expression1 = START('m.second')",
-                "expression2 = START('people.person')",
+                "expression0 = START('m.private')",
             ],
             "extracted_entities": [
-                ["Distractor", "m.other"],
-                ["Second Topic", "m.second"],
-                ["Person type", "people.person"],
                 ["Topic", "m.topic"],
             ],
         }
     }
 
-    assert dataset_candidate_entities(row) == [
-        ["Topic", "m.topic"],
-        ["Second Topic", "m.second"],
-    ]
+    assert dataset_candidate_entities(row) == [["Topic", "m.topic"]]
 
 
 def test_augmented_prompt_exposes_only_oracle_linked_topic_entities():
@@ -86,12 +78,11 @@ def test_augmented_prompt_exposes_only_oracle_linked_topic_entities():
         "prompt": [{"role": "user", "content": "Question: Who founded Topic?"}],
         "extra_info": {
             "function_list": [
-                "expression0 = START('m.topic')",
+                "expression0 = START('m.private')",
                 "expression1 = START('organization.organization')",
             ],
             "extracted_entities": [
                 ["Topic", "m.topic"],
-                ["Unrelated candidate", "m.distractor"],
             ],
         },
     }
@@ -99,7 +90,7 @@ def test_augmented_prompt_exposes_only_oracle_linked_topic_entities():
     content = augment_dataset_row(row)["prompt"][0]["content"]
 
     assert "Candidate Entities: ['Topic' (m.topic)]" in content
-    assert "m.distractor" not in content
+    assert "m.private" not in content
     assert "organization.organization" not in content
     assert "START(" not in content
 
