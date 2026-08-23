@@ -74,6 +74,36 @@ def test_contrast_siblings_remain_active():
     assert any(edge.kind == HypothesisEdgeKind.CONTRAST for edge in graph.state(0).edges)
 
 
+def test_frontier_does_not_expose_teacher_only_provenance_labels():
+    graph = HypothesisGraph(max_active=4)
+    policy = add(graph, "r.policy", ["m.policy"])
+    alternative = add(graph, "r.alternative", ["m.alternative"])
+    policy.provenance.append("policy_choice")
+    alternative.provenance.append("ranked_alternative")
+
+    rendered = graph.serialize(0)
+
+    assert "source=policy" not in rendered
+    assert "source=alternative" not in rendered
+    assert "source=derived" not in rendered
+
+
+def test_recall_restores_runtime_creation_order_in_every_affordance():
+    graph = HypothesisGraph(max_active=4)
+    first = add(graph, "r.first", ["m.first"])
+    second = add(graph, "r.second", ["m.second"])
+    third = add(graph, "r.third", ["m.third"])
+    graph.park(0, first.node_id)
+    graph.recall(0, first.node_id)
+
+    rendered = graph.serialize(0)
+
+    assert "Select=[H0,H1,H2]" in rendered
+    assert "Park=[H0,H1,H2]" in rendered
+    assert "Commit(nonempty active)=[H0,H1,H2]" in rendered
+    assert "Combine=[H0|H1,H0|H2,H1|H2]" in rendered
+
+
 def test_same_denotation_with_different_meaning_stays_distinct():
     graph = HypothesisGraph(max_active=4)
     canonical = add(graph, "r.alias_a", ["m.answer"], group="choice")

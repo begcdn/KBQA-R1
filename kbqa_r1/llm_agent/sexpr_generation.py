@@ -20,6 +20,7 @@ from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
                               proposal_action_targets,
                               public_frontier_signature,
+                              render_hyper_information,
                               result_denotation_values,
                               result_display_labels,
                               required_hyper_relation_model)
@@ -445,20 +446,17 @@ class SExprLLMGenerationManager:
 
     def _hyper_info(self, sample_id: int, message: str, is_final_turn: bool) -> str:
         page_state = self._open_relation_page_state(sample_id)
-        content = (
-            "<information>\n"
-            + message
-            + "\n"
-            + self.hyper_graph.serialize(
+        content = render_hyper_information(
+            message,
+            self.hyper_graph.serialize(
                 sample_id,
                 candidate_sources=[
                     str(entity[-1])
                     for entity in self.state_manager.get_sample_entities(sample_id)
                     if entity
                 ],
-            )
-            + ("\n" + page_state if page_state else "")
-            + "\n</information>"
+            ),
+            page_state,
         )
         # Reproduce the exact chat-template boundary used by trajectory SFT:
         # close the generated assistant turn, add a user observation, and open

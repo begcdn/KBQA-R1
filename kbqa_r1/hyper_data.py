@@ -22,6 +22,7 @@ from .hyper_r1 import (
     public_question_contract,
     proposal_action_targets,
     relation_path,
+    render_hyper_information,
     serialize_frontier,
     validate_public_prune_certificate,
 )
@@ -5204,6 +5205,9 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
     selected: Optional[str] = None
     committed_id: Optional[str] = None
     known = set(active)
+    node_order = {
+        node_id: index for index, node_id in enumerate(demo.hypotheses)
+    }
     executions = 0
     open_frontiers: List[Dict[str, Any]] = []
     lazy_protocol = (
@@ -5350,6 +5354,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             node_id = step.arguments[0]
             parked.remove(node_id)
             active.append(node_id)
+            active.sort(key=node_order.__getitem__)
             event = f"Recalled {node_id} to the visible workspace."
         elif step.action == "Select":
             selected = step.arguments[0]
@@ -5394,9 +5399,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             known.update(step.created)
             executions += 1
             selected = None
-            event = (
-                f"Applied ontology type {step.arguments[1]} into {step.created[0]}."
-            )
+            event = "Executed the selected hypothesis operation."
         elif step.action in {"Order", "Compare", "Time_constraint", "Count"}:
             if len(step.created) != 1:
                 raise ValueError(f"{step.action} must create one executable hypothesis")
@@ -5408,7 +5411,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             known.update(step.created)
             executions += 1
             selected = None
-            event = f"Executed {step.action} into {step.created[0]}."
+            event = "Executed the selected hypothesis operation."
         elif step.action == "Commit":
             node = demo.hypotheses[step.arguments[0]]
             if not _has_valid_commit_certificate(demo, step, node):
@@ -5430,12 +5433,36 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
             event = "Closed the search without a certified complete answer."
         else:
             raise ValueError(f"unsupported action {step.action}")
+        page_state = ""
+        if committed_id is None and lazy_protocol and lazy_frontiers:
+            page_state = _public_proposal_catalogs(
+                demo,
+                lazy_frontiers,
+                proposal_status,
+                active_count=len(active),
+                selected=selected,
+                known_count=len(known),
+                executions=executions,
+            )
+        elif committed_id is None:
+            page_state = "\n".join(
+                serialize_relation_page_state(
+                    str(frontier["source"]),
+                    exposed=int(frontier["exposed"]),
+                    total=int(frontier["total"]),
+                    page_size=int(
+                        demo.private_metadata.get("relation_page_size", 6)
+                    ),
+                )
+                for frontier in open_frontiers
+                if set(frontier["node_ids"]).intersection(active)
+            )
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    f"<information>\n{event}\n"
-                    + _public_graph(
+                "content": render_hyper_information(
+                    event,
+                    _public_graph(
                         demo,
                         active,
                         selected=selected,
@@ -5443,47 +5470,8 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         executions=executions,
                         known_ids=known,
                         parked_ids=parked,
-                    )
-                    + (
-                        "\n"
-                        + (
-                            _public_proposal_catalogs(
-                                demo,
-                                lazy_frontiers,
-                                proposal_status,
-                                active_count=len(active),
-                                selected=selected,
-                                known_count=len(known),
-                                executions=executions,
-                            )
-                            if lazy_protocol
-                            else "\n".join(
-                                serialize_relation_page_state(
-                                    str(frontier["source"]),
-                                    exposed=int(frontier["exposed"]),
-                                    total=int(frontier["total"]),
-                                    page_size=int(
-                                        demo.private_metadata.get(
-                                            "relation_page_size", 6
-                                        )
-                                    ),
-                                )
-                                for frontier in open_frontiers
-                                if committed_id is None
-                                and set(frontier["node_ids"]).intersection(active)
-                            )
-                        )
-                        if committed_id is None
-                        and (
-                            (lazy_protocol and lazy_frontiers)
-                            or any(
-                                set(frontier["node_ids"]).intersection(active)
-                                for frontier in open_frontiers
-                            )
-                        )
-                        else ""
-                    )
-                    + "\n</information>"
+                    ),
+                    page_state,
                 ),
             }
         )

@@ -222,6 +222,15 @@ def test_operator_program_teaches_count_after_retained_relation_frontier():
         if message["role"] == "assistant"
     ]
     assert any("Count [ expression1 ]" in message for message in assistant)
+    count_index = next(
+        index
+        for index, message in enumerate(rendered["messages"])
+        if message["role"] == "assistant" and "Count [ expression1 ]" in message["content"]
+    )
+    assert "Executed the selected hypothesis operation." in (
+        rendered["messages"][count_index + 1]["content"]
+    )
+    assert "Executed Count into" not in rendered["messages"][count_index + 1]["content"]
 
 
 def test_operator_recovery_uses_relation_siblings_below_type_constraint():

@@ -28,6 +28,7 @@ from kbqa_r1.hyper_data import (  # noqa: E402
     HyperDemonstration,
     decision_sft_records,
 )
+from kbqa_r1.hyper_r1 import render_hyper_information  # noqa: E402
 from scripts.data_process.build_hyper_demonstrations import _question_split  # noqa: E402
 from scripts.data_process.repair_hyper_curriculum import _load_demo  # noqa: E402
 
@@ -169,6 +170,7 @@ def _budget_abstain_demo(
 ) -> HyperDemonstration | None:
     """Create a terminal state where the next required Inspect is unaffordable."""
     executions = 0
+    eligible: list[tuple[int, int]] = []
     for index, step in enumerate(demo.steps):
         if step.action == "Inspect" and executions > 0:
             complete = any(
@@ -177,52 +179,59 @@ def _budget_abstain_demo(
                 if node_id in demo.hypotheses
             )
             if not complete:
-                metadata = dict(demo.private_metadata)
-                metadata.update(
-                    {
-                        "max_execution_attempts": executions,
-                        "max_turns": index + 1,
-                        "execution_attempts": executions,
-                        "verified_abstain_reason": "execution_budget_exhausted",
-                    }
-                )
-                abstain = DemonstrationStep(
-                    "Abstain",
-                    (),
-                    step.visible_before,
-                    (),
-                    ("execution_budget_exhausted_without_complete_hypothesis",),
-                )
-                retained_steps = [*demo.steps[:index], abstain]
-                retained_hypotheses = {
-                    node_id
-                    for retained_step in retained_steps
-                    for node_id in (*retained_step.visible_before, *retained_step.created)
-                    if node_id in demo.hypotheses
-                }
-                retained_proposals = {
-                    proposal_id
-                    for retained_step in retained_steps
-                    for proposal_id in retained_step.exposed
-                    if proposal_id in demo.proposals
-                }
-                return replace(
-                    demo,
-                    demo_id=f"{demo.demo_id}:budget_abstain:{index}",
-                    family="budget_exhausted_abstain",
-                    hypotheses={
-                        node_id: demo.hypotheses[node_id]
-                        for node_id in sorted(retained_hypotheses)
-                    },
-                    steps=retained_steps,
-                    private_metadata=metadata,
-                    proposals={
-                        proposal_id: demo.proposals[proposal_id]
-                        for proposal_id in sorted(retained_proposals)
-                    },
-                )
+                eligible.append((index, executions))
         executions += int(step.action in _EXECUTING_ACTIONS)
-    return None
+    if not eligible:
+        return None
+    digest = hashlib.sha256(demo.demo_id.encode("utf-8")).digest()
+    index, executions = eligible[int.from_bytes(digest[:8], "big") % len(eligible)]
+    step = demo.steps[index]
+    metadata = dict(demo.private_metadata)
+    metadata.update(
+        {
+            "max_execution_attempts": executions,
+            "max_turns": index + 1,
+            "execution_attempts": executions,
+            "verified_abstain_reason": "execution_budget_exhausted",
+        }
+    )
+    abstain = DemonstrationStep(
+        "Abstain",
+        (),
+        step.visible_before,
+        (),
+        ("execution_budget_exhausted_without_complete_hypothesis",),
+    )
+    retained_steps = [*demo.steps[:index], abstain]
+    retained_hypotheses = {
+        node_id
+        for retained_step in retained_steps
+        for node_id in (*retained_step.visible_before, *retained_step.created)
+        if node_id in demo.hypotheses
+    }
+    retained_proposals = {
+        proposal_id
+        for retained_step in retained_steps
+        for proposal_id in retained_step.exposed
+        if proposal_id in demo.proposals
+    }
+    return replace(
+        demo,
+        demo_id=f"{demo.demo_id}:budget_abstain:{index}",
+        family="budget_exhausted_abstain",
+        hypotheses={
+            node_id: node
+            for node_id, node in demo.hypotheses.items()
+            if node_id in retained_hypotheses
+        },
+        steps=retained_steps,
+        private_metadata=metadata,
+        proposals={
+            proposal_id: proposal
+            for proposal_id, proposal in demo.proposals.items()
+            if proposal_id in retained_proposals
+        },
+    )
 
 
 def _target_action(row: dict) -> str:
@@ -233,24 +242,72 @@ def _target_action(row: dict) -> str:
     return match.group(1)
 
 
+def _observation_state(observation: str) -> str:
+    start = observation.find("<hypothesis_graph>")
+    stop = observation.rfind("</information>")
+    if start < 0 or stop < start:
+        raise ValueError("environment observation has no rendered hypothesis state")
+    return observation[start:stop].rstrip()
+
+
+def _stale_expanded_id(messages: list[dict]) -> str | None:
+    if len(messages) < 4:
+        return None
+    previous_action = str(messages[-3].get("content", ""))
+    action = re.search(r"<action>\s*(Merge|Order|Compare|Time_constraint|Count|Combine)\b", previous_action)
+    if action is None:
+        return None
+    if action.group(1) == "Combine":
+        ids = re.findall(r"\bH\d+\b", previous_action)
+        return ids[0] if ids else None
+    previous_observation = str(messages[-4].get("content", ""))
+    selected = re.search(r"\bselected=(H\d+)\b", previous_observation)
+    return selected.group(1) if selected else None
+
+
+def _invalid_recovery_spec(row: dict) -> tuple[str, str, str] | None:
+    messages = row.get("messages", ())
+    if len(messages) < 2 or messages[-2].get("role") != "user":
+        return None
+    observation = str(messages[-2].get("content", ""))
+    if "<hypothesis_graph>" not in observation:
+        return None
+    if _target_action(row) == "Commit":
+        stale = _stale_expanded_id(list(messages))
+        if stale is None:
+            return None
+        return (
+            f"Commit [ {stale} ]",
+            f"hypothesis {stale} is expanded, not active",
+            "stale_commit",
+        )
+    if "<proposal_catalog>" in observation:
+        return (
+            "Inspect [ P999999 ]",
+            str(KeyError("unknown or unexposed proposal: P999999")),
+            "unknown_proposal",
+        )
+    return (
+        "Select [ H999999 ]",
+        str(KeyError("unknown hypothesis: H999999")),
+        "unknown_hypothesis",
+    )
+
+
 def _invalid_recovery_record(row: dict, ordinal: int) -> dict:
     """Insert a rejected action with zero loss, then retain the valid target."""
     messages = [dict(message) for message in row["messages"]]
-    if len(messages) < 2 or messages[-2].get("role") != "user":
-        raise ValueError("decision record lacks a current user observation")
+    spec = _invalid_recovery_spec(row)
+    if spec is None:
+        raise ValueError("decision record has no runtime-valid recovery intervention")
+    invalid_action, failure, recovery_kind = spec
     observation = str(messages[-2]["content"])
-    if "<information>" not in observation:
-        raise ValueError("invalid recovery requires an environment observation")
-    if "<proposal_catalog>" in observation:
-        invalid_action = "Inspect [ P999999 ]"
-        failure = "unknown or unexposed proposal: P999999"
-    else:
-        invalid_action = "Select [ H999999 ]"
-        failure = "unknown hypothesis: H999999"
-    failed_observation = observation.replace(
-        "<information>",
-        f"<information>\nGraph action failed: {failure}",
-        1,
+    state = _observation_state(observation)
+    graph, separator, page_state = state.partition("\n<proposal_catalog>")
+    if separator:
+        page_state = "<proposal_catalog>" + page_state
+    failed_observation = render_hyper_information(
+        f"Graph action failed: {failure}", graph, page_state
     )
     messages[-1:-1] = [
         {
@@ -265,18 +322,14 @@ def _invalid_recovery_record(row: dict, ordinal: int) -> dict:
         {
             "invalid_recovery": True,
             "invalid_recovery_ordinal": ordinal,
+            "invalid_recovery_kind": recovery_kind,
         }
     )
     return {**row, "messages": messages, "extra_info": extra}
 
 
 def _supports_invalid_recovery(row: dict) -> bool:
-    messages = row.get("messages", ())
-    return bool(
-        len(messages) >= 2
-        and messages[-2].get("role") == "user"
-        and "<information>" in str(messages[-2].get("content", ""))
-    )
+    return _invalid_recovery_spec(row) is not None
 
 
 def _balanced_invalid_recoveries(rows: list[dict], limit: int) -> list[dict]:
@@ -320,6 +373,7 @@ def _normalized_decision_row(row: dict) -> dict:
     extra.setdefault("recovery_stratum", None)
     extra.setdefault("invalid_recovery", False)
     extra.setdefault("invalid_recovery_ordinal", -1)
+    extra.setdefault("invalid_recovery_kind", None)
     return {**row, "extra_info": extra}
 
 
@@ -357,6 +411,7 @@ def _decision_schema():
                         pa.field("target_is_graph_action", pa.bool_()),
                         pa.field("invalid_recovery", pa.bool_()),
                         pa.field("invalid_recovery_ordinal", pa.int64()),
+                        pa.field("invalid_recovery_kind", pa.string()),
                     ]
                 ),
             ),
@@ -470,14 +525,17 @@ def _valid_budget_abstain(demo: HyperDemonstration) -> bool:
 
 def _valid_invalid_recovery(row: dict) -> bool:
     messages = row["messages"]
+    failed = str(messages[-2].get("content", "")) if len(messages) >= 2 else ""
+    kind = row.get("extra_info", {}).get("invalid_recovery_kind")
     return (
         len(messages) >= 3
         and messages[-3].get("role") == "assistant"
         and messages[-3].get("loss_mask") == 0
-        and "999999" in str(messages[-3].get("content", ""))
+        and kind in {"unknown_proposal", "unknown_hypothesis", "stale_commit"}
         and messages[-2].get("role") == "user"
         and messages[-2].get("loss_mask") == 0
-        and "Graph action failed:" in str(messages[-2].get("content", ""))
+        and failed.startswith("<information>\nGraph action failed:")
+        and "\n<hypothesis_graph>" in failed
         and messages[-1].get("role") == "assistant"
         and messages[-1].get("loss_mask") == 1
     )
@@ -499,7 +557,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     validation_sink = _ParquetSink(output / "validation_decision.parquet")
     consistency = _DecisionConsistency()
     eligible_recovery_actions = sorted(
-        (set(action_counts) | {"Recall"}) - {"Commit", "Abstain"}
+        (set(action_counts) | {"Recall"}) - {"Abstain"}
     )
     per_action_limit = (
         rare_action_target + len(eligible_recovery_actions) - 1
@@ -515,6 +573,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     counters: Counter = Counter()
     recall_valid = True
     abstain_valid = True
+    abstain_execution_budgets: Counter = Counter()
 
     def write_decision(row: dict, *, collect_recovery: bool) -> None:
         split = _question_split(row["extra_info"]["question_id"])
@@ -546,6 +605,9 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                         variants.append(candidate)
                         seen_abstain_questions.add(updated.question_id)
                         counters["abstain"] += 1
+                        abstain_execution_budgets[
+                            int(candidate.private_metadata["max_execution_attempts"])
+                        ] += 1
                         abstain_valid = abstain_valid and _valid_budget_abstain(candidate)
 
                 for demo in variants:
@@ -576,6 +638,9 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         invalid_masks_valid = all(
             _valid_invalid_recovery(row) for row in invalid_rows
         )
+        invalid_recovery_kinds = Counter(
+            row["extra_info"]["invalid_recovery_kind"] for row in invalid_rows
+        )
         for row in invalid_rows:
             write_decision(row, collect_recovery=False)
 
@@ -586,6 +651,13 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
             "invalid_actions_have_zero_loss": invalid_masks_valid,
             "recall_restores_a_parked_executable_hypothesis": recall_valid,
             "abstain_requires_exhausted_execution_budget": abstain_valid,
+            "abstain_prefixes_span_multiple_execution_budgets": (
+                len(abstain_execution_budgets) > 1
+            ),
+            "runtime_aligned_invalid_recovery_observations": invalid_masks_valid,
+            "stale_commit_recovery_is_supervised": (
+                invalid_recovery_kinds["stale_commit"] > 0
+            ),
             "question_disjoint_split": not train_questions.intersection(
                 validation_questions
             ),
@@ -606,7 +678,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
-        "quality_schema": "hyper_r1_v17_truthful_control",
+        "quality_schema": "hyper_r1_v18_runtime_aligned_control",
         "source": str(input_path),
         "source_contract": source_contract,
         "output": str(output),
@@ -615,6 +687,10 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         "recall_augmented_demonstrations": counters["recall"],
         "budget_exhausted_abstain_demonstrations": counters["abstain"],
         "masked_invalid_recovery_decisions": len(invalid_rows),
+        "invalid_recovery_kinds": dict(sorted(invalid_recovery_kinds.items())),
+        "abstain_execution_budgets": {
+            str(key): value for key, value in sorted(abstain_execution_budgets.items())
+        },
         "rare_action_reference_count": rare_action_target,
         "action_counts": dict(sorted(final_actions.items())),
         "train_demonstrations": counters["train_demonstrations"],

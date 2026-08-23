@@ -318,14 +318,6 @@ def relation_path(function_state: Sequence[str]) -> Tuple[str, ...]:
     return tuple(relations)
 
 
-def _node_source(provenance: Sequence[str]) -> str:
-    if "policy_choice" in provenance:
-        return "policy"
-    if "ranked_alternative" in provenance or "hard_sibling" in provenance:
-        return "alternative"
-    return "derived"
-
-
 def proposal_action_targets(
     visible_ids: Sequence[str],
     source: str,
@@ -392,14 +384,13 @@ def serialize_frontier(
             answers += f", ... (+{len(denotation) - max_answers})"
         status = "committed" if node_id == committed_id else "active"
         path = " -> ".join(relation_path(node.get("function_state", ()))) or "root"
-        provenance = tuple(node.get("provenance", ()))
         parents = tuple(node.get("parent_ids", ()))
         parent_text = "+".join(parents) if parents else node.get("parent_id") or "ROOT"
         operation = str(node.get("operation") or "expand")
         lines.append(
             f"{node_id} [{status}] parents={parent_text} operation={operation} "
             f"via={node.get('relation_id') or node.get('operation') or 'derived'} "
-            f"source={_node_source(provenance)} depth={int(node.get('depth', 0))} "
+            f"depth={int(node.get('depth', 0))} "
             f"path={path} answers={len(denotation)}: {answers}"
         )
     ordered_active = [str(node_id) for node_id in active_ids]
@@ -470,6 +461,15 @@ def serialize_frontier(
             )
         lines.append("</parked_hypotheses>")
     return "\n".join(lines)
+
+
+def render_hyper_information(message: str, graph: str, page_state: str = "") -> str:
+    """Render the environment observation shared by SFT and live rollouts."""
+    sections = ["<information>", str(message), str(graph)]
+    if page_state:
+        sections.append(str(page_state))
+    sections.append("</information>")
+    return "\n".join(sections)
 
 
 _EXPRESSION_RE = re.compile(r"\bexpression\d*\b")
