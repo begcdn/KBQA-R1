@@ -16,10 +16,42 @@ from kbqa_r1.hyper_r1 import (
     proposal_action_targets,
     public_frontier_signature,
     public_question_contract,
+    render_hyper_observation_suffix,
     result_display_labels,
     result_denotation_values,
     required_hyper_relation_model,
 )
+
+
+class _TinyChatTokenizer:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        rendered = "".join(
+            f"<{message['role']}>{message['content']}</{message['role']}>"
+            for message in messages
+        )
+        return rendered + ("<assistant>" if add_generation_prompt else "")
+
+
+def test_runtime_observation_suffix_matches_decision_sft_context():
+    tokenizer = _TinyChatTokenizer()
+    initial = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "question"}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    runtime = initial + render_hyper_observation_suffix(tokenizer, "state")
+    sft = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "state"},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    assert runtime == sft
 
 
 def test_execution_results_keep_identity_separate_from_display_label():

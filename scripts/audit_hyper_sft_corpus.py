@@ -6,9 +6,16 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from kbqa_r1.hyper_r1 import render_hyper_observation_suffix
 
 
 def main() -> None:
@@ -47,6 +54,38 @@ def main() -> None:
                 ):
                     raise RuntimeError(
                         f"row {rows + offset} does not end in exactly one supervised action"
+                    )
+                context = [
+                    {"role": message["role"], "content": message["content"]}
+                    for message in messages[:-1]
+                ]
+                sft_context = tokenizer.apply_chat_template(
+                    context,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                initial = tokenizer.apply_chat_template(
+                    context[:1],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                if len(context) == 1:
+                    runtime_context = initial
+                elif (
+                    len(context) == 3
+                    and context[1] == {"role": "assistant", "content": ""}
+                    and context[2]["role"] == "user"
+                ):
+                    runtime_context = initial + render_hyper_observation_suffix(
+                        tokenizer, context[2]["content"]
+                    )
+                else:
+                    raise RuntimeError(
+                        f"row {rows + offset} has a non-Markov prompt shape"
+                    )
+                if runtime_context != sft_context:
+                    raise RuntimeError(
+                        f"row {rows + offset} differs from the live HyPER prompt"
                     )
                 conversations.append(messages)
             encoded = tokenizer.apply_chat_template(

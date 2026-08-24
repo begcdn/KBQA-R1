@@ -21,6 +21,7 @@ from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               proposal_action_targets,
                               public_frontier_signature,
                               render_hyper_information,
+                              render_hyper_observation_suffix,
                               result_denotation_values,
                               result_display_labels,
                               required_hyper_relation_model)
@@ -485,22 +486,8 @@ class SExprLLMGenerationManager:
         # Reproduce the exact chat-template boundary used by trajectory SFT:
         # close the generated assistant turn, add a user observation, and open
         # the next assistant turn. This avoids a raw-text SFT/RL format split.
-        sentinel = "HYPER_R1_ASSISTANT_SENTINEL"
-        messages = [
-            {"role": "user", "content": ""},
-            {"role": "assistant", "content": sentinel},
-            {"role": "user", "content": content},
-        ]
         try:
-            rendered = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            marker = rendered.find(sentinel)
-            if marker < 0:
-                raise ValueError("chat template removed the observation sentinel")
-            return rendered[marker + len(sentinel) :]
+            return render_hyper_observation_suffix(self.tokenizer, content)
         except (AttributeError, TypeError, ValueError):
             # Older tokenizers without a chat template retain the released
             # raw-observation behavior, but supported model runs use the exact

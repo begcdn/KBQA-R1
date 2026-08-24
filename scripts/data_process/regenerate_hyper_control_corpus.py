@@ -217,6 +217,9 @@ def _runtime_replay_errors(demo: HyperDemonstration) -> list[str]:
     )
     graph.register_public_question(0, demo.question)
     max_turns = int(demo.private_metadata.get("max_turns", 32))
+    turn_offset = int(demo.private_metadata.get("turn_offset", 0))
+    if turn_offset < 0 or turn_offset + len(demo.steps) > max_turns:
+        return ["invalid time-shifted turn clock"]
     frontiers: dict[str, str | None] = {}
     errors: list[str] = []
     candidate_sources = [
@@ -227,7 +230,11 @@ def _runtime_replay_errors(demo: HyperDemonstration) -> list[str]:
     ]
 
     for step_index, step in enumerate(demo.steps):
-        graph.set_clock(0, turns_used=step_index, max_turns=max_turns)
+        graph.set_clock(
+            0,
+            turns_used=turn_offset + step_index,
+            max_turns=max_turns,
+        )
         active = tuple(node.node_id for node in graph.active_nodes(0))
         if active != tuple(step.visible_before):
             errors.append(
@@ -244,7 +251,7 @@ def _runtime_replay_errors(demo: HyperDemonstration) -> list[str]:
             executions=graph.state(0).execution_attempts,
             known_ids=known,
             parked_ids=parked,
-            turns_used=step_index,
+            turns_used=turn_offset + step_index,
         )
         actual_graph = graph.serialize(0, candidate_sources=candidate_sources)
         if actual_graph != expected_graph:
@@ -432,8 +439,81 @@ def _augment_recall(demo: HyperDemonstration) -> tuple[HyperDemonstration, bool]
     return demo, False
 
 
+def _delayed_decoy_comparison(demo: HyperDemonstration) -> HyperDemonstration | None:
+    """Move one unused decoy Inspect immediately before the gold Commit.
+
+    The original committed hypothesis retains its answer-and-intent
+    certificate. Delaying an independent active leaf makes that certified
+    hypothesis older than a freshly executed plausible alternative without
+    inventing a denotation or changing any graph operation.
+    """
+    if len(demo.steps) < 3 or demo.steps[-1].action != "Commit":
+        return None
+    commit = demo.steps[-1]
+    target = commit.arguments[0]
+    creators = {
+        node_id: (index, step)
+        for index, step in enumerate(demo.steps[:-1])
+        for node_id in step.created
+    }
+    movable = []
+    for node_id in commit.visible_before:
+        if node_id == target or node_id not in creators:
+            continue
+        creator_index, creator = creators[node_id]
+        if creator.action != "Inspect" or len(creator.created) != 1:
+            continue
+        if any(node_id in step.arguments for step in demo.steps[creator_index + 1 : -1]):
+            continue
+        if any(
+            node_id == node.parent_id or node_id in node.parent_ids
+            for candidate_id, node in demo.hypotheses.items()
+            if candidate_id != node_id
+        ):
+            continue
+        if creator.arguments[0] not in demo.proposals:
+            continue
+        movable.append((creator_index, node_id, creator))
+    if not movable:
+        return None
+
+    digest = int(hashlib.sha256((demo.demo_id + ":comparison").encode()).hexdigest()[:16], 16)
+    creator_index, decoy_id, creator = movable[digest % len(movable)]
+    rewritten = []
+    for index, step in enumerate(demo.steps[:-1]):
+        if index == creator_index:
+            continue
+        visible = (
+            tuple(value for value in step.visible_before if value != decoy_id)
+            if index > creator_index
+            else step.visible_before
+        )
+        rewritten.append(replace(step, visible_before=visible))
+    delayed_visible = tuple(
+        value for value in commit.visible_before if value != decoy_id
+    )
+    rewritten.append(replace(creator, visible_before=delayed_visible))
+    rewritten.append(commit)
+    metadata = dict(demo.private_metadata)
+    metadata.update(
+        {
+            "comparison_variant": True,
+            "comparison_decoy": decoy_id,
+            "terminal_decision_start": len(rewritten) - 1,
+        }
+    )
+    return _runtime_ordered_demo(
+        replace(
+            demo,
+            demo_id=f"{demo.demo_id}:delayed-decoy",
+            steps=rewritten,
+            private_metadata=metadata,
+        )
+    )
+
+
 def _deadline_variant(demo: HyperDemonstration) -> HyperDemonstration | None:
-    """Create one gold-independent deadline state with an offline F1 label."""
+    """Create a time-shifted deadline state with an offline F1 teacher."""
     if len(demo.steps) < 4 or demo.steps[-1].action != "Commit":
         return None
     digest = int(hashlib.sha256(demo.demo_id.encode()).hexdigest()[:16], 16)
@@ -502,14 +582,19 @@ def _deadline_variant(demo: HyperDemonstration) -> HyperDemonstration | None:
     known = set(demo.steps[0].visible_before if demo.steps else ())
     for step in prefix:
         known.update(step.created)
+    max_turns = int(demo.private_metadata.get("max_turns", 32))
+    if len(prefix) > max_turns:
+        return None
     metadata = dict(demo.private_metadata)
     metadata.update(
         {
             "best_attainable_supervision": True,
-            "deadline_sampled_without_gold": True,
+            "deadline_cutoff_sampled_without_gold": True,
             "deadline_recalled_best": deadline_recalled_best,
             "terminal_answer_f1": chosen_f1,
-            "max_turns": len(prefix),
+            "max_turns": max_turns,
+            "turn_offset": max_turns - len(prefix),
+            "terminal_decision_start": len(prefix) - (2 if deadline_recalled_best else 1),
             "execution_attempts": sum(
                 step.action in _EXECUTING_ACTIONS for step in prefix
             ),
@@ -534,6 +619,41 @@ def _target_action(row: dict) -> str:
     if match is None:
         raise ValueError("decision row has no target action")
     return match.group(1)
+
+
+def _rendered_clock(row: dict) -> tuple[int, int, int] | None:
+    """Return the latest public (used, maximum, remaining) clock."""
+    clocks = []
+    for message in row.get("messages", ()):
+        if message.get("role") != "user":
+            continue
+        clocks.extend(
+            tuple(map(int, match))
+            for match in re.findall(
+                r"turns_used=(\d+)/(\d+)\s+turns_remaining=(\d+)",
+                str(message.get("content", "")),
+            )
+        )
+    return clocks[-1] if clocks else None
+
+
+def _commit_recency(row: dict) -> tuple[bool, bool] | None:
+    """Return (eligible, target_is_newest) for a rendered Commit decision."""
+    target = re.search(
+        r"<action>\s*Commit\s*\[\s*(H\d+)\s*\]",
+        str(row["messages"][-1].get("content", "")),
+    )
+    if target is None or len(row.get("messages", ())) < 2:
+        return None
+    observation = str(row["messages"][-2].get("content", ""))
+    active = [
+        int(value)
+        for value in re.findall(r"(?m)^H(\d+) \[active\]", observation)
+    ]
+    if len(active) < 2:
+        return (False, False)
+    target_index = int(target.group(1)[1:])
+    return (True, target_index == max(active))
 
 
 def _observation_state(observation: str) -> str:
@@ -571,50 +691,117 @@ def _rendered_runtime_identity_is_valid(row: dict) -> bool:
     return True
 
 
-def _stale_expanded_id(messages: list[dict]) -> str | None:
-    if len(messages) < 2:
-        return None
-    observation = _observation_state(str(messages[-2].get("content", "")))
-    expanded = re.search(r"(?m)^(H\d+) \[expanded\]", observation)
-    return expanded.group(1) if expanded else None
-
-
-def _invalid_recovery_spec(row: dict) -> tuple[str, str, str] | None:
+def _invalid_recovery_specs(row: dict) -> list[tuple[str, str, str]]:
+    """Return mistakes whose rejection follows from the visible live state."""
     messages = row.get("messages", ())
     if len(messages) < 2 or messages[-2].get("role") != "user":
-        return None
+        return []
     observation = str(messages[-2].get("content", ""))
     if "<hypothesis_graph>" not in observation:
-        return None
-    if _target_action(row) == "Commit":
-        stale = _stale_expanded_id(list(messages))
-        if stale is None:
-            return None
-        return (
-            f"Commit [ {stale} ]",
-            f"hypothesis {stale} is expanded, not active",
-            "stale_commit",
+        return []
+    state = _observation_state(observation)
+    specs: list[tuple[str, str, str]] = []
+    selected = re.search(r"\bselected=(H\d+)\b", state)
+    if selected:
+        node_id = selected.group(1)
+        specs.append(
+            (
+                "repeat_select",
+                f"Select [ {node_id} ]",
+                f"hypothesis {node_id} is already selected; choose a progress action",
+            )
         )
-    if "<proposal_catalog>" in observation:
-        return (
-            "Inspect [ P999999 ]",
-            str(KeyError("unknown or unexposed proposal: P999999")),
-            "unknown_proposal",
-        )
-    return (
-        "Select [ H999999 ]",
-        str(KeyError("unknown hypothesis: H999999")),
-        "unknown_hypothesis",
+    active = re.findall(
+        r"(?m)^(H\d+) \[active\].*? answers=(\d+):", state
     )
+    if active:
+        node_id = active[0][0]
+        specs.append(
+            (
+                "recall_active",
+                f"Recall [ {node_id} ]",
+                f"hypothesis {node_id} is active, not parked",
+            )
+        )
+    empty = next((node_id for node_id, size in active if int(size) == 0), None)
+    if empty:
+        specs.append(
+            (
+                "commit_empty",
+                f"Commit [ {empty} ]",
+                "cannot commit an empty hypothesis",
+            )
+        )
+    parked = re.search(r"(?ms)<parked_hypotheses>.*?^(H\d+) path=", state)
+    if parked:
+        node_id = parked.group(1)
+        specs.append(
+            (
+                "select_parked",
+                f"Select [ {node_id} ]",
+                f"hypothesis {node_id} is parked, not active",
+            )
+        )
+    budget = re.search(
+        r"active=(\d+) capacity=(\d+) stored=(\d+).*?"
+        r"execution_attempts=(\d+)/(\d+)",
+        state,
+    )
+    selected_id = re.search(r"\bselected=(\S+)\b", state)
+    if budget:
+        active_count, capacity, _, used, maximum = map(int, budget.groups())
+        for catalog in re.findall(
+            r"(?s)<proposal_catalog>.*?</proposal_catalog>", state
+        ):
+            header = re.search(r"source=(\S+) exposed=(\d+)/(\d+)", catalog)
+            if (
+                header
+                and int(header.group(2)) >= int(header.group(3))
+                and active_count < capacity
+                and used < maximum
+                and selected_id
+                and selected_id.group(1) == "none"
+            ):
+                source = header.group(1)
+                specs.append(
+                    (
+                        "widen_exhausted",
+                        f"Widen [ {source} ]",
+                        f"no open frontier from {source} has further ranked proposals",
+                    )
+                )
+                break
+    visible_proposal = re.search(r"(?m)^(P\d+) rank=", state)
+    if budget and visible_proposal:
+        active_count, capacity, _, used, maximum = map(int, budget.groups())
+        proposal_id = visible_proposal.group(1)
+        if active_count >= capacity:
+            specs.append(
+                (
+                    "inspect_full_workspace",
+                    f"Inspect [ {proposal_id} ]",
+                    "the visible hypothesis workspace is full; Park an unresolved hypothesis first",
+                )
+            )
+        if used >= maximum:
+            specs.append(
+                (
+                    "inspect_execution_exhausted",
+                    f"Inspect [ {proposal_id} ]",
+                    "the execution budget is exhausted; select or recall the strongest supported nonempty hypothesis and Commit it",
+                )
+            )
+    return specs
 
 
-def _invalid_recovery_record(row: dict, ordinal: int) -> dict:
-    """Insert a rejected action with zero loss, then retain the valid target."""
+def _invalid_recovery_record(
+    row: dict,
+    spec: tuple[str, str, str],
+    ordinal: int,
+) -> dict:
+    """Show the live Markov failure state and supervise one legal recovery."""
     messages = [dict(message) for message in row["messages"]]
-    spec = _invalid_recovery_spec(row)
-    if spec is None:
-        raise ValueError("decision record has no runtime-valid recovery intervention")
-    invalid_action, failure, recovery_kind = spec
+    recovery_kind, invalid_action, failure = spec
     observation = str(messages[-2]["content"])
     state = _observation_state(observation)
     graph, separator, page_state = state.partition("\n<proposal_catalog>")
@@ -623,13 +810,11 @@ def _invalid_recovery_record(row: dict, ordinal: int) -> dict:
     failed_observation = render_hyper_information(
         f"Graph action failed: {failure}", graph, page_state
     )
-    messages[-1:-1] = [
-        {
-            "role": "assistant",
-            "content": f"<think>I must use only currently listed IDs.</think>\n<action>{invalid_action}</action>",
-            "loss_mask": 0,
-        },
+    messages = [
+        dict(messages[0]),
+        {"role": "assistant", "content": "", "loss_mask": 0},
         {"role": "user", "content": failed_observation, "loss_mask": 0},
+        dict(messages[-1]),
     ]
     extra = dict(row.get("extra_info", {}))
     extra.update(
@@ -637,27 +822,15 @@ def _invalid_recovery_record(row: dict, ordinal: int) -> dict:
             "invalid_recovery": True,
             "invalid_recovery_ordinal": ordinal,
             "invalid_recovery_kind": recovery_kind,
+            "invalid_action": invalid_action,
+            "invalid_failure": failure,
         }
     )
     return {**row, "messages": messages, "extra_info": extra}
 
 
 def _supports_invalid_recovery(row: dict) -> bool:
-    return _invalid_recovery_spec(row) is not None
-
-
-def _balanced_invalid_recoveries(rows: list[dict], limit: int) -> list[dict]:
-    by_action: dict[str, list[dict]] = defaultdict(list)
-    for row in rows:
-        action = _target_action(row)
-        if action not in {"Commit", "Abstain"} and _supports_invalid_recovery(row):
-            by_action[action].append(row)
-    selected = []
-    while len(selected) < limit and any(by_action.values()):
-        for action in sorted(by_action):
-            if by_action[action] and len(selected) < limit:
-                selected.append(by_action[action].pop(0))
-    return [_invalid_recovery_record(row, index) for index, row in enumerate(selected)]
+    return bool(_invalid_recovery_specs(row))
 
 
 def _decision_contradictions(rows: list[dict]) -> dict:
@@ -688,6 +861,8 @@ def _normalized_decision_row(row: dict) -> dict:
     extra.setdefault("invalid_recovery", False)
     extra.setdefault("invalid_recovery_ordinal", -1)
     extra.setdefault("invalid_recovery_kind", None)
+    extra.setdefault("invalid_action", None)
+    extra.setdefault("invalid_failure", None)
     return {**row, "extra_info": extra}
 
 
@@ -726,6 +901,8 @@ def _decision_schema():
                         pa.field("invalid_recovery", pa.bool_()),
                         pa.field("invalid_recovery_ordinal", pa.int64()),
                         pa.field("invalid_recovery_kind", pa.string()),
+                        pa.field("invalid_action", pa.string()),
+                        pa.field("invalid_failure", pa.string()),
                     ]
                 ),
             ),
@@ -820,19 +997,33 @@ def _valid_recall_augmentation(demo: HyperDemonstration) -> bool:
 
 def _valid_invalid_recovery(row: dict) -> bool:
     messages = row["messages"]
-    failed = str(messages[-2].get("content", "")) if len(messages) >= 2 else ""
-    kind = row.get("extra_info", {}).get("invalid_recovery_kind")
+    extra = row.get("extra_info", {})
+    failed = str(messages[2].get("content", "")) if len(messages) == 4 else ""
+    kind = extra.get("invalid_recovery_kind")
+    supported = {
+        "repeat_select",
+        "recall_active",
+        "commit_empty",
+        "select_parked",
+        "widen_exhausted",
+        "inspect_full_workspace",
+        "inspect_execution_exhausted",
+    }
     return (
-        len(messages) >= 3
-        and messages[-3].get("role") == "assistant"
-        and messages[-3].get("loss_mask") == 0
-        and kind in {"unknown_proposal", "unknown_hypothesis", "stale_commit"}
-        and messages[-2].get("role") == "user"
-        and messages[-2].get("loss_mask") == 0
+        len(messages) == 4
+        and messages[0].get("role") == "user"
+        and messages[1] == {"role": "assistant", "content": "", "loss_mask": 0}
+        and kind in supported
+        and messages[2].get("role") == "user"
+        and messages[2].get("loss_mask") == 0
         and failed.startswith("<information>\nGraph action failed:")
         and "\n<hypothesis_graph>" in failed
-        and messages[-1].get("role") == "assistant"
-        and messages[-1].get("loss_mask") == 1
+        and messages[3].get("role") == "assistant"
+        and messages[3].get("loss_mask") == 1
+        and extra.get("invalid_action")
+        and extra.get("invalid_failure")
+        and "P999999" not in json.dumps(row)
+        and "H999999" not in json.dumps(row)
     )
 
 
@@ -851,43 +1042,74 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     train_sink = _ParquetSink(output / "train_decision.parquet")
     validation_sink = _ParquetSink(output / "validation_decision.parquet")
     consistency = _DecisionConsistency()
-    eligible_recovery_actions = sorted(
-        (set(action_counts) | {"Recall"}) - {"Abstain"}
-    )
-    per_action_limit = (
-        rare_action_target + len(eligible_recovery_actions) - 1
-    ) // len(eligible_recovery_actions)
-    recovery_candidates: dict[str, list[dict]] = {
-        action: [] for action in eligible_recovery_actions
-    }
-    recovery_overflow: list[dict] = []
+    recovery_candidates: dict[
+        str, list[tuple[dict, tuple[str, str, str]]]
+    ] = defaultdict(list)
     train_questions = set()
     validation_questions = set()
     final_actions: Counter = Counter()
+    training_actions: Counter = Counter()
     counters: Counter = Counter()
     recall_valid = True
     runtime_order_valid = True
     rendered_runtime_identity_valid = True
     runtime_replay_valid = True
     runtime_replay_failures: list[dict] = []
+    clock_contract_valid = True
+    clocked_decisions = 0
+    near_deadline_decisions = 0
+    deadline_decisions = 0
+    deadline_near_horizon = 0
+    comparison_decisions = 0
+    commit_recency: Counter = Counter()
+    comparison_commit_recency: Counter = Counter()
 
     def write_decision(row: dict, *, collect_recovery: bool) -> None:
-        nonlocal rendered_runtime_identity_valid
+        nonlocal rendered_runtime_identity_valid, clock_contract_valid
+        nonlocal clocked_decisions, near_deadline_decisions
+        nonlocal deadline_decisions, deadline_near_horizon, comparison_decisions
         rendered_runtime_identity_valid = (
             rendered_runtime_identity_valid
             and _rendered_runtime_identity_is_valid(row)
         )
+        demo_id = str(row["extra_info"]["demo_id"])
+        is_invalid_recovery = bool(
+            row.get("extra_info", {}).get("invalid_recovery")
+        )
+        is_comparison_primary = (
+            ":delayed-decoy" in demo_id and not is_invalid_recovery
+        )
+        clock = _rendered_clock(row)
+        if clock is not None:
+            used, maximum, remaining = clock
+            clocked_decisions += 1
+            near_deadline_decisions += int(remaining <= 3)
+            clock_contract_valid = (
+                clock_contract_valid
+                and maximum == int(source_contract["max_turns"])
+                and remaining == maximum - used
+            )
+            if ":deadline:" in demo_id:
+                deadline_decisions += 1
+                deadline_near_horizon += int(remaining <= 3)
+        if is_comparison_primary:
+            comparison_decisions += 1
+        recency = _commit_recency(row)
+        if recency is not None and recency[0]:
+            commit_recency["eligible"] += 1
+            commit_recency["newest"] += int(recency[1])
+            if is_comparison_primary:
+                comparison_commit_recency["eligible"] += 1
+                comparison_commit_recency["newest"] += int(recency[1])
         split = _question_split(row["extra_info"]["question_id"])
         (train_sink if split == "train" else validation_sink).append(row)
+        training_actions[_target_action(row)] += 1
         consistency.add(row)
         if collect_recovery:
-            action = _target_action(row)
-            candidates = recovery_candidates.get(action)
-            if candidates is not None and _supports_invalid_recovery(row):
-                if len(candidates) < per_action_limit:
-                    candidates.append(row)
-                elif len(recovery_overflow) < rare_action_target:
-                    recovery_overflow.append(row)
+            for spec in _invalid_recovery_specs(row):
+                candidates = recovery_candidates[spec[0]]
+                if len(candidates) < rare_action_target:
+                    candidates.append((row, spec))
 
     try:
         with demo_temporary.open("w", encoding="utf-8") as demo_handle:
@@ -895,6 +1117,10 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                 source_demo = _runtime_ordered_demo(source_demo)
                 updated, augmented = _augment_recall(source_demo)
                 variants = [updated]
+                comparison = _delayed_decoy_comparison(updated)
+                if comparison is not None:
+                    variants.append(comparison)
+                    counters["comparison"] += 1
                 deadline = _deadline_variant(updated)
                 if deadline is not None:
                     variants.append(deadline)
@@ -933,19 +1159,37 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                     demo_handle.write(
                         json.dumps(demo.to_dict(), ensure_ascii=False) + "\n"
                     )
-                    for row in decision_sft_records(demo):
+                    rows = decision_sft_records(demo)
+                    terminal_start = demo.private_metadata.get(
+                        "terminal_decision_start"
+                    )
+                    if terminal_start is not None:
+                        rows = [
+                            row
+                            for row in rows
+                            if int(row["extra_info"]["trajectory_step_index"])
+                            >= int(terminal_start)
+                        ]
+                    for row in rows:
                         write_decision(row, collect_recovery=True)
 
-        selected = []
+        selected: list[tuple[dict, tuple[str, str, str]]] = []
+        recovery_kinds = sorted(recovery_candidates)
+        recovery_offsets = {kind: 0 for kind in recovery_kinds}
         while len(selected) < rare_action_target and any(recovery_candidates.values()):
-            for action in eligible_recovery_actions:
-                candidates = recovery_candidates[action]
-                if candidates and len(selected) < rare_action_target:
-                    selected.append(candidates.pop(0))
-        selected.extend(recovery_overflow[: rare_action_target - len(selected)])
+            made_progress = False
+            for kind in recovery_kinds:
+                offset = recovery_offsets[kind]
+                candidates = recovery_candidates[kind]
+                if offset < len(candidates) and len(selected) < rare_action_target:
+                    selected.append(candidates[offset])
+                    recovery_offsets[kind] = offset + 1
+                    made_progress = True
+            if not made_progress:
+                break
         invalid_rows = [
-            _invalid_recovery_record(row, index)
-            for index, row in enumerate(selected)
+            _invalid_recovery_record(row, spec, index)
+            for index, (row, spec) in enumerate(selected)
         ]
         invalid_count_complete = len(invalid_rows) == rare_action_target
         invalid_masks_valid = all(
@@ -967,12 +1211,31 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
             "runtime_aligned_invalid_recovery_observations": invalid_masks_valid,
             "hypotheses_follow_runtime_creation_order": runtime_order_valid,
             "rendered_ids_and_clock_match_runtime": rendered_runtime_identity_valid,
+            "all_rendered_clocks_use_source_horizon": clock_contract_valid,
+            "deadline_states_reach_the_live_horizon": (
+                source_demonstrations < 100
+                or deadline_decisions > 0
+                and deadline_near_horizon == deadline_decisions
+            ),
             "all_teacher_actions_replay_in_live_graph": runtime_replay_valid,
             "deadline_commit_supervision_present": (
                 source_demonstrations < 100 or counters["deadline"] > 0
             ),
-            "stale_expanded_hypotheses_are_not_policy_visible": (
-                invalid_recovery_kinds["stale_commit"] == 0
+            "invalid_recovery_uses_only_runtime_visible_ids": all(
+                "P999999" not in json.dumps(row)
+                and "H999999" not in json.dumps(row)
+                for row in invalid_rows
+            ),
+            "invalid_recovery_has_multiple_real_failure_modes": (
+                source_demonstrations < 100 or len(invalid_recovery_kinds) >= 3
+            ),
+            "comparison_variants_train_only_the_terminal_decision": (
+                comparison_decisions == counters["comparison"]
+            ),
+            "comparison_commits_break_the_recency_shortcut": (
+                source_demonstrations < 100
+                or comparison_commit_recency["eligible"] > 0
+                and comparison_commit_recency["newest"] == 0
             ),
             "question_disjoint_split": not train_questions.intersection(
                 validation_questions
@@ -994,12 +1257,15 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
-        "quality_schema": "hyper_r1_v22_markov_terminal",
+        "quality_schema": "hyper_r1_v23_runtime_comparison",
         "source": str(input_path),
         "source_contract": source_contract,
         "output": str(output),
         "source_demonstrations": source_demonstrations,
-        "output_demonstrations": source_demonstrations + counters["deadline"],
+        "output_demonstrations": (
+            source_demonstrations + counters["comparison"] + counters["deadline"]
+        ),
+        "delayed_decoy_comparisons": counters["comparison"],
         "recall_augmented_demonstrations": counters["recall"],
         "deadline_commit_demonstrations": counters["deadline"],
         "deadline_commit_exact": counters["deadline_exact"],
@@ -1008,8 +1274,26 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         "deadline_recalled_best": counters["deadline_recalled_best"],
         "masked_invalid_recovery_decisions": len(invalid_rows),
         "invalid_recovery_kinds": dict(sorted(invalid_recovery_kinds.items())),
+        "clock_audit": {
+            "clocked_decisions": clocked_decisions,
+            "near_deadline_decisions": near_deadline_decisions,
+            "deadline_decisions": deadline_decisions,
+            "deadline_near_horizon": deadline_near_horizon,
+        },
+        "commit_recency": {
+            "eligible": commit_recency["eligible"],
+            "newest": commit_recency["newest"],
+            "newest_rate": (
+                commit_recency["newest"] / commit_recency["eligible"]
+                if commit_recency["eligible"]
+                else None
+            ),
+            "comparison_eligible": comparison_commit_recency["eligible"],
+            "comparison_newest": comparison_commit_recency["newest"],
+        },
         "rare_action_reference_count": rare_action_target,
-        "action_counts": dict(sorted(final_actions.items())),
+        "demonstration_action_counts": dict(sorted(final_actions.items())),
+        "action_counts": dict(sorted(training_actions.items())),
         "train_demonstrations": counters["train_demonstrations"],
         "validation_demonstrations": counters["validation_demonstrations"],
         "train_decisions": train_sink.count,

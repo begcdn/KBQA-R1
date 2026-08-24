@@ -490,6 +490,30 @@ def render_hyper_information(message: str, graph: str, page_state: str = "") -> 
     return "\n".join(sections)
 
 
+def render_hyper_observation_suffix(tokenizer: Any, content: str) -> str:
+    """Close the empty assistant turn and render one Markov observation.
+
+    Runtime resets every decision to the immutable question prompt. The
+    suffix returned here turns its open assistant generation header into the
+    exact ``assistant("") -> user(observation) -> assistant`` context used by
+    decision SFT.
+    """
+    sentinel = "HYPER_R1_ASSISTANT_SENTINEL"
+    rendered = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": ""},
+            {"role": "assistant", "content": sentinel},
+            {"role": "user", "content": str(content)},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    marker = rendered.find(sentinel)
+    if marker < 0:
+        raise ValueError("chat template removed the HyPER observation sentinel")
+    return rendered[marker + len(sentinel) :]
+
+
 _EXPRESSION_RE = re.compile(r"\bexpression\d*\b")
 
 

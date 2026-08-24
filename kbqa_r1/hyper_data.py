@@ -5238,6 +5238,12 @@ def _action_text(step: DemonstrationStep) -> str:
 
 def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
     """Export one complete policy trajectory in the runtime's multi-turn format."""
+    max_turns = int(demo.private_metadata.get("max_turns", 32))
+    turn_offset = int(demo.private_metadata.get("turn_offset", 0))
+    if turn_offset < 0 or turn_offset + len(demo.steps) > max_turns:
+        raise ValueError(
+            f"trajectory {demo.demo_id} has an invalid time-shifted clock"
+        )
     messages: List[Dict[str, Any]] = [
         {
             "role": "user",
@@ -5277,7 +5283,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                     executions=executions,
                     known_ids=known,
                     parked_ids=parked,
-                    turns_used=0,
+                    turns_used=turn_offset,
                 )
                 + "\n</information>",
             }
@@ -5520,7 +5526,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         executions=executions,
                         known_ids=known,
                         parked_ids=parked,
-                        turns_used=step_index + 1,
+                        turns_used=turn_offset + step_index + 1,
                     ),
                     page_state,
                 ),

@@ -7,6 +7,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationStep,
     ExecutedHypothesis,
     HyperDemonstration,
+    RelationProposal,
     decision_sft_records,
     trajectory_sft_record,
 )
@@ -243,11 +244,12 @@ def test_deadline_variant_uses_only_available_executed_candidates():
             break
 
     assert variant is not None
-    assert variant.private_metadata["deadline_sampled_without_gold"]
+    assert variant.private_metadata["deadline_cutoff_sampled_without_gold"]
     assert variant.steps[-1].action == "Commit"
     assert variant.steps[-1].arguments[0] in variant.steps[-1].visible_before
     assert set(variant.hypotheses).issuperset(variant.steps[-1].visible_before)
-    assert variant.private_metadata["max_turns"] == len(variant.steps)
+    assert variant.private_metadata["max_turns"] == 32
+    assert variant.private_metadata["turn_offset"] + len(variant.steps) == 32
 
 
 def test_deadline_variant_recalls_the_best_parked_candidate_before_commit():
@@ -285,47 +287,135 @@ def test_deadline_variant_recalls_the_best_parked_candidate_before_commit():
     assert [step.action for step in variant.steps[-2:]] == ["Recall", "Commit"]
     assert variant.steps[-2].arguments == ("H1",)
     assert variant.steps[-1].arguments == ("H1",)
-    assert variant.private_metadata["max_turns"] == len(variant.steps)
+    assert variant.private_metadata["max_turns"] == 32
+    assert variant.private_metadata["turn_offset"] + len(variant.steps) == 32
+
+
+def test_delayed_decoy_comparison_makes_the_certified_target_older():
+    start = "expression1 = START('m.topic')"
+    gold = ExecutedHypothesis(
+        "H1",
+        (start, "expression1 = JOIN('r.gold', expression1)"),
+        "expression1",
+        ("m.answer",),
+        relation="r.gold",
+    )
+    decoy = ExecutedHypothesis(
+        "H0",
+        (start, "expression1 = JOIN('r.decoy', expression1)"),
+        "expression1",
+        ("m.decoy",),
+        relation="r.decoy",
+    )
+    source = HyperDemonstration(
+        demo_id="comparison",
+        question_id="comparison",
+        question="Which value is correct?",
+        family="frontier_commit",
+        hypotheses={"H0": decoy, "H1": gold},
+        proposals={
+            "P0": RelationProposal("P0", "F0", "m.topic", "r.decoy", 0.8, 0),
+            "P1": RelationProposal("P1", "F0", "m.topic", "r.gold", 0.7, 1),
+        },
+        steps=[
+            DemonstrationStep(
+                "Find_relation",
+                ("m.topic",),
+                (),
+                exposed=("P0", "P1"),
+                relation_page=(0, 2, 2),
+            ),
+            DemonstrationStep("Inspect", ("P0",), (), ("H0",)),
+            DemonstrationStep("Inspect", ("P1",), ("H0",), ("H1",)),
+            DemonstrationStep(
+                "Commit",
+                ("H1",),
+                ("H0", "H1"),
+                certificate_kind="answer_and_supported_query_equivalent",
+            ),
+        ],
+        gold_answers=("m.answer",),
+        private_metadata={
+            "runtime_protocol": "lazy_relation_inspection_v1",
+            "gold_program": gold.function_state,
+            "gold_target_expression": "expression1",
+            "max_turns": 32,
+            "max_active": 24,
+            "max_nodes": 128,
+            "max_execution_attempts": 24,
+        },
+    )
+
+    variant = MODULE._delayed_decoy_comparison(source)
+
+    assert variant is not None
+    assert [step.action for step in variant.steps] == [
+        "Find_relation",
+        "Inspect",
+        "Inspect",
+        "Commit",
+    ]
+    assert variant.steps[1].arguments == ("P1",)
+    assert variant.steps[2].arguments == ("P0",)
+    target = variant.steps[-1].arguments[0]
+    decoy_id = variant.private_metadata["comparison_decoy"]
+    assert int(target[1:]) < int(decoy_id[1:])
+    assert variant.hypotheses[target].denotation == ("m.answer",)
+    assert variant.private_metadata["terminal_decision_start"] == 3
+    assert not MODULE._runtime_replay_errors(variant)
 
 
 def test_invalid_recovery_masks_the_bad_action_and_trains_only_valid_target():
+    state = """<hypothesis_graph>
+active=1 capacity=24 stored=1 parked=0 execution_attempts=1/24 turns_used=3/32 turns_remaining=29 selected=H0 committed=none
+H0 [active] parents=ROOT operation=expand via=r depth=0 path=r answers=1: m.x
+Available targets: Select=[H0]; Park=[H0]; Commit(nonempty active)=[H0]; Combine=[none]; Prune candidates=[none]; Recall=[none]; Find_relation sources=[m.topic].
+</hypothesis_graph>"""
     row = {
         "messages": [
             {"role": "user", "content": "Question"},
             {
                 "role": "user",
-                "content": "<information>\n<hypothesis_graph>state</hypothesis_graph>\n</information>",
+                "content": f"<information>\nSelected H0.\n{state}\n</information>",
                 "loss_mask": 0,
             },
             {
                 "role": "assistant",
-                "content": "<action>Select [ H0 ]</action>",
+                "content": "<action>Park [ H0 ]</action>",
                 "loss_mask": 1,
             },
         ],
         "extra_info": {"question_id": "question"},
     }
 
-    recovered = MODULE._invalid_recovery_record(row, 0)
+    spec = next(
+        spec for spec in MODULE._invalid_recovery_specs(row)
+        if spec[0] == "repeat_select"
+    )
+    recovered = MODULE._invalid_recovery_record(row, spec, 0)
 
-    assistant = [
-        message for message in recovered["messages"] if message["role"] == "assistant"
-    ]
-    assert assistant[0]["loss_mask"] == 0
-    assert "H999999" in assistant[0]["content"]
-    assert assistant[-1]["loss_mask"] == 1
-    assert "H0" in assistant[-1]["content"]
-    assert "Graph action failed" in recovered["messages"][-2]["content"]
-    assert recovered["messages"][-2]["content"].splitlines()[2].startswith(
+    assert len(recovered["messages"]) == 4
+    assert recovered["messages"][1] == {
+        "role": "assistant",
+        "content": "",
+        "loss_mask": 0,
+    }
+    assert recovered["messages"][-1]["loss_mask"] == 1
+    assert "Park [ H0 ]" in recovered["messages"][-1]["content"]
+    assert "Select [ H0 ]" not in json.dumps(recovered["messages"])
+    assert "Graph action failed" in recovered["messages"][2]["content"]
+    assert recovered["messages"][2]["content"].splitlines()[2].startswith(
         "<hypothesis_graph>"
     )
+    assert recovered["extra_info"]["invalid_action"] == "Select [ H0 ]"
+    assert MODULE._valid_invalid_recovery(recovered)
 
 
-def test_markov_record_does_not_expose_a_stale_commit_target():
+def test_invalid_recovery_specs_use_only_ids_visible_in_the_current_state():
     current = """<information>
 Executed the selected hypothesis operation.
 <hypothesis_graph>
-active=1 capacity=24 stored=2 parked=0 execution_attempts=2/24 selected=none committed=none
+active=1 capacity=24 stored=2 parked=0 execution_attempts=2/24 turns_used=4/32 turns_remaining=28 selected=none committed=none
 H1 [active] parents=H0 operation=count via=count depth=1 path=r.items answers=1: 2
 Available targets: Select=[H1]; Park=[H1]; Commit(nonempty active)=[H1]; Combine=[none]; Prune candidates=[none]; Recall=[none]; Find_relation sources=[m.topic].
 </hypothesis_graph>
@@ -343,7 +433,10 @@ Available targets: Select=[H1]; Park=[H1]; Commit(nonempty active)=[H1]; Combine
         "extra_info": {"question_id": "question"},
     }
 
-    assert MODULE._invalid_recovery_spec(row) is None
+    specs = MODULE._invalid_recovery_specs(row)
+    assert specs
+    assert all("H0" not in invalid_action for _, invalid_action, _ in specs)
+    assert all("999999" not in invalid_action for _, invalid_action, _ in specs)
 
 
 def test_invalid_recovery_rejects_an_initial_prompt_without_environment_feedback():
