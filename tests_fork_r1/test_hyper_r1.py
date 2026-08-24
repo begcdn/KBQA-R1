@@ -782,7 +782,7 @@ def test_semantic_certificate_is_only_a_positive_bonus():
     assert result[1].tolist() == pytest.approx([0.0, 0.1])
 
 
-def test_abstention_is_safe_but_never_earns_answer_reward():
+def test_abstention_is_penalized_under_f1_objective():
     rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
     mask = torch.ones_like(rewards)
     result = enforce_commit_reward(
@@ -794,8 +794,16 @@ def test_abstention_is_safe_but_never_earns_answer_reward():
         invalid_penalty=0.25,
     )
 
-    assert result[0].tolist() == [0.0, 0.0, 0.0]
+    assert result[0].tolist() == [0.0, 0.0, -0.25]
     assert result[1].tolist() == [0.0, 0.0, -0.25]
+
+
+def test_runtime_rejects_abstention_under_f1_objective():
+    graph = HypothesisGraph(max_active=3)
+    add(graph, "r.candidate", ["m.answer"])
+
+    with pytest.raises(ValueError, match="disabled for F1 evaluation"):
+        graph.abstain(0)
 
 
 def test_invalid_action_tokens_cannot_keep_positive_advantage():

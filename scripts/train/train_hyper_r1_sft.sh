@@ -20,7 +20,7 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 schema = report.get("quality_schema")
-if schema == "hyper_r1_v19_runtime_exact_control":
+if schema == "hyper_r1_v20_f1_control":
     assertions = report.get("assertions", {})
     failed_assertions = [name for name, passed in assertions.items() if not passed]
     contradictions = report.get("decision_consistency", {}).get(
@@ -45,11 +45,12 @@ if schema == "hyper_r1_v19_runtime_exact_control":
 elif schema in {
     "hyper_r1_v17_truthful_control",
     "hyper_r1_v18_runtime_aligned_control",
+    "hyper_r1_v19_runtime_exact_control",
     "hyper_r1_v13_state_covered_recovery",
 }:
     raise SystemExit(
         "HyPER-R1 corpus schema " + str(schema) +
-        " is superseded; regenerate the runtime-exact v19 corpus before SFT."
+        " is superseded; regenerate the F1-aligned v20 corpus before SFT."
     )
 else:
     raise SystemExit(

@@ -448,7 +448,7 @@ def serialize_frontier(
     )
     lines.append(
         "Actions: Select, Find_relation [ source ], Widen [ source ], Inspect [ Pn ], "
-        "Park, Recall, Combine, Prune, Commit, or Abstain. Widen exposes symbolic "
+        "Park, Recall, Combine, Prune, or Commit. Widen exposes symbolic "
         "proposals and Inspect alone executes one."
     )
     lines.append("</hypothesis_graph>")
@@ -822,13 +822,13 @@ class HypothesisGraph:
         if not opens_frontier:
             if not self.has_capacity(sample_id):
                 return (
-                    "The persistent hypothesis store is exhausted. Commit only if a "
-                    "complete hypothesis is already justified; otherwise use Abstain."
+                    "The persistent hypothesis store is exhausted. Select or recall the "
+                    "strongest supported nonempty hypothesis and Commit it."
                 )
             if not self.has_execution_budget(sample_id):
                 return (
-                    "The execution budget is exhausted. Commit only if a complete "
-                    "hypothesis is already justified; otherwise use Abstain."
+                    "The execution budget is exhausted. Select or recall the strongest "
+                    "supported nonempty hypothesis and Commit it."
                 )
         return None
 
@@ -951,15 +951,11 @@ class HypothesisGraph:
         return node
 
     def abstain(self, sample_id: int) -> None:
-        graph = self.state(sample_id)
-        if graph.committed_id is not None:
-            raise ValueError("cannot Abstain after Commit")
-        graph.abstained = True
-        graph.selected_id = None
-        for node in graph.nodes.values():
-            if node.status in {HypothesisStatus.ACTIVE, HypothesisStatus.PARKED}:
-                node.status = HypothesisStatus.CLOSED
-                node.provenance.append("closed_by_abstain")
+        self.state(sample_id)
+        raise ValueError(
+            "Abstain is disabled for F1 evaluation; Commit the strongest "
+            "supported nonempty hypothesis"
+        )
 
     def committed_node(self, sample_id: int) -> Optional[HypothesisNode]:
         graph = self.state(sample_id)
@@ -1249,8 +1245,7 @@ def enforce_commit_reward(
         raise ValueError("abstained must contain one value per rollout")
     result = torch.zeros_like(token_rewards)
     legal_commit = commit_protocol_valid.to(dtype=torch.bool)
-    safe_abstention = abstained.to(dtype=torch.bool) & ~legal_commit
-    invalid = ~legal_commit & ~safe_abstention
+    invalid = ~legal_commit
     answer_f1 = commit_answer_f1.to(dtype=result.dtype).clamp(0.0, 1.0)
     intent = commit_intent_equivalent.to(dtype=result.dtype)
     terminal_reward = answer_f1 + float(semantic_bonus) * intent

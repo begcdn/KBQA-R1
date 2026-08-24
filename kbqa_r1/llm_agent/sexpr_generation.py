@@ -959,7 +959,8 @@ class SExprLLMGenerationManager:
                     raise RuntimeError("the persistent hypothesis store is full")
                 if not self.hyper_graph.has_execution_budget(sample_id):
                     raise RuntimeError(
-                        "the execution budget is exhausted; use Abstain unless a complete hypothesis is already justified"
+                        "the execution budget is exhausted; select or recall the "
+                        "strongest supported nonempty hypothesis and Commit it"
                     )
                 candidate = proposal["candidate"]
                 try:
@@ -1107,20 +1108,9 @@ class SExprLLMGenerationManager:
                 )
 
             if action.action_type == ActionType.ABSTAIN:
-                self.hyper_graph.abstain(sample_id)
-                self._record_hyper_action(
-                    sample_id,
-                    action,
-                    turn,
-                    state_key=state_key,
-                    action_key=action_key,
-                    active_before=active_before,
-                    selected_before=selected_before,
-                )
-                return self._hyper_info(
-                    sample_id,
-                    "Abstained without claiming that an unresolved hypothesis is complete.",
-                    is_final_turn,
+                raise ValueError(
+                    "Abstain is disabled for F1 evaluation; select or recall the "
+                    "strongest supported nonempty hypothesis and Commit it"
                 )
 
             if action.action_type == ActionType.COMBINE_HYPOTHESES:

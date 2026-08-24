@@ -2,8 +2,8 @@
 """Regenerate HyPER-R1 SFT from structured demonstrations.
 
 This exporter adds only transitions whose legality can be reconstructed from
-the stored graph state: reversible Park/Recall recovery, budget-exhausted
-Abstain, and masked invalid-action recovery contexts.
+the stored graph state: reversible Park/Recall recovery and masked
+invalid-action recovery contexts.
 """
 
 from __future__ import annotations
@@ -194,84 +194,6 @@ def _augment_recall(demo: HyperDemonstration) -> tuple[HyperDemonstration, bool]
         metadata["recall_augmented"] = True
         return replace(demo, steps=rewritten, private_metadata=metadata), True
     return demo, False
-
-
-def _budget_abstain_demo(
-    demo: HyperDemonstration,
-) -> HyperDemonstration | None:
-    """Create a terminal state where the next required Inspect is unaffordable."""
-    executions = 0
-    parked: set[str] = set()
-    eligible: list[tuple[int, int]] = []
-    for index, step in enumerate(demo.steps):
-        if step.action == "Inspect" and executions > 0:
-            complete = any(
-                demo.hypotheses[node_id].denotation == demo.gold_answers
-                for node_id in (*step.visible_before, *parked)
-                if node_id in demo.hypotheses
-            )
-            if not complete:
-                eligible.append((index, executions))
-        if step.action == "Park":
-            parked.add(step.arguments[0])
-        elif step.action == "Recall":
-            parked.discard(step.arguments[0])
-        elif step.action in {"Prune", "Commit"}:
-            parked.discard(step.arguments[0])
-        elif step.action == "Abstain":
-            parked.clear()
-        executions += int(step.action in _EXECUTING_ACTIONS)
-    if not eligible:
-        return None
-    digest = hashlib.sha256(demo.demo_id.encode("utf-8")).digest()
-    index, executions = eligible[int.from_bytes(digest[:8], "big") % len(eligible)]
-    step = demo.steps[index]
-    metadata = dict(demo.private_metadata)
-    metadata.update(
-        {
-            "max_execution_attempts": executions,
-            "max_turns": index + 1,
-            "execution_attempts": executions,
-            "verified_abstain_reason": "execution_budget_exhausted",
-        }
-    )
-    abstain = DemonstrationStep(
-        "Abstain",
-        (),
-        step.visible_before,
-        (),
-        ("execution_budget_exhausted_without_complete_hypothesis",),
-    )
-    retained_steps = [*demo.steps[:index], abstain]
-    retained_hypotheses = {
-        node_id
-        for retained_step in retained_steps
-        for node_id in (*retained_step.visible_before, *retained_step.created)
-        if node_id in demo.hypotheses
-    }
-    retained_proposals = {
-        proposal_id
-        for retained_step in retained_steps
-        for proposal_id in retained_step.exposed
-        if proposal_id in demo.proposals
-    }
-    return replace(
-        demo,
-        demo_id=f"{demo.demo_id}:budget_abstain:{index}",
-        family="budget_exhausted_abstain",
-        hypotheses={
-            node_id: node
-            for node_id, node in demo.hypotheses.items()
-            if node_id in retained_hypotheses
-        },
-        steps=retained_steps,
-        private_metadata=metadata,
-        proposals={
-            proposal_id: proposal
-            for proposal_id, proposal in demo.proposals.items()
-            if proposal_id in retained_proposals
-        },
-    )
 
 
 def _target_action(row: dict) -> str:
@@ -544,35 +466,6 @@ def _valid_recall_augmentation(demo: HyperDemonstration) -> bool:
     return recalls == 1
 
 
-def _valid_budget_abstain(demo: HyperDemonstration) -> bool:
-    if not demo.steps or demo.steps[-1].action != "Abstain":
-        return False
-    executions = sum(step.action in _EXECUTING_ACTIONS for step in demo.steps[:-1])
-    parked = set()
-    for step in demo.steps[:-1]:
-        if step.action == "Park":
-            parked.add(step.arguments[0])
-        elif step.action == "Recall":
-            parked.discard(step.arguments[0])
-        elif step.action in {"Prune", "Commit"}:
-            parked.discard(step.arguments[0])
-        elif step.action == "Abstain":
-            parked.clear()
-    visible = demo.steps[-1].visible_before
-    complete_available = any(
-        demo.hypotheses[node_id].denotation == demo.gold_answers
-        for node_id in (*visible, *parked)
-        if node_id in demo.hypotheses
-    )
-    return (
-        executions > 0
-        and int(demo.private_metadata.get("max_execution_attempts", -1)) == executions
-        and demo.private_metadata.get("verified_abstain_reason")
-        == "execution_budget_exhausted"
-        and not complete_available
-    )
-
-
 def _valid_invalid_recovery(row: dict) -> bool:
     messages = row["messages"]
     failed = str(messages[-2].get("content", "")) if len(messages) >= 2 else ""
@@ -616,15 +509,12 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         action: [] for action in eligible_recovery_actions
     }
     recovery_overflow: list[dict] = []
-    seen_abstain_questions = set()
     train_questions = set()
     validation_questions = set()
     final_actions: Counter = Counter()
     counters: Counter = Counter()
     recall_valid = True
-    abstain_valid = True
     runtime_order_valid = True
-    abstain_execution_budgets: Counter = Counter()
 
     def write_decision(row: dict, *, collect_recovery: bool) -> None:
         split = _question_split(row["extra_info"]["question_id"])
@@ -648,19 +538,6 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                 counters["recall"] += int(augmented)
                 if augmented:
                     recall_valid = recall_valid and _valid_recall_augmentation(updated)
-                if (
-                    counters["abstain"] < rare_action_target
-                    and updated.question_id not in seen_abstain_questions
-                ):
-                    candidate = _budget_abstain_demo(updated)
-                    if candidate is not None:
-                        variants.append(candidate)
-                        seen_abstain_questions.add(updated.question_id)
-                        counters["abstain"] += 1
-                        abstain_execution_budgets[
-                            int(candidate.private_metadata["max_execution_attempts"])
-                        ] += 1
-                        abstain_valid = abstain_valid and _valid_budget_abstain(candidate)
 
                 for demo in variants:
                     runtime_order_valid = (
@@ -706,11 +583,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
             "invalid_recovery_count_reached": invalid_count_complete,
             "invalid_actions_have_zero_loss": invalid_masks_valid,
             "recall_restores_a_parked_executable_hypothesis": recall_valid,
-            "abstain_requires_exhausted_execution_budget": abstain_valid,
-            "no_abstain_with_recallable_complete_hypothesis": abstain_valid,
-            "abstain_prefixes_span_multiple_execution_budgets": (
-                len(abstain_execution_budgets) > 1
-            ),
+            "no_abstain_supervision_under_f1_objective": final_actions["Abstain"] == 0,
             "runtime_aligned_invalid_recovery_observations": invalid_masks_valid,
             "hypotheses_follow_runtime_creation_order": runtime_order_valid,
             "stale_commit_recovery_is_supervised": (
@@ -736,19 +609,15 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
-        "quality_schema": "hyper_r1_v19_runtime_exact_control",
+        "quality_schema": "hyper_r1_v20_f1_control",
         "source": str(input_path),
         "source_contract": source_contract,
         "output": str(output),
         "source_demonstrations": source_demonstrations,
-        "output_demonstrations": source_demonstrations + counters["abstain"],
+        "output_demonstrations": source_demonstrations,
         "recall_augmented_demonstrations": counters["recall"],
-        "budget_exhausted_abstain_demonstrations": counters["abstain"],
         "masked_invalid_recovery_decisions": len(invalid_rows),
         "invalid_recovery_kinds": dict(sorted(invalid_recovery_kinds.items())),
-        "abstain_execution_budgets": {
-            str(key): value for key, value in sorted(abstain_execution_budgets.items())
-        },
         "rare_action_reference_count": rare_action_target,
         "action_counts": dict(sorted(final_actions.items())),
         "train_demonstrations": counters["train_demonstrations"],

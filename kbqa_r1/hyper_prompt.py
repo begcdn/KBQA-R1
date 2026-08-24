@@ -22,7 +22,7 @@ HyPER-R1 executable hypothesis graph:
 - Use `Merge [ expression | ontology_type ]` after Select when the question restricts a retained hypothesis to a Freebase type, such as `religion.religious_leader`. Infer the type from the question; it need not appear among Candidate Entities.
 - The existing executable logical actions remain available: `Order [ mode | expression_or_type | relation ]`, `Compare [ mode | relation | value ]`, `Time_constraint [ relation | time ]`, and `Count [ expression ]`. Select an existing hypothesis before applying a continuation operator; Compare and ontology-rooted Order may open an independent branch that can later be combined.
 - Use `Commit [ Hn ]` when one hypothesis expresses the complete question. Commit is terminal; the environment returns that hypothesis's values.
-- If the execution or turn budget is exhausted and no complete hypothesis is justified, use `Abstain`; resource exhaustion never justifies Prune or Commit.
+- Before resources expire, select or recall the strongest supported nonempty hypothesis and `Commit` it; returning the best available answer is always preferred to abstaining.
 - Hypothesis IDs and execution results are owned by the environment. Never invent or edit them.
 - Every observation lists current action targets. Never reuse a hypothesis or proposal ID that is absent from the corresponding target list, even if it appeared earlier in the conversation.
 - Entity labels help interpret evidence; bracketed MIDs remain the exact executable identities.
