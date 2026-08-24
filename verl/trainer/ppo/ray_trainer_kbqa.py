@@ -333,6 +333,7 @@ def compute_advantage(
         required = {
             "hyper_r1_action_ids",
             "hyper_r1_invalid_action_mask",
+            "hyper_r1_forced_terminal",
             "terminal_reward",
         }
         missing = required.difference(data.batch.keys())
@@ -348,6 +349,10 @@ def compute_advantage(
             penalize_invalid_actions,
         )
 
+        deliberate = ~data.batch["hyper_r1_forced_terminal"].to(dtype=torch.bool)
+        data.batch["advantages"][~deliberate] = 0.0
+        data.batch["returns"][~deliberate] = 0.0
+
         advantages, compared_mask = apply_grouped_decision_credit(
             data.batch["advantages"],
             data.batch["hyper_r1_action_ids"],
@@ -355,6 +360,7 @@ def compute_advantage(
             data.non_tensor_batch["uid"],
             data.non_tensor_batch["hyper_r1_action_records"],
             weight=float(config.get("hyper_r1_credit_weight", 1.0)),
+            eligible_rollouts=deliberate,
         )
         data.batch["advantages"] = advantages
         data.batch["hyper_r1_compared_action_mask"] = compared_mask
@@ -1935,6 +1941,7 @@ class RayPPOTrainer:
                                 "hyper_r1_commit_answer_f1",
                                 "hyper_r1_commit_intent_equivalent",
                                 "hyper_r1_abstained",
+                                "hyper_r1_forced_terminal",
                                 "hyper_r1_premature_answer",
                                 "response_mask",
                             }
@@ -1965,7 +1972,7 @@ class RayPPOTrainer:
                                 ),
                                 semantic_bonus=float(
                                     self.config.algorithm.get(
-                                        "hyper_r1_semantic_bonus", 0.1
+                                        "hyper_r1_semantic_bonus", 0.0
                                     )
                                 ),
                             )
@@ -1979,7 +1986,7 @@ class RayPPOTrainer:
                                     )
                                 ),
                                 cost=float(
-                                    self.config.algorithm.get("hyper_r1_budget_cost", 0.05)
+                                    self.config.algorithm.get("hyper_r1_budget_cost", 0.0)
                                 ),
                                 group_ids=batch.non_tensor_batch["uid"],
                             )

@@ -359,10 +359,22 @@ class MultiTurnSFTDataset(Dataset):
                 "loss_mask": loss_mask,
             }
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
-            # truncate input_ids if it is longer than max_length
             if len(input_ids) > self.max_length:
-                input_ids = input_ids[: self.max_length]
-                loss_mask = loss_mask[: self.max_length]
+                if self.truncation == "left":
+                    input_ids = input_ids[-self.max_length :]
+                    loss_mask = loss_mask[-self.max_length :]
+                elif self.truncation == "right":
+                    input_ids = input_ids[: self.max_length]
+                    loss_mask = loss_mask[: self.max_length]
+                elif self.truncation == "error":
+                    raise ValueError(
+                        f"sequence_length={len(input_ids)} is larger than "
+                        f"max_length={self.max_length}"
+                    )
+                else:
+                    raise ValueError(f"Unknown truncation method {self.truncation}")
+            if int(loss_mask.sum()) == 0:
+                raise ValueError("SFT example contains no supervised target tokens")
             # create position IDs
             position_ids = torch.arange(len(input_ids), dtype=torch.long)
             # return nested tensor with out padding

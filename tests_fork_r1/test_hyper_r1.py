@@ -651,6 +651,31 @@ def test_graph_credit_compares_different_actions_from_same_state():
     assert compared[2].sum().item() == 0
 
 
+def test_forced_terminal_rollouts_do_not_supply_or_receive_local_credit():
+    advantages = torch.zeros((3, 3))
+    action_ids = torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0]])
+    rewards = torch.tensor([1.0, 0.9, 0.0])
+    records = [
+        [{"state_key": "S", "action_key": "commit-H0"}],
+        [{"state_key": "S", "action_key": "wait"}],
+        [{"state_key": "S", "action_key": "commit-H1"}],
+    ]
+
+    result, compared = apply_grouped_decision_credit(
+        advantages,
+        action_ids,
+        rewards,
+        ["question"] * 3,
+        records,
+        eligible_rollouts=torch.tensor([True, False, True]),
+    )
+
+    assert result[0, :2].tolist() == pytest.approx([1.0, 1.0])
+    assert result[1].tolist() == [0.0, 0.0, 0.0]
+    assert result[2, :2].tolist() == pytest.approx([-1.0, -1.0])
+    assert compared[1].sum().item() == 0
+
+
 def test_decision_state_distinguishes_remaining_turn_budget():
     graph = HypothesisGraph(max_active=3)
     add(graph, "r.answer", ["m.answer"])
@@ -762,10 +787,10 @@ def test_answer_correct_alternative_is_not_vetoed_by_intent_certificate():
     )
 
     assert result[0].tolist() == [0.0, 0.0, 1.0]
-    assert result[1].tolist() == pytest.approx([0.0, 0.0, 0.6])
+    assert result[1].tolist() == pytest.approx([0.0, 0.0, 0.5])
 
 
-def test_semantic_certificate_is_only_a_positive_bonus():
+def test_semantic_certificate_is_a_metric_not_an_f1_bonus():
     rewards = torch.zeros((2, 2))
     mask = torch.ones_like(rewards)
 
@@ -779,7 +804,7 @@ def test_semantic_certificate_is_only_a_positive_bonus():
     )
 
     assert result[0].tolist() == [0.0, 0.0]
-    assert result[1].tolist() == pytest.approx([0.0, 0.1])
+    assert result[1].tolist() == [0.0, 0.0]
 
 
 def test_abstention_is_penalized_under_f1_objective():
@@ -804,6 +829,59 @@ def test_runtime_rejects_abstention_under_f1_objective():
 
     with pytest.raises(ValueError, match="disabled for F1 evaluation"):
         graph.abstain(0)
+
+
+def test_visible_clock_is_part_of_the_shared_graph_state():
+    graph = HypothesisGraph(max_active=3)
+    graph.set_clock(0, turns_used=7, max_turns=32)
+
+    rendered = graph.serialize(0)
+
+    assert "turns_used=7/32" in rendered
+    assert "turns_remaining=25" in rendered
+
+
+def test_forced_terminal_prefers_the_policy_selected_nonempty_candidate():
+    graph = HypothesisGraph(max_active=3)
+    preferred = add(graph, "r.preferred", ["m.partial"])
+    add(graph, "r.newer", ["m.other"])
+    graph.select(0, preferred.node_id)
+    graph.mark_expanded(0, preferred.node_id)
+
+    chosen = graph.force_terminal(0)
+
+    assert chosen is preferred
+    assert graph.state(0).committed_id == preferred.node_id
+    assert graph.state(0).terminal_kind == "forced_candidate"
+    assert graph.is_terminal(0)
+
+
+def test_forced_terminal_without_nonempty_candidate_returns_empty_prediction():
+    graph = HypothesisGraph(max_active=3)
+    add(graph, "r.empty", [])
+
+    assert graph.force_terminal(0) is None
+    assert graph.state(0).committed_id is None
+    assert graph.state(0).terminal_kind == "forced_empty"
+    assert graph.is_terminal(0)
+
+
+def test_forced_terminal_does_not_choose_an_unselected_historical_node():
+    graph = HypothesisGraph(max_active=3)
+    historical = add(graph, "r.old", ["m.old"])
+    graph.mark_expanded(0, historical.node_id)
+
+    assert graph.force_terminal(0) is None
+    assert graph.state(0).terminal_kind == "forced_empty"
+
+
+def test_repeated_select_is_rejected_as_no_progress():
+    graph = HypothesisGraph(max_active=3)
+    node = add(graph, "r.choice", ["m.answer"])
+    graph.select(0, node.node_id)
+
+    with pytest.raises(ValueError, match="already selected"):
+        graph.select(0, node.node_id)
 
 
 def test_invalid_action_tokens_cannot_keep_positive_advantage():
@@ -839,3 +917,20 @@ def test_execution_budget_only_charges_excess_over_sibling_rollout():
     assert result[0, 2].item() == pytest.approx(-0.06)
     assert result[1, 1].item() == 0.0
     assert torch.count_nonzero(result).item() == 1
+
+
+def test_execution_cost_cannot_reverse_answer_f1_ordering():
+    rewards = torch.tensor([[0.0, 0.70], [0.0, 0.69]])
+    mask = torch.ones_like(rewards)
+
+    result = charge_execution_budget(
+        rewards,
+        mask,
+        torch.tensor([24.0, 1.0]),
+        max_execution_attempts=24,
+        cost=1.0,
+        group_ids=["question", "question"],
+    )
+
+    totals = result.sum(dim=-1)
+    assert totals[0] > totals[1]

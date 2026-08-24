@@ -133,11 +133,25 @@ echo "Micro batch   : ${MICRO_BATCH_SIZE_PER_GPU}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "========================================"
 
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
+AUDIT_FILES=("${TRAIN_PARQUET}")
+if [[ -f "${VAL_PARQUET}" ]]; then
+  AUDIT_FILES+=("${VAL_PARQUET}")
+fi
+AUDIT_TEMPLATE_ARGS=()
+if [[ -n "${SFT_CHAT_TEMPLATE:-}" ]]; then
+  AUDIT_TEMPLATE_ARGS+=(--chat-template "${SFT_CHAT_TEMPLATE}")
+fi
+"${PYTHON_BIN}" "${REPO_ROOT}/scripts/audit_hyper_sft_corpus.py" \
+  --data "${AUDIT_FILES[@]}" \
+  --tokenizer "${BASE_MODEL}" \
+  "${AUDIT_TEMPLATE_ARGS[@]}" \
+  --max-length "${SFT_MAX_LENGTH}"
+
 # -----------------------------
 # torch.distributed launcher. Use the active Python environment so a global
 # torchrun cannot silently launch the trainer with a different site-packages.
 # -----------------------------
-PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
 if [[ -n "${TORCHRUN:-}" ]]; then
   read -r -a TORCHRUN_CMD <<< "${TORCHRUN}"
 else

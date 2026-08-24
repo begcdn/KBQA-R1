@@ -368,6 +368,30 @@ class SExprLLMGenerationManager:
             "valid": certificate.valid,
         }
 
+    def _force_hyper_terminal(self, sample_id: int, turn: int) -> None:
+        """Convert a hard stop into an oracle-free benchmark prediction."""
+        node = self.hyper_graph.force_terminal(sample_id)
+        contract = self._hyper_gold_contracts.get(sample_id)
+        if node is None:
+            from kbqa_r1.hyper_data import answer_set_f1
+
+            certificate = {
+                "gold_contract_available": bool(
+                    contract and contract.get("function_list")
+                ),
+                "answer_exact": False,
+                "answer_f1": answer_set_f1(
+                    (), contract.get("answers", ()) if contract else ()
+                ),
+                "intent_equivalent": False,
+                "valid": False,
+            }
+        else:
+            certificate = self._certify_hyper_commit(sample_id)
+        self._hyper_commit_certificates[sample_id] = certificate
+        self._hyper_protocol_valid_answer_turns[sample_id] = int(turn)
+        self._hyper_valid_answer_turns[sample_id] = int(turn)
+
     def _get_independent_gpu_manager(self):
         """
         获取独立的GPU维护管理器（绕过Ray的GPU环境限制）
@@ -896,6 +920,14 @@ class SExprLLMGenerationManager:
                 sample_id, action.action_type.value, action.arguments
             )
             if action.action_type == ActionType.WIDEN_FRONTIER:
+                if not self.hyper_graph.has_capacity(sample_id):
+                    raise RuntimeError(
+                        "the persistent hypothesis store is exhausted; exploration is closed"
+                    )
+                if not self.hyper_graph.has_execution_budget(sample_id):
+                    raise RuntimeError(
+                        "the execution budget is exhausted; exploration is closed"
+                    )
                 if graph_state.selected_id is not None:
                     raise ValueError("Widen before Select so the original frontier remains current")
                 source = str(action.arguments[0])
@@ -1306,6 +1338,9 @@ class SExprLLMGenerationManager:
         abstained = torch.zeros(
             batch_size, dtype=torch.bool, device=responses.device
         )
+        forced_terminal = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
         premature_answer = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
         action_records = []
         graph_records = []
@@ -1331,6 +1366,10 @@ class SExprLLMGenerationManager:
                 bool(self._hyper_gold_contracts.get(sample_id, {}).get("function_list"))
             )
             abstained[sample_id] = bool(graph.abstained)
+            forced_terminal[sample_id] = graph.terminal_kind in {
+                "forced_candidate",
+                "forced_empty",
+            }
             premature_answer[sample_id] = sample_id in self._hyper_premature_answers
             records = list(self._hyper_action_records.get(sample_id, []))
             action_records.append(records)
@@ -1355,6 +1394,7 @@ class SExprLLMGenerationManager:
         output.batch["hyper_r1_commit_intent_equivalent"] = commit_intent_equivalent
         output.batch["hyper_r1_gold_contract_available"] = gold_contract_available
         output.batch["hyper_r1_abstained"] = abstained
+        output.batch["hyper_r1_forced_terminal"] = forced_terminal
         output.batch["hyper_r1_premature_answer"] = premature_answer
         output.non_tensor_batch["hyper_r1_action_records"] = np.array(
             action_records, dtype=object
@@ -1451,6 +1491,11 @@ class SExprLLMGenerationManager:
             # 记录完整的observation字符串到日志文件
             self.logging_manager.log_long_observations(next_obs, next_obs_ids.shape[1])
             
+            if self.hyper_r1_enable:
+                raise RuntimeError(
+                    "HyPER-R1 observation truncation would remove public state or "
+                    "legal affordances; increase max_obs_length"
+                )
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
         return next_obs_ids
@@ -1488,6 +1533,11 @@ class SExprLLMGenerationManager:
                 return (i, local_next_obs, True, False)
 
             if self.hyper_r1_enable and self.config.enable_sexpr_mode:
+                self.hyper_graph.set_clock(
+                    i,
+                    turns_used=min(int(turn) + 1, int(self.config.max_turns)),
+                    max_turns=int(self.config.max_turns),
+                )
                 self._prepare_hyper_turn_actions(pred, i, turn)
 
             answer_values = extract_last_answer_values(pred)
@@ -1554,8 +1604,7 @@ class SExprLLMGenerationManager:
                     observation = SExprUtils.ensure_leading_newline_info(observation)
                     local_next_obs = observation
                     if self.hyper_r1_enable:
-                        graph = self.hyper_graph.state(i)
-                        if graph.abstained or graph.committed_id is not None:
+                        if self.hyper_graph.is_terminal(i):
                             local_done = True
                     
                     # Check if the observation contains timeout error
@@ -1604,6 +1653,8 @@ class SExprLLMGenerationManager:
                 if timeout:
                     # Update timeout tracking
                     self._record_timeout(i, turn)
+                    if self.hyper_r1_enable:
+                        self._force_hyper_terminal(i, turn)
                     # Mark as inactive in active_mask if available
                     if active_mask is not None:
                         active_mask[i] = False
@@ -2440,6 +2491,11 @@ class SExprLLMGenerationManager:
             
             if len(responses_str) == 0 or all(not s for s in responses_str):
                 logger.warning("Empty responses after postprocessing")
+                if self.hyper_r1_enable:
+                    for sample_id in torch.nonzero(
+                        active_mask, as_tuple=False
+                    ).flatten().tolist():
+                        self._force_hyper_terminal(sample_id, turn)
                 active_mask = torch.zeros_like(active_mask)
                 meta_info['done'] = ~active_mask
                 continue
@@ -2466,7 +2522,14 @@ class SExprLLMGenerationManager:
             
             # Update states
             is_final_turn = (turn == self.config.max_turns - 1)
-            rollings = self.batch_utils.update_rolling_state(rollings, responses_ids, next_obs_ids, is_final_turn)
+            if self.hyper_r1_enable:
+                rollings = self.batch_utils.replace_with_latest_state(
+                    initial_input_ids, next_obs_ids
+                )
+            else:
+                rollings = self.batch_utils.update_rolling_state(
+                    rollings, responses_ids, next_obs_ids, is_final_turn
+                )
             # CRITICAL FIX: Pass cur_rollout_log_probs to update_right_side
             original_right_side = self.batch_utils.update_right_side(
                 original_right_side, 
@@ -2525,7 +2588,18 @@ class SExprLLMGenerationManager:
             # 直接基于当前rollings计算截断信息，避免使用空tensor
             self.batch_utils.record_final_truncation_info(rollings, meta_info, batch_size)
 
-        # Final LLM rollout
+        # HyPER hard stops are environment-owned terminal outcomes. A legacy
+        # answer-only generation cannot execute Commit and is therefore not a
+        # valid recovery mechanism for this protocol.
+        if self.hyper_r1_enable and active_mask.sum():
+            for sample_id in torch.nonzero(
+                active_mask, as_tuple=False
+            ).flatten().tolist():
+                self._force_hyper_terminal(sample_id, self.config.max_turns)
+            active_mask = torch.zeros_like(active_mask)
+            meta_info['done'] = ~active_mask
+
+        # Final LLM rollout for the legacy non-HyPER protocol.
         if active_mask.sum():
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,

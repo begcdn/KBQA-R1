@@ -17,18 +17,20 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from kbqa_r1.hyper_data import (  # noqa: E402
+    _public_graph,
+    answer_set_f1,
     DemonstrationStep,
     HyperDemonstration,
     decision_sft_records,
 )
-from kbqa_r1.hyper_r1 import render_hyper_information  # noqa: E402
+from kbqa_r1.hyper_r1 import HypothesisGraph, render_hyper_information  # noqa: E402
 from scripts.data_process.build_hyper_demonstrations import _question_split  # noqa: E402
 from scripts.data_process.repair_hyper_curriculum import _load_demo  # noqa: E402
 
@@ -64,13 +66,21 @@ def _load_source_contract(input_path: Path) -> dict:
             f"source corpus contract is missing: {report_path}"
         )
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    missing = [field for field in _SOURCE_CONTRACT_FIELDS if field not in report]
+    inherited = report.get("source_contract", {})
+    missing = [
+        field
+        for field in _SOURCE_CONTRACT_FIELDS
+        if field not in report and field not in inherited
+    ]
     if missing:
         raise ValueError(
             "source corpus report is missing contract fields: "
             + ", ".join(missing)
         )
-    contract = {field: report[field] for field in _SOURCE_CONTRACT_FIELDS}
+    contract = {
+        field: report[field] if field in report else inherited[field]
+        for field in _SOURCE_CONTRACT_FIELDS
+    }
     contract["report"] = str(report_path)
     contract["report_sha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
     return contract
@@ -88,8 +98,27 @@ def _iter_demos(path: Path) -> Iterator[HyperDemonstration]:
                 yield _load_demo(json.loads(line))
 
 
-def _runtime_ordered_demo(demo: HyperDemonstration) -> HyperDemonstration:
-    """Store nodes in the order the live graph creates them."""
+_HYPOTHESIS_ID = re.compile(r"\bH\d+\b")
+
+
+def _rewrite_hypothesis_ids(value: Any, mapping: dict[str, str]) -> Any:
+    """Rewrite exact hypothesis references inside structured metadata."""
+    if isinstance(value, str):
+        return _HYPOTHESIS_ID.sub(lambda match: mapping.get(match.group(0), match.group(0)), value)
+    if isinstance(value, tuple):
+        return tuple(_rewrite_hypothesis_ids(item, mapping) for item in value)
+    if isinstance(value, list):
+        return [_rewrite_hypothesis_ids(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {
+            _rewrite_hypothesis_ids(key, mapping): _rewrite_hypothesis_ids(item, mapping)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _runtime_creation_order(demo: HyperDemonstration) -> list[str]:
+    """Return the order in which the live graph would mint node IDs."""
     known = set(demo.hypotheses)
     order: list[str] = []
     seen: set[str] = set()
@@ -107,16 +136,223 @@ def _runtime_ordered_demo(demo: HyperDemonstration) -> HyperDemonstration:
         if node_id not in seen:
             order.append(node_id)
             seen.add(node_id)
-    if order == list(demo.hypotheses):
-        return demo
+    return order
+
+
+def _runtime_ordered_demo(demo: HyperDemonstration) -> HyperDemonstration:
+    """Rename every node and reference to the IDs minted by live runtime."""
+    order = _runtime_creation_order(demo)
+    mapping = {node_id: f"H{index}" for index, node_id in enumerate(order)}
+    hypotheses = {}
+    for old_id in order:
+        node = demo.hypotheses[old_id]
+        new_id = mapping[old_id]
+        hypotheses[new_id] = replace(
+            node,
+            hypothesis_id=new_id,
+            parent_id=mapping.get(node.parent_id, node.parent_id),
+            parent_ids=tuple(mapping.get(value, value) for value in node.parent_ids),
+            provenance=_rewrite_hypothesis_ids(node.provenance, mapping),
+        )
+    steps = [
+        replace(
+            step,
+            arguments=_rewrite_hypothesis_ids(step.arguments, mapping),
+            visible_before=tuple(
+                sorted(
+                    _rewrite_hypothesis_ids(step.visible_before, mapping),
+                    key=lambda node_id: int(str(node_id)[1:]),
+                )
+            ),
+            created=_rewrite_hypothesis_ids(step.created, mapping),
+            rationale_facts=_rewrite_hypothesis_ids(step.rationale_facts, mapping),
+            certificate_evidence=_rewrite_hypothesis_ids(
+                step.certificate_evidence, mapping
+            ),
+        )
+        for step in demo.steps
+    ]
     return replace(
         demo,
-        hypotheses={node_id: demo.hypotheses[node_id] for node_id in order},
+        hypotheses=hypotheses,
+        steps=steps,
+        private_metadata=_rewrite_hypothesis_ids(demo.private_metadata, mapping),
     )
 
 
 def _hypotheses_follow_runtime_order(demo: HyperDemonstration) -> bool:
-    return list(_runtime_ordered_demo(demo).hypotheses) == list(demo.hypotheses)
+    expected = [f"H{index}" for index in range(len(demo.hypotheses))]
+    if list(demo.hypotheses) != expected:
+        return False
+    known = set(demo.steps[0].visible_before if demo.steps else ())
+    next_index = len(known)
+    if known != set(expected[:next_index]):
+        return False
+    for step in demo.steps:
+        if len(step.visible_before) != len(set(step.visible_before)):
+            return False
+        for node_id in step.created:
+            if node_id != f"H{next_index}":
+                return False
+            known.add(node_id)
+            next_index += 1
+        referenced = {
+            value
+            for value in step.arguments
+            if _HYPOTHESIS_ID.fullmatch(str(value))
+        }
+        if not referenced.issubset(known):
+            return False
+    return known == set(expected)
+
+
+def _runtime_replay_errors(demo: HyperDemonstration) -> list[str]:
+    """Replay a teacher trajectory through the real graph state machine."""
+    graph = HypothesisGraph(
+        max_active=int(demo.private_metadata.get("max_active", 24)),
+        max_nodes=int(demo.private_metadata.get("max_nodes", 128)),
+        max_execution_attempts=int(
+            demo.private_metadata.get("max_execution_attempts", 24)
+        ),
+    )
+    graph.register_public_question(0, demo.question)
+    max_turns = int(demo.private_metadata.get("max_turns", 32))
+    frontiers: dict[str, str | None] = {}
+    errors: list[str] = []
+    candidate_sources = [
+        str(candidate[-1])
+        for key in ("candidate_entities", "candidate_literals")
+        for candidate in demo.private_metadata.get(key, ())
+        if candidate
+    ]
+
+    for step_index, step in enumerate(demo.steps):
+        graph.set_clock(0, turns_used=step_index, max_turns=max_turns)
+        active = tuple(node.node_id for node in graph.active_nodes(0))
+        if active != tuple(step.visible_before):
+            errors.append(
+                f"step {step_index} {step.action}: runtime active={active} "
+                f"teacher active={step.visible_before}"
+            )
+            break
+        known = tuple(graph.state(0).nodes)
+        parked = tuple(node.node_id for node in graph.parked_nodes(0))
+        expected_graph = _public_graph(
+            demo,
+            active,
+            selected=graph.state(0).selected_id,
+            executions=graph.state(0).execution_attempts,
+            known_ids=known,
+            parked_ids=parked,
+            turns_used=step_index,
+        )
+        actual_graph = graph.serialize(0, candidate_sources=candidate_sources)
+        if actual_graph != expected_graph:
+            errors.append(
+                f"step {step_index} {step.action}: rendered runtime state differs"
+            )
+            break
+
+        try:
+            if step.action == "Find_relation":
+                for proposal_id in step.exposed:
+                    frontiers[demo.proposals[proposal_id].frontier_id] = (
+                        graph.state(0).selected_id
+                    )
+                graph.clear_selection(0)
+            elif step.action == "Widen":
+                pass
+            elif step.action == "Inspect":
+                node = demo.hypotheses[step.created[0]]
+                proposal = demo.proposals[step.arguments[0]]
+                parent_id = frontiers.get(proposal.frontier_id)
+                graph.record_execution_attempt(0)
+                created = graph.add_executed(
+                    sample_id=0,
+                    function_state=node.function_state,
+                    target_expression=node.target_expression,
+                    sexpr="\n".join(node.function_state),
+                    denotation=node.denotation,
+                    denotation_labels=dict(node.denotation_labels),
+                    parent_id=parent_id,
+                    parent_ids=node.parent_ids,
+                    operation=node.operation,
+                    relation_id=node.relation,
+                    provenance=node.provenance,
+                )
+                if created.node_id != step.created[0]:
+                    errors.append(
+                        f"step {step_index} Inspect: created {created.node_id}, "
+                        f"teacher expects {step.created[0]}"
+                    )
+                    break
+            elif step.action == "Select":
+                graph.select(0, step.arguments[0])
+            elif step.action == "Park":
+                graph.park(0, step.arguments[0])
+            elif step.action == "Recall":
+                graph.recall(0, step.arguments[0])
+            elif step.action == "Prune":
+                graph.prune(0, step.arguments[0])
+            elif step.action == "Combine":
+                node = demo.hypotheses[step.created[0]]
+                left, right = graph.combination_parents(0, *step.arguments)
+                graph.mark_expanded(0, left.node_id)
+                graph.mark_expanded(0, right.node_id)
+                graph.record_execution_attempt(0)
+                created = graph.add_executed(
+                    sample_id=0,
+                    function_state=node.function_state,
+                    target_expression=node.target_expression,
+                    sexpr="\n".join(node.function_state),
+                    denotation=node.denotation,
+                    denotation_labels=dict(node.denotation_labels),
+                    parent_id=node.parent_id,
+                    parent_ids=node.parent_ids,
+                    operation=node.operation,
+                    relation_id=node.relation,
+                    provenance=node.provenance,
+                )
+                if created.node_id != step.created[0]:
+                    errors.append(f"step {step_index} Combine: node ID mismatch")
+                    break
+            elif step.action in {
+                "Merge",
+                "Order",
+                "Compare",
+                "Time_constraint",
+                "Count",
+            }:
+                node = demo.hypotheses[step.created[0]]
+                parent_id = graph.state(0).selected_id
+                if parent_id is not None:
+                    graph.mark_expanded(0, parent_id)
+                graph.record_execution_attempt(0)
+                created = graph.add_executed(
+                    sample_id=0,
+                    function_state=node.function_state,
+                    target_expression=node.target_expression,
+                    sexpr="\n".join(node.function_state),
+                    denotation=node.denotation,
+                    denotation_labels=dict(node.denotation_labels),
+                    parent_id=node.parent_id,
+                    parent_ids=node.parent_ids,
+                    operation=node.operation,
+                    relation_id=node.relation,
+                    provenance=node.provenance,
+                )
+                if created.node_id != step.created[0]:
+                    errors.append(f"step {step_index} {step.action}: node ID mismatch")
+                    break
+            elif step.action == "Commit":
+                graph.commit(0, step.arguments[0])
+            else:
+                errors.append(f"step {step_index}: unsupported action {step.action}")
+                break
+        except (KeyError, RuntimeError, ValueError) as exc:
+            errors.append(f"step {step_index} {step.action}: {exc}")
+            break
+    return errors
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -196,6 +432,102 @@ def _augment_recall(demo: HyperDemonstration) -> tuple[HyperDemonstration, bool]
     return demo, False
 
 
+def _deadline_variant(demo: HyperDemonstration) -> HyperDemonstration | None:
+    """Create one gold-independent deadline state with an offline F1 label."""
+    if len(demo.steps) < 4 or demo.steps[-1].action != "Commit":
+        return None
+    digest = int(hashlib.sha256(demo.demo_id.encode()).hexdigest()[:16], 16)
+    if digest % 1000 >= 80:
+        return None
+
+    # The deadline is sampled without looking at gold or candidate quality.
+    cutoff = 1 + (digest // 1000) % (len(demo.steps) - 1)
+    active = tuple(demo.steps[cutoff].visible_before)
+    parked: set[str] = set()
+    for step in demo.steps[:cutoff]:
+        if step.action == "Park":
+            parked.add(step.arguments[0])
+        elif step.action == "Recall":
+            parked.discard(step.arguments[0])
+    available = tuple(active) + tuple(
+        node_id for node_id in demo.hypotheses if node_id in parked
+    )
+    candidates = [
+        demo.hypotheses[node_id]
+        for node_id in available
+        if node_id in demo.hypotheses and demo.hypotheses[node_id].denotation
+    ]
+    if not candidates:
+        return None
+    chosen = max(
+        candidates,
+        key=lambda node: (
+            answer_set_f1(node.denotation, demo.gold_answers),
+            node.depth,
+            -int(node.hypothesis_id[1:]),
+        ),
+    )
+    chosen_f1 = answer_set_f1(chosen.denotation, demo.gold_answers)
+    prefix = list(demo.steps[:cutoff])
+    deadline_recalled_best = chosen.hypothesis_id in parked
+    if deadline_recalled_best:
+        if len(active) >= int(demo.private_metadata.get("max_active", 24)):
+            return None
+        prefix.append(
+            DemonstrationStep(
+                "Recall",
+                (chosen.hypothesis_id,),
+                active,
+                (),
+                ("restore_best_available_candidate_at_deadline",),
+            )
+        )
+        order = {node_id: index for index, node_id in enumerate(demo.hypotheses)}
+        active = tuple(sorted((*active, chosen.hypothesis_id), key=order.__getitem__))
+    prefix.append(
+        DemonstrationStep(
+            "Commit",
+            (chosen.hypothesis_id,),
+            active,
+            (),
+            (
+                "deadline_reached",
+                "best_attainable_visible_candidate",
+                f"answer_f1:{chosen_f1:.8f}",
+            ),
+            certificate_kind="best_attainable_answer_f1",
+            certificate_evidence=(f"answer_f1:{chosen_f1:.8f}",),
+        )
+    )
+    known = set(demo.steps[0].visible_before if demo.steps else ())
+    for step in prefix:
+        known.update(step.created)
+    metadata = dict(demo.private_metadata)
+    metadata.update(
+        {
+            "best_attainable_supervision": True,
+            "deadline_sampled_without_gold": True,
+            "deadline_recalled_best": deadline_recalled_best,
+            "terminal_answer_f1": chosen_f1,
+            "max_turns": len(prefix),
+            "execution_attempts": sum(
+                step.action in _EXECUTING_ACTIONS for step in prefix
+            ),
+        }
+    )
+    return replace(
+        demo,
+        demo_id=f"{demo.demo_id}:deadline:{cutoff}",
+        hypotheses={
+            node_id: node
+            for node_id, node in demo.hypotheses.items()
+            if node_id in known
+        },
+        steps=prefix,
+        private_metadata=metadata,
+    )
+
+
 def _target_action(row: dict) -> str:
     content = str(row["messages"][-1]["content"])
     match = re.search(r"<action>\s*([^\s\[]+)", content)
@@ -212,19 +544,39 @@ def _observation_state(observation: str) -> str:
     return observation[start:stop].rstrip()
 
 
+def _rendered_runtime_identity_is_valid(row: dict) -> bool:
+    """Reject sparse/impossible node IDs and observations without a clock."""
+    for message in row.get("messages", ()):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content", ""))
+        if "<hypothesis_graph>" not in content:
+            continue
+        graph = _observation_state(content)
+        header = re.search(
+            r"stored=(\d+).*turns_used=(\d+)/(\d+).*turns_remaining=(\d+)",
+            graph,
+        )
+        if header is None:
+            return False
+        stored, used, maximum, remaining = map(int, header.groups())
+        if used > maximum or remaining != maximum - used:
+            return False
+        ids = [
+            int(value)
+            for value in re.findall(r"(?<![A-Za-z0-9_-])H(\d+)\b", graph)
+        ]
+        if ids and max(ids) >= stored:
+            return False
+    return True
+
+
 def _stale_expanded_id(messages: list[dict]) -> str | None:
-    if len(messages) < 4:
+    if len(messages) < 2:
         return None
-    previous_action = str(messages[-3].get("content", ""))
-    action = re.search(r"<action>\s*(Merge|Order|Compare|Time_constraint|Count|Combine)\b", previous_action)
-    if action is None:
-        return None
-    if action.group(1) == "Combine":
-        ids = re.findall(r"\bH\d+\b", previous_action)
-        return ids[0] if ids else None
-    previous_observation = str(messages[-4].get("content", ""))
-    selected = re.search(r"\bselected=(H\d+)\b", previous_observation)
-    return selected.group(1) if selected else None
+    observation = _observation_state(str(messages[-2].get("content", "")))
+    expanded = re.search(r"(?m)^(H\d+) \[expanded\]", observation)
+    return expanded.group(1) if expanded else None
 
 
 def _invalid_recovery_spec(row: dict) -> tuple[str, str, str] | None:
@@ -515,8 +867,16 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     counters: Counter = Counter()
     recall_valid = True
     runtime_order_valid = True
+    rendered_runtime_identity_valid = True
+    runtime_replay_valid = True
+    runtime_replay_failures: list[dict] = []
 
     def write_decision(row: dict, *, collect_recovery: bool) -> None:
+        nonlocal rendered_runtime_identity_valid
+        rendered_runtime_identity_valid = (
+            rendered_runtime_identity_valid
+            and _rendered_runtime_identity_is_valid(row)
+        )
         split = _question_split(row["extra_info"]["question_id"])
         (train_sink if split == "train" else validation_sink).append(row)
         consistency.add(row)
@@ -535,11 +895,31 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                 source_demo = _runtime_ordered_demo(source_demo)
                 updated, augmented = _augment_recall(source_demo)
                 variants = [updated]
+                deadline = _deadline_variant(updated)
+                if deadline is not None:
+                    variants.append(deadline)
+                    counters["deadline"] += 1
+                    counters["deadline_recalled_best"] += int(
+                        deadline.private_metadata.get("deadline_recalled_best", False)
+                    )
+                    counters[
+                        "deadline_exact"
+                        if float(deadline.private_metadata["terminal_answer_f1"]) == 1.0
+                        else "deadline_partial"
+                        if float(deadline.private_metadata["terminal_answer_f1"]) > 0.0
+                        else "deadline_zero"
+                    ] += 1
                 counters["recall"] += int(augmented)
                 if augmented:
                     recall_valid = recall_valid and _valid_recall_augmentation(updated)
 
                 for demo in variants:
+                    replay_errors = _runtime_replay_errors(demo)
+                    runtime_replay_valid = runtime_replay_valid and not replay_errors
+                    if replay_errors and len(runtime_replay_failures) < 20:
+                        runtime_replay_failures.append(
+                            {"demo_id": demo.demo_id, "errors": replay_errors}
+                        )
                     runtime_order_valid = (
                         runtime_order_valid
                         and _hypotheses_follow_runtime_order(demo)
@@ -586,8 +966,13 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
             "no_abstain_supervision_under_f1_objective": final_actions["Abstain"] == 0,
             "runtime_aligned_invalid_recovery_observations": invalid_masks_valid,
             "hypotheses_follow_runtime_creation_order": runtime_order_valid,
-            "stale_commit_recovery_is_supervised": (
-                invalid_recovery_kinds["stale_commit"] > 0
+            "rendered_ids_and_clock_match_runtime": rendered_runtime_identity_valid,
+            "all_teacher_actions_replay_in_live_graph": runtime_replay_valid,
+            "deadline_commit_supervision_present": (
+                source_demonstrations < 100 or counters["deadline"] > 0
+            ),
+            "stale_expanded_hypotheses_are_not_policy_visible": (
+                invalid_recovery_kinds["stale_commit"] == 0
             ),
             "question_disjoint_split": not train_questions.intersection(
                 validation_questions
@@ -609,13 +994,18 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
-        "quality_schema": "hyper_r1_v20_f1_control",
+        "quality_schema": "hyper_r1_v22_markov_terminal",
         "source": str(input_path),
         "source_contract": source_contract,
         "output": str(output),
         "source_demonstrations": source_demonstrations,
-        "output_demonstrations": source_demonstrations,
+        "output_demonstrations": source_demonstrations + counters["deadline"],
         "recall_augmented_demonstrations": counters["recall"],
+        "deadline_commit_demonstrations": counters["deadline"],
+        "deadline_commit_exact": counters["deadline_exact"],
+        "deadline_commit_partial": counters["deadline_partial"],
+        "deadline_commit_zero": counters["deadline_zero"],
+        "deadline_recalled_best": counters["deadline_recalled_best"],
         "masked_invalid_recovery_decisions": len(invalid_rows),
         "invalid_recovery_kinds": dict(sorted(invalid_recovery_kinds.items())),
         "rare_action_reference_count": rare_action_target,
@@ -625,6 +1015,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         "train_decisions": train_sink.count,
         "validation_decisions": validation_sink.count,
         "decision_consistency": consistency_report,
+        "runtime_replay_failures": runtime_replay_failures,
         "assertions": assertions,
     }
     report_path = output / "report.json"

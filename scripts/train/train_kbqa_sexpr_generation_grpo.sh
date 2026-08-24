@@ -195,6 +195,7 @@ rollout_is_veto_threshold=${rollout_is_veto_threshold:-null} # per-token veto (n
 
 max_turns=${max_turns:-6}
 max_prompt_length=${max_prompt_length:-14336}
+max_obs_length=${max_obs_length:-3072}
 # Reduce max_response_length to avoid GPU memory issues
 max_response_length=${max_response_length:-1024}
 actor_lr=${actor_lr:-1e-6}
@@ -330,7 +331,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.max_start_length=2048 \
-    data.max_obs_length=3072 \
+    data.max_obs_length=${max_obs_length} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \

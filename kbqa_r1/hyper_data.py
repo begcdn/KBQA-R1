@@ -4334,6 +4334,25 @@ def _has_valid_commit_certificate(
     step: DemonstrationStep,
     node: ExecutedHypothesis,
 ) -> bool:
+    if step.certificate_kind == "best_attainable_answer_f1":
+        if not demo.private_metadata.get("best_attainable_supervision"):
+            return False
+        visible = [
+            demo.hypotheses[node_id]
+            for node_id in step.visible_before
+            if node_id in demo.hypotheses and demo.hypotheses[node_id].denotation
+        ]
+        if not visible or not node.denotation:
+            return False
+        node_f1 = answer_set_f1(node.denotation, demo.gold_answers)
+        best_f1 = max(
+            answer_set_f1(candidate.denotation, demo.gold_answers)
+            for candidate in visible
+        )
+        return node_f1 == best_f1 and any(
+            evidence == f"answer_f1:{node_f1:.8f}"
+            for evidence in step.certificate_evidence
+        )
     valid_kind = step.certificate_kind == "answer_and_supported_query_equivalent"
     legacy_kind = (
         step.certificate_kind == "answer_and_intent_exact"
@@ -4619,11 +4638,20 @@ class DemonstrationValidator:
                 if node_id not in active or node is None:
                     errors.append(f"Commit targets inactive {node_id}")
                 else:
-                    if node.denotation != demo.gold_answers:
+                    best_attainable = (
+                        step.certificate_kind == "best_attainable_answer_f1"
+                        and demo.private_metadata.get("best_attainable_supervision")
+                    )
+                    if node.denotation != demo.gold_answers and not best_attainable:
                         errors.append(f"Commit {node_id} does not return gold answers")
                     if not _has_valid_commit_certificate(demo, step, node):
                         errors.append(
-                            f"Commit {node_id} lacks exact answer-and-intent proof"
+                            f"Commit {node_id} lacks "
+                            + (
+                                "a valid best-attainable certificate"
+                                if best_attainable
+                                else "exact answer-and-intent proof"
+                            )
                         )
                     committed = node_id
                 active = {node_id} if node is not None else set()
@@ -5014,6 +5042,7 @@ def _public_graph(
     executions: int = 0,
     known_ids: Optional[Sequence[str]] = None,
     parked_ids: Optional[Sequence[str]] = None,
+    turns_used: int = 0,
 ) -> str:
     known = set(known_ids or ())
     parked = set(parked_ids or ())
@@ -5049,6 +5078,8 @@ def _public_graph(
         execution_budget=int(
             demo.private_metadata.get("max_execution_attempts", 24)
         ),
+        turns_used=int(turns_used),
+        max_turns=int(demo.private_metadata.get("max_turns", 32)),
         count_completion_possible=public_question_contract(
             demo.question
         ).count_completion_possible,
@@ -5194,7 +5225,10 @@ def _action_text(step: DemonstrationStep) -> str:
                 else "This hypothesis has a verified public contradiction."
             ),
             "Commit": (
-                "This executable hypothesis has an exact answer and its logical "
+                "The deadline is here, so I will return the strongest executed "
+                "candidate currently available."
+                if step.certificate_kind == "best_attainable_answer_f1"
+                else "This executable hypothesis has an exact answer and its logical "
                 "program covers the complete question."
             ),
         }
@@ -5243,11 +5277,12 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                     executions=executions,
                     known_ids=known,
                     parked_ids=parked,
+                    turns_used=0,
                 )
                 + "\n</information>",
             }
         )
-    for step in demo.steps:
+    for step_index, step in enumerate(demo.steps):
         if set(active) != set(step.visible_before):
             raise ValueError(
                 f"trajectory {demo.demo_id} has inconsistent visible state before {step.action}"
@@ -5485,6 +5520,7 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
                         executions=executions,
                         known_ids=known,
                         parked_ids=parked,
+                        turns_used=step_index + 1,
                     ),
                     page_state,
                 ),
@@ -5494,7 +5530,11 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
     abstained = bool(demo.steps and demo.steps[-1].action == "Abstain")
     if committed is None and not abstained:
         raise ValueError(f"trajectory {demo.demo_id} has no terminal Commit or Abstain")
-    if committed is not None and committed.denotation != demo.gold_answers:
+    if (
+        committed is not None
+        and committed.denotation != demo.gold_answers
+        and not demo.private_metadata.get("best_attainable_supervision")
+    ):
         raise ValueError(f"trajectory {demo.demo_id} did not finish on verified answers")
     return {
         "messages": messages,
@@ -5512,11 +5552,13 @@ def trajectory_sft_record(demo: HyperDemonstration) -> Dict[str, Any]:
 
 
 def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
-    """Export one exact conversation prefix per graph decision.
+    """Export one Markov-complete state per graph decision.
 
-    The final answer-copy turn is deliberately excluded. This makes behavior
-    cloning optimize the policy actions that SFT is meant to install, while the
-    complete trajectory remains available for replay checks and inspection.
+    The latest observation already serializes every policy-actionable
+    hypothesis, exposed proposal, and the deadline. Repeating older snapshots
+    adds no available action and can push the question out of model context.
+    Keep the original question/instructions, latest state, and target action.
+    The complete trajectory remains available for replay checks and inspection.
     """
     trajectory = trajectory_sft_record(demo)
     records = []
@@ -5529,7 +5571,14 @@ def decision_sft_records(demo: HyperDemonstration) -> List[Dict[str, Any]]:
         step_index += 1
         if step.supervision != "policy_target":
             continue
-        prefix = [dict(item) for item in trajectory["messages"][: message_index + 1]]
+        prefix = [dict(trajectory["messages"][0])]
+        latest_state = trajectory["messages"][message_index - 1]
+        if message_index > 1 and latest_state.get("role") == "user":
+            # Runtime resets to the original prompt, whose generation header
+            # is closed by the observation suffix before the next user state.
+            prefix.append({"role": "assistant", "content": ""})
+            prefix.append(dict(latest_state))
+        prefix.append(dict(message))
         for prior in prefix:
             # Keep the nested Parquet field non-nullable. Pandas otherwise
             # promotes nullable integer masks to floats before VERL sees them.

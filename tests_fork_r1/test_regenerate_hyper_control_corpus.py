@@ -7,6 +7,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationStep,
     ExecutedHypothesis,
     HyperDemonstration,
+    decision_sft_records,
     trajectory_sft_record,
 )
 
@@ -128,6 +129,41 @@ def test_recalled_training_affordances_follow_runtime_creation_order():
     assert "Combine=[H0|H1]" in recalled
 
 
+def test_decision_records_keep_question_latest_state_and_target_only():
+    source = demo(
+        [
+            DemonstrationStep("Select", ("H0",), ("H0", "H1")),
+            DemonstrationStep(
+                "Commit",
+                ("H0",),
+                ("H0", "H1"),
+                certificate_kind="best_attainable_answer_f1",
+                certificate_evidence=("answer_f1:0.00000000",),
+            ),
+        ]
+    )
+    source = replace(
+        source,
+        private_metadata={
+            **source.private_metadata,
+            "best_attainable_supervision": True,
+        },
+    )
+
+    rows = decision_sft_records(source)
+
+    assert len(rows[0]["messages"]) == 4
+    assert len(rows[1]["messages"]) == 4
+    assert "Which value is correct?" in rows[1]["messages"][0]["content"]
+    assert rows[1]["messages"][1] == {
+        "role": "assistant",
+        "content": "",
+        "loss_mask": 0,
+    }
+    assert "Selected H0" in rows[1]["messages"][2]["content"]
+    assert "<action>Commit [ H0 ]</action>" in rows[1]["messages"][3]["content"]
+
+
 def test_saved_hypotheses_are_migrated_to_runtime_creation_order():
     source = HyperDemonstration(
         demo_id="inverted-inspection",
@@ -148,8 +184,108 @@ def test_saved_hypotheses_are_migrated_to_runtime_creation_order():
 
     migrated = MODULE._runtime_ordered_demo(source)
 
-    assert list(migrated.hypotheses) == ["H1", "H0"]
+    assert list(migrated.hypotheses) == ["H0", "H1"]
+    assert migrated.hypotheses["H0"].denotation == ("m.other",)
+    assert migrated.hypotheses["H1"].denotation == ("m.value",)
+    assert migrated.steps[0].created == ("H0",)
+    assert migrated.steps[1].visible_before == ("H0",)
+    assert migrated.steps[1].created == ("H1",)
+    assert migrated.steps[-1].arguments == ("H1",)
     assert MODULE._hypotheses_follow_runtime_order(migrated)
+
+
+def test_rendered_runtime_identity_rejects_sparse_node_ids():
+    row = {
+        "messages": [
+            {
+                "role": "user",
+                "content": """<information>
+<hypothesis_graph>
+active=1 capacity=24 stored=2 parked=0 execution_attempts=1/24 turns_used=2/32 turns_remaining=30 selected=none committed=none
+H6 [active] parents=ROOT operation=expand via=r depth=0 path=r answers=1: m.x
+</hypothesis_graph>
+</information>""",
+            }
+        ]
+    }
+
+    assert not MODULE._rendered_runtime_identity_is_valid(row)
+    row["messages"][0]["content"] = row["messages"][0]["content"].replace(
+        "H6", "H1"
+    )
+    assert MODULE._rendered_runtime_identity_is_valid(row)
+
+
+def test_deadline_variant_uses_only_available_executed_candidates():
+    source = HyperDemonstration(
+        demo_id="placeholder",
+        question_id="deadline",
+        question="Which value is correct?",
+        family="deadline",
+        hypotheses={
+            "H0": node("H0", ("m.partial",)),
+            "H1": node("H1", ("m.answer",)),
+        },
+        steps=[
+            DemonstrationStep("Inspect", ("P0",), (), ("H0",)),
+            DemonstrationStep("Inspect", ("P1",), ("H0",), ("H1",)),
+            DemonstrationStep("Select", ("H1",), ("H0", "H1")),
+            DemonstrationStep("Commit", ("H1",), ("H0", "H1")),
+        ],
+        gold_answers=("m.answer",),
+        private_metadata={"max_turns": 32},
+    )
+    variant = None
+    for index in range(10_000):
+        candidate = replace(source, demo_id=f"deadline-{index}")
+        variant = MODULE._deadline_variant(candidate)
+        if variant is not None:
+            break
+
+    assert variant is not None
+    assert variant.private_metadata["deadline_sampled_without_gold"]
+    assert variant.steps[-1].action == "Commit"
+    assert variant.steps[-1].arguments[0] in variant.steps[-1].visible_before
+    assert set(variant.hypotheses).issuperset(variant.steps[-1].visible_before)
+    assert variant.private_metadata["max_turns"] == len(variant.steps)
+
+
+def test_deadline_variant_recalls_the_best_parked_candidate_before_commit():
+    source = HyperDemonstration(
+        demo_id="placeholder",
+        question_id="deadline-parked",
+        question="Which value is correct?",
+        family="deadline",
+        hypotheses={
+            "H0": node("H0", ("m.partial",)),
+            "H1": node("H1", ("m.answer",)),
+        },
+        steps=[
+            DemonstrationStep("Inspect", ("P0",), (), ("H0",)),
+            DemonstrationStep("Inspect", ("P1",), ("H0",), ("H1",)),
+            DemonstrationStep("Park", ("H1",), ("H0", "H1")),
+            DemonstrationStep("Select", ("H0",), ("H0",)),
+            DemonstrationStep("Recall", ("H1",), ("H0",)),
+            DemonstrationStep("Commit", ("H1",), ("H0", "H1")),
+        ],
+        gold_answers=("m.answer",),
+        private_metadata={"max_turns": 32},
+    )
+    variant = None
+    for index in range(100_000):
+        candidate = replace(source, demo_id=f"deadline-parked-{index}")
+        possible = MODULE._deadline_variant(candidate)
+        if possible is not None and possible.private_metadata.get(
+            "deadline_recalled_best"
+        ):
+            variant = possible
+            break
+
+    assert variant is not None
+    assert [step.action for step in variant.steps[-2:]] == ["Recall", "Commit"]
+    assert variant.steps[-2].arguments == ("H1",)
+    assert variant.steps[-1].arguments == ("H1",)
+    assert variant.private_metadata["max_turns"] == len(variant.steps)
 
 
 def test_invalid_recovery_masks_the_bad_action_and_trains_only_valid_target():
@@ -185,15 +321,7 @@ def test_invalid_recovery_masks_the_bad_action_and_trains_only_valid_target():
     )
 
 
-def test_invalid_recovery_teaches_commit_of_current_node_after_stale_commit_failure():
-    previous = """<information>
-Selected H0. Further Find_relation actions now expand this hypothesis.
-<hypothesis_graph>
-active=1 capacity=24 stored=1 parked=0 execution_attempts=1/24 selected=H0 committed=none
-H0 [active] parents=ROOT operation=expand via=r.items depth=0 path=r.items answers=2: m.one, m.two
-Available targets: Select=[H0]; Park=[H0]; Commit(nonempty active)=[H0]; Combine=[none]; Prune candidates=[none]; Recall=[none]; Find_relation sources=[expression1].
-</hypothesis_graph>
-</information>"""
+def test_markov_record_does_not_expose_a_stale_commit_target():
     current = """<information>
 Executed the selected hypothesis operation.
 <hypothesis_graph>
@@ -205,12 +333,6 @@ Available targets: Select=[H1]; Park=[H1]; Commit(nonempty active)=[H1]; Combine
     row = {
         "messages": [
             {"role": "user", "content": "Question"},
-            {"role": "user", "content": previous, "loss_mask": 0},
-            {
-                "role": "assistant",
-                "content": "<action>Count [ expression1 ]</action>",
-                "loss_mask": 1,
-            },
             {"role": "user", "content": current, "loss_mask": 0},
             {
                 "role": "assistant",
@@ -221,21 +343,7 @@ Available targets: Select=[H1]; Park=[H1]; Commit(nonempty active)=[H1]; Combine
         "extra_info": {"question_id": "question"},
     }
 
-    recovered = MODULE._invalid_recovery_record(row, 0)
-
-    assert "<action>Commit [ H0 ]</action>" in recovered["messages"][-3]["content"]
-    assert recovered["messages"][-3]["loss_mask"] == 0
-    assert recovered["extra_info"]["invalid_recovery_kind"] == "stale_commit"
-    assert recovered["messages"][-2]["content"].startswith(
-        "<information>\nGraph action failed: hypothesis H0 is expanded, not active\n"
-        "<hypothesis_graph>"
-    )
-    assert "Executed the selected hypothesis operation." not in (
-        recovered["messages"][-2]["content"]
-    )
-    assert recovered["messages"][-1]["content"] == "<action>Commit [ H1 ]</action>"
-    assert recovered["messages"][-1]["loss_mask"] == 1
-    assert MODULE._valid_invalid_recovery(recovered)
+    assert MODULE._invalid_recovery_spec(row) is None
 
 
 def test_invalid_recovery_rejects_an_initial_prompt_without_environment_feedback():

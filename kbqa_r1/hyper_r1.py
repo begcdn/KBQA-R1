@@ -126,6 +126,10 @@ class HypothesisGraphState:
     execution_attempts: int = 0
     execution_calls: int = 0
     next_node_index: int = 0
+    turns_used: int = 0
+    max_turns: Optional[int] = None
+    last_preferred_nonempty_id: Optional[str] = None
+    terminal_kind: Optional[str] = None
     question_contract: Optional["PublicQuestionContract"] = None
     prune_certificates: Dict[str, "PruneCertificate"] = field(default_factory=dict)
 
@@ -339,7 +343,11 @@ def proposal_action_targets(
         and execution_attempts < execution_budget
     )
     inspect = tuple(str(value) for value in visible_ids) if can_inspect else ()
-    widen = str(source) if selected_id is None and exposed < total else None
+    widen = (
+        str(source)
+        if can_inspect and selected_id is None and exposed < total
+        else None
+    )
     return inspect, widen
 
 
@@ -355,6 +363,8 @@ def serialize_frontier(
     max_nodes: Optional[int] = None,
     parked_nodes: Sequence[Mapping[str, Any]] = (),
     execution_budget: Optional[int] = None,
+    turns_used: Optional[int] = None,
+    max_turns: Optional[int] = None,
     count_completion_possible: bool = True,
     candidate_sources: Sequence[str] = (),
     max_answers: int = 4,
@@ -368,6 +378,12 @@ def serialize_frontier(
         f"active={len(active)} capacity={max_active} stored={node_count} "
         f"parked={len(parked_nodes)} execution_attempts={execution_calls}"
         + (f"/{execution_budget}" if execution_budget is not None else "")
+        + (
+            f" turns_used={turns_used}/{max_turns} "
+            f"turns_remaining={max(0, max_turns - turns_used)}"
+            if turns_used is not None and max_turns is not None
+            else ""
+        )
         + f" selected={selected_id or 'none'} "
         f"committed={committed_id or 'none'}",
     ]
@@ -433,6 +449,8 @@ def serialize_frontier(
         ).strip()
         relation_sources = [selected_target] if selected_target else []
     if committed_id is not None:
+        relation_sources = []
+    if not has_node_capacity or not has_execution_budget:
         relation_sources = []
     show = lambda values: ",".join(values) if values else "none"
     lines.append(
@@ -600,6 +618,14 @@ class HypothesisGraph:
         contract = public_question_contract(question)
         self.state(sample_id).question_contract = contract
         return contract
+
+    def set_clock(self, sample_id: int, *, turns_used: int, max_turns: int) -> None:
+        """Expose the same deadline state to the policy and decision logger."""
+        if max_turns < 1 or turns_used < 0 or turns_used > max_turns:
+            raise ValueError("invalid HyPER-R1 turn clock")
+        graph = self.state(sample_id)
+        graph.turns_used = int(turns_used)
+        graph.max_turns = int(max_turns)
 
     def count_completion_possible(self, sample_id: int) -> bool:
         contract = self.state(sample_id).question_contract
@@ -772,12 +798,18 @@ class HypothesisGraph:
         graph = self.state(sample_id)
         if graph.committed_id is not None:
             raise ValueError("the hypothesis graph is already committed")
+        if graph.selected_id == node_id:
+            raise ValueError(
+                f"hypothesis {node_id} is already selected; choose a progress action"
+            )
         node = self.require_active(sample_id, node_id)
         if not node.denotation and not self.count_completion_possible(sample_id):
             raise ValueError(
                 "cannot select an empty hypothesis when the public question has no Count obligation"
             )
         graph.selected_id = node_id
+        if node.denotation:
+            graph.last_preferred_nonempty_id = node_id
         return node
 
     def selected_node(self, sample_id: int) -> Optional[HypothesisNode]:
@@ -817,6 +849,20 @@ class HypothesisGraph:
             return "No active hypothesis can be continued."
         if not graph.nodes and not opens_frontier and not opens_new_root:
             return "Begin the executable frontier with Find_relation."
+        if not self.has_execution_budget(sample_id) and (
+            opens_frontier or operation_name in {"widen", "inspect"}
+        ):
+            return (
+                "The execution budget is exhausted. Exploration is closed; "
+                "Select or recall a supported nonempty hypothesis and Commit it."
+            )
+        if not self.has_capacity(sample_id) and (
+            opens_frontier or operation_name in {"widen", "inspect"}
+        ):
+            return (
+                "The persistent hypothesis store is exhausted. Exploration is "
+                "closed; Select or recall a supported nonempty hypothesis and Commit it."
+            )
         # Opening or widening a proposal catalog is symbolic and consumes no
         # hypothesis or execution capacity. Only Inspect is budgeted.
         if not opens_frontier:
@@ -948,7 +994,57 @@ class HypothesisGraph:
         node.status = HypothesisStatus.COMMITTED
         graph.selected_id = None
         graph.committed_id = node_id
+        graph.last_preferred_nonempty_id = node_id
+        graph.terminal_kind = "explicit_commit"
         return node
+
+    def force_terminal(self, sample_id: int) -> Optional[HypothesisNode]:
+        """End a rollout on an oracle-free public candidate, or the empty set.
+
+        The environment honors the policy's latest explicit preference first.
+        Recency is only a deterministic safety fallback; no gold answer or gold
+        program participates in this choice.
+        """
+        graph = self.state(sample_id)
+        if graph.terminal_kind is not None:
+            return self.committed_node(sample_id)
+
+        ordered_ids: List[str] = []
+        for node_id in (graph.selected_id, graph.last_preferred_nonempty_id):
+            if node_id and node_id not in ordered_ids:
+                ordered_ids.append(node_id)
+        for statuses in (
+            {HypothesisStatus.ACTIVE},
+            {HypothesisStatus.PARKED},
+        ):
+            for node in reversed(list(graph.nodes.values())):
+                if (
+                    node.node_id not in ordered_ids
+                    and node.status in statuses
+                    and node.denotation
+                ):
+                    ordered_ids.append(node.node_id)
+
+        chosen = next(
+            (graph.nodes[node_id] for node_id in ordered_ids if graph.nodes[node_id].denotation),
+            None,
+        )
+        for node in graph.nodes.values():
+            if chosen is not None and node.node_id == chosen.node_id:
+                node.status = HypothesisStatus.COMMITTED
+                node.provenance.append("forced_terminal_candidate")
+            elif node.status in {HypothesisStatus.ACTIVE, HypothesisStatus.PARKED}:
+                node.status = HypothesisStatus.CLOSED
+                node.provenance.append("closed_by_forced_terminal")
+        graph.selected_id = None
+        graph.committed_id = chosen.node_id if chosen is not None else None
+        graph.terminal_kind = (
+            "forced_candidate" if chosen is not None else "forced_empty"
+        )
+        return chosen
+
+    def is_terminal(self, sample_id: int) -> bool:
+        return self.state(sample_id).terminal_kind is not None
 
     def abstain(self, sample_id: int) -> None:
         self.state(sample_id)
@@ -1083,6 +1179,8 @@ class HypothesisGraph:
             max_nodes=self.max_nodes,
             parked_nodes=[node.__dict__ for node in self.parked_nodes(sample_id)],
             execution_budget=self.max_execution_attempts,
+            turns_used=graph.turns_used,
+            max_turns=graph.max_turns,
             count_completion_possible=self.count_completion_possible(sample_id),
             candidate_sources=candidate_sources,
             max_answers=max_answers,
@@ -1095,6 +1193,10 @@ class HypothesisGraph:
             "selected_id": graph.selected_id,
             "committed_id": graph.committed_id,
             "abstained": graph.abstained,
+            "terminal_kind": graph.terminal_kind,
+            "turns_used": graph.turns_used,
+            "max_turns": graph.max_turns,
+            "last_preferred_nonempty_id": graph.last_preferred_nonempty_id,
             "max_active": self.max_active,
             "max_nodes": self.max_nodes,
             "max_execution_attempts": self.max_execution_attempts,
@@ -1145,6 +1247,7 @@ def apply_grouped_decision_credit(
     group_ids: Sequence[str],
     action_records: Sequence[Sequence[Mapping[str, Any]]],
     weight: float = 1.0,
+    eligible_rollouts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Credit actions only when sibling rollouts tried a different decision.
 
@@ -1159,9 +1262,18 @@ def apply_grouped_decision_credit(
         raise ValueError("terminal_rewards must contain one value per rollout")
     if len(group_ids) != advantages.shape[0] or len(action_records) != advantages.shape[0]:
         raise ValueError("group ids and records must align with rollouts")
+    if eligible_rollouts is None:
+        eligible_rollouts = torch.ones(
+            advantages.shape[0], dtype=torch.bool, device=advantages.device
+        )
+    if eligible_rollouts.ndim != 1 or eligible_rollouts.shape[0] != advantages.shape[0]:
+        raise ValueError("eligible_rollouts must contain one value per rollout")
+    eligible_rollouts = eligible_rollouts.to(dtype=torch.bool)
 
     outcomes: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
     for row, records in enumerate(action_records):
+        if not bool(eligible_rollouts[row]):
+            continue
         reward = float(terminal_rewards[row].item())
         for record in records:
             key = (str(group_ids[row]), str(record["state_key"]))
@@ -1170,6 +1282,8 @@ def apply_grouped_decision_credit(
     result = advantages.clone()
     compared = torch.zeros_like(action_ids, dtype=torch.float32)
     for row, records in enumerate(action_records):
+        if not bool(eligible_rollouts[row]):
+            continue
         reward = float(terminal_rewards[row].item())
         for fallback_index, record in enumerate(records, 1):
             action_index = int(record.get("action_index", fallback_index))
@@ -1214,12 +1328,12 @@ def enforce_commit_reward(
     commit_intent_equivalent: Optional[torch.Tensor] = None,
     abstained: Optional[torch.Tensor] = None,
     invalid_penalty: float = 0.25,
-    semantic_bonus: float = 0.1,
+    semantic_bonus: float = 0.0,
 ) -> torch.Tensor:
-    """Reward answer quality without vetoing alternative executable programs.
+    """Use benchmark answer F1 as the terminal task reward.
 
-    Formal gold-program equivalence is a one-sided auxiliary signal: proving it
-    earns a bonus, while failure to prove it never removes answer reward.
+    Formal equivalence is retained as a diagnostic metric. It must not reorder
+    two outcomes under an answer-F1 objective.
     """
     if token_rewards.shape != response_mask.shape:
         raise ValueError("token_rewards and response_mask must have the same shape")
@@ -1247,8 +1361,7 @@ def enforce_commit_reward(
     legal_commit = commit_protocol_valid.to(dtype=torch.bool)
     invalid = ~legal_commit
     answer_f1 = commit_answer_f1.to(dtype=result.dtype).clamp(0.0, 1.0)
-    intent = commit_intent_equivalent.to(dtype=result.dtype)
-    terminal_reward = answer_f1 + float(semantic_bonus) * intent
+    terminal_reward = answer_f1
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows[legal_commit], lengths[legal_commit]] = terminal_reward[legal_commit]
@@ -1264,7 +1377,7 @@ def charge_execution_budget(
     cost: float,
     group_ids: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
-    """Charge only executions beyond the cheapest sibling rollout."""
+    """Break equal-F1 ties by efficiency without reversing F1 ordering."""
     if token_rewards.shape != response_mask.shape:
         raise ValueError("token_rewards and response_mask must have the same shape")
     if execution_counts.ndim != 1 or execution_counts.shape[0] != token_rewards.shape[0]:
@@ -1273,16 +1386,24 @@ def charge_execution_budget(
         raise ValueError("max_execution_attempts must be positive")
     result = token_rewards.clone()
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
+    if group_ids is None or float(cost) == 0.0:
+        return result
     baseline = torch.zeros_like(execution_counts)
+    terminal_values = token_rewards.sum(dim=-1)
+    if len(group_ids) != execution_counts.shape[0]:
+        raise ValueError("group_ids must align with rollouts")
     if group_ids is not None:
-        if len(group_ids) != execution_counts.shape[0]:
-            raise ValueError("group_ids must align with rollouts")
-        minima: Dict[str, float] = {}
-        for group_id, count in zip(group_ids, execution_counts.tolist()):
-            key = str(group_id)
+        minima: Dict[Tuple[str, float], float] = {}
+        for group_id, reward, count in zip(
+            group_ids, terminal_values.tolist(), execution_counts.tolist()
+        ):
+            key = (str(group_id), float(reward))
             minima[key] = min(minima.get(key, float("inf")), float(count))
         baseline = torch.tensor(
-            [minima[str(group_id)] for group_id in group_ids],
+            [
+                minima[(str(group_id), float(reward))]
+                for group_id, reward in zip(group_ids, terminal_values.tolist())
+            ],
             device=execution_counts.device,
             dtype=execution_counts.dtype,
         )
@@ -1292,6 +1413,24 @@ def charge_execution_budget(
         * excess.to(result.dtype)
         / float(max_execution_attempts)
     )
+    if group_ids is not None:
+        grouped_rewards: Dict[str, List[float]] = {}
+        for group_id, reward in zip(group_ids, terminal_values.tolist()):
+            grouped_rewards.setdefault(str(group_id), []).append(float(reward))
+        caps = []
+        for group_id, reward in zip(group_ids, terminal_values.tolist()):
+            lower = [
+                value
+                for value in grouped_rewards[str(group_id)]
+                if value < float(reward)
+            ]
+            caps.append(
+                float("inf") if not lower else (float(reward) - max(lower)) / 2.0
+            )
+        penalties = torch.minimum(
+            penalties,
+            torch.tensor(caps, device=result.device, dtype=result.dtype),
+        )
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows, lengths] -= penalties
     return result

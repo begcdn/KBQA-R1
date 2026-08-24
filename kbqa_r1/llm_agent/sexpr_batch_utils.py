@@ -122,6 +122,32 @@ class SExprBatchUtils:
             result.meta_info.update(truncation_info)
         
         return result
+
+    def replace_with_latest_state(
+        self,
+        initial_input_ids: torch.Tensor,
+        next_obs_ids: torch.Tensor,
+    ) -> DataProto:
+        """Build the next HyPER prompt from the question and latest policy state."""
+        new_input_ids = self.tensor_fn.concatenate_with_padding(
+            [initial_input_ids, next_obs_ids]
+        )
+        attention_mask = self.tensor_fn.create_attention_mask(new_input_ids)
+        effective_lengths = attention_mask.sum(dim=1)
+        if bool((effective_lengths > self.config.max_prompt_length).any()):
+            raise RuntimeError(
+                "HyPER-R1 question plus latest graph state exceeds "
+                "max_prompt_length; refusing to discard policy-visible state"
+            )
+        position_ids = self.tensor_fn.create_position_ids(attention_mask)
+        effective_len = int(effective_lengths.max().item())
+        return DataProto.from_dict(
+            {
+                "input_ids": new_input_ids[:, -effective_len:],
+                "position_ids": position_ids[:, -effective_len:],
+                "attention_mask": attention_mask[:, -effective_len:],
+            }
+        )
     
     def record_final_truncation_info(self, rollings, meta_info: Dict, batch_size: int):
         """
