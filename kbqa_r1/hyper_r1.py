@@ -670,7 +670,10 @@ class HypothesisGraph:
 
         node_id = f"H{graph.next_node_index}"
         graph.next_node_index += 1
-        parent_depth = graph.nodes[parent_id].depth if parent_id is not None else -1
+        parent_depth = max(
+            (graph.nodes[value].depth for value in all_parent_ids),
+            default=-1,
+        )
         node = HypothesisNode(
             node_id=node_id,
             sample_id=sample_id,

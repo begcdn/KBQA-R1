@@ -615,6 +615,17 @@ def test_builds_replayable_certified_empty_recovery():
     assert "Available targets: Select=" in graph_observations[0]
     assert "H3" not in graph_observations[0]
 
+    initial_nodes = list(demo.steps[0].visible_before)
+    created_nodes = [
+        node_id
+        for step in demo.steps
+        for node_id in step.created
+        if node_id not in initial_nodes
+    ]
+    expected_runtime_order = list(dict.fromkeys([*initial_nodes, *created_nodes]))
+    assert list(demo.hypotheses) == expected_runtime_order
+    assert expected_runtime_order.index("H6") < expected_runtime_order.index("H5")
+
     assert len(demos) == 1
     assert builder.stats["recovery_probe_natural_frontier"] == 1
     assert builder.stats["recovery_probe_visible_empty"] == 1

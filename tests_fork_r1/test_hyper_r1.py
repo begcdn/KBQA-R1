@@ -409,6 +409,35 @@ def test_combine_node_retains_both_parent_edges():
     assert f"parents={left.node_id}+{right.node_id} operation=combine" in graph.serialize(0)
 
 
+def test_combine_depth_follows_the_deepest_parent():
+    graph = HypothesisGraph(max_active=6)
+    shallow = add(graph, "r.shallow", ["m.shared"])
+    deep_root = add(graph, "r.deep_root", ["m.middle"])
+    deep = graph.add_executed(
+        sample_id=0,
+        function_state=("expression2 = JOIN('r.deep', expression2)",),
+        target_expression="expression2",
+        sexpr="(JOIN r.deep m.root)",
+        denotation=["m.shared"],
+        parent_id=deep_root.node_id,
+        operation="expand",
+    )
+    combined = graph.add_executed(
+        sample_id=0,
+        function_state=("expression3 = AND(expression1, expression2)",),
+        target_expression="expression3",
+        sexpr="(AND shallow deep)",
+        denotation=["m.shared"],
+        parent_id=shallow.node_id,
+        parent_ids=(shallow.node_id, deep.node_id),
+        operation="combine",
+    )
+
+    assert shallow.depth == 0
+    assert deep.depth == 1
+    assert combined.depth == 2
+
+
 def test_combine_validation_is_atomic():
     graph = HypothesisGraph(max_active=3)
     left = add(graph, "r.left", ["m.left"])

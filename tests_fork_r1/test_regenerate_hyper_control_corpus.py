@@ -128,6 +128,30 @@ def test_recalled_training_affordances_follow_runtime_creation_order():
     assert "Combine=[H0|H1]" in recalled
 
 
+def test_saved_hypotheses_are_migrated_to_runtime_creation_order():
+    source = HyperDemonstration(
+        demo_id="inverted-inspection",
+        question_id="inverted-inspection",
+        question="Which value is correct?",
+        family="recovery",
+        hypotheses={
+            "H0": node("H0"),
+            "H1": node("H1", ("m.other",)),
+        },
+        steps=[
+            DemonstrationStep("Inspect", ("P1",), (), ("H1",)),
+            DemonstrationStep("Inspect", ("P0",), ("H1",), ("H0",)),
+            DemonstrationStep("Commit", ("H0",), ("H1", "H0")),
+        ],
+        gold_answers=("m.answer",),
+    )
+
+    migrated = MODULE._runtime_ordered_demo(source)
+
+    assert list(migrated.hypotheses) == ["H1", "H0"]
+    assert MODULE._hypotheses_follow_runtime_order(migrated)
+
+
 def test_abstain_example_requires_prior_execution_and_no_complete_hypothesis():
     source = demo(
         [
@@ -164,6 +188,43 @@ def test_abstain_examples_span_later_exhaustion_states_instead_of_always_one_ste
     }
 
     assert budgets == {1, 2}
+
+
+def test_abstain_is_not_taught_when_a_complete_parked_hypothesis_can_be_recalled():
+    source = HyperDemonstration(
+        demo_id="parked-gold",
+        question_id="parked-gold",
+        question="Which value is correct?",
+        family="recovery",
+        hypotheses={
+            "H0": node("H0", ("m.answer",)),
+            "H1": node("H1", ("m.other",)),
+        },
+        steps=[
+            DemonstrationStep("Inspect", ("P0",), (), ("H0",)),
+            DemonstrationStep("Park", ("H0",), ("H0",)),
+            DemonstrationStep("Inspect", ("P1",), (), ("H1",)),
+        ],
+        gold_answers=("m.answer",),
+        private_metadata={"max_turns": 12},
+    )
+
+    assert MODULE._budget_abstain_demo(source) is None
+
+    invalid = replace(
+        source,
+        steps=[
+            *source.steps[:2],
+            DemonstrationStep("Abstain", (), ()),
+        ],
+        private_metadata={
+            "max_turns": 3,
+            "max_execution_attempts": 1,
+            "execution_attempts": 1,
+            "verified_abstain_reason": "execution_budget_exhausted",
+        },
+    )
+    assert not MODULE._valid_budget_abstain(invalid)
 
 
 def test_invalid_recovery_masks_the_bad_action_and_trains_only_valid_target():

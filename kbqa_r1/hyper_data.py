@@ -1665,12 +1665,27 @@ class DemonstrationBuilder:
 
         if not steps or steps[-1].action not in {"Commit", "Abstain"}:
             return None
+        creation_order = []
+        seen_nodes = set()
+        if steps:
+            for node_id in steps[0].visible_before:
+                if node_id in known and node_id not in seen_nodes:
+                    creation_order.append(node_id)
+                    seen_nodes.add(node_id)
+        for step in steps:
+            for node_id in step.created:
+                if node_id in known and node_id not in seen_nodes:
+                    creation_order.append(node_id)
+                    seen_nodes.add(node_id)
+        creation_order.extend(
+            node_id
+            for node_id in demo.hypotheses
+            if node_id in known and node_id not in seen_nodes
+        )
         demo.steps = steps
         demo.proposals = proposals
         demo.hypotheses = {
-            node_id: node
-            for node_id, node in demo.hypotheses.items()
-            if node_id in known
+            node_id: demo.hypotheses[node_id] for node_id in creation_order
         }
         demo.private_metadata["runtime_protocol"] = "lazy_relation_inspection_v1"
         demo.private_metadata["execution_attempts"] = execution_attempts

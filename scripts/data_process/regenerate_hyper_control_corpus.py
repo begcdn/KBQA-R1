@@ -88,6 +88,37 @@ def _iter_demos(path: Path) -> Iterator[HyperDemonstration]:
                 yield _load_demo(json.loads(line))
 
 
+def _runtime_ordered_demo(demo: HyperDemonstration) -> HyperDemonstration:
+    """Store nodes in the order the live graph creates them."""
+    known = set(demo.hypotheses)
+    order: list[str] = []
+    seen: set[str] = set()
+    if demo.steps:
+        for node_id in demo.steps[0].visible_before:
+            if node_id in known and node_id not in seen:
+                order.append(node_id)
+                seen.add(node_id)
+    for step in demo.steps:
+        for node_id in step.created:
+            if node_id in known and node_id not in seen:
+                order.append(node_id)
+                seen.add(node_id)
+    for node_id in demo.hypotheses:
+        if node_id not in seen:
+            order.append(node_id)
+            seen.add(node_id)
+    if order == list(demo.hypotheses):
+        return demo
+    return replace(
+        demo,
+        hypotheses={node_id: demo.hypotheses[node_id] for node_id in order},
+    )
+
+
+def _hypotheses_follow_runtime_order(demo: HyperDemonstration) -> bool:
+    return list(_runtime_ordered_demo(demo).hypotheses) == list(demo.hypotheses)
+
+
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -170,16 +201,25 @@ def _budget_abstain_demo(
 ) -> HyperDemonstration | None:
     """Create a terminal state where the next required Inspect is unaffordable."""
     executions = 0
+    parked: set[str] = set()
     eligible: list[tuple[int, int]] = []
     for index, step in enumerate(demo.steps):
         if step.action == "Inspect" and executions > 0:
             complete = any(
                 demo.hypotheses[node_id].denotation == demo.gold_answers
-                for node_id in step.visible_before
+                for node_id in (*step.visible_before, *parked)
                 if node_id in demo.hypotheses
             )
             if not complete:
                 eligible.append((index, executions))
+        if step.action == "Park":
+            parked.add(step.arguments[0])
+        elif step.action == "Recall":
+            parked.discard(step.arguments[0])
+        elif step.action in {"Prune", "Commit"}:
+            parked.discard(step.arguments[0])
+        elif step.action == "Abstain":
+            parked.clear()
         executions += int(step.action in _EXECUTING_ACTIONS)
     if not eligible:
         return None
@@ -508,10 +548,20 @@ def _valid_budget_abstain(demo: HyperDemonstration) -> bool:
     if not demo.steps or demo.steps[-1].action != "Abstain":
         return False
     executions = sum(step.action in _EXECUTING_ACTIONS for step in demo.steps[:-1])
+    parked = set()
+    for step in demo.steps[:-1]:
+        if step.action == "Park":
+            parked.add(step.arguments[0])
+        elif step.action == "Recall":
+            parked.discard(step.arguments[0])
+        elif step.action in {"Prune", "Commit"}:
+            parked.discard(step.arguments[0])
+        elif step.action == "Abstain":
+            parked.clear()
     visible = demo.steps[-1].visible_before
-    complete_visible = any(
+    complete_available = any(
         demo.hypotheses[node_id].denotation == demo.gold_answers
-        for node_id in visible
+        for node_id in (*visible, *parked)
         if node_id in demo.hypotheses
     )
     return (
@@ -519,7 +569,7 @@ def _valid_budget_abstain(demo: HyperDemonstration) -> bool:
         and int(demo.private_metadata.get("max_execution_attempts", -1)) == executions
         and demo.private_metadata.get("verified_abstain_reason")
         == "execution_budget_exhausted"
-        and not complete_visible
+        and not complete_available
     )
 
 
@@ -573,6 +623,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     counters: Counter = Counter()
     recall_valid = True
     abstain_valid = True
+    runtime_order_valid = True
     abstain_execution_budgets: Counter = Counter()
 
     def write_decision(row: dict, *, collect_recovery: bool) -> None:
@@ -591,6 +642,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
     try:
         with demo_temporary.open("w", encoding="utf-8") as demo_handle:
             for source_demo in _iter_demos(input_path):
+                source_demo = _runtime_ordered_demo(source_demo)
                 updated, augmented = _augment_recall(source_demo)
                 variants = [updated]
                 counters["recall"] += int(augmented)
@@ -611,6 +663,10 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
                         abstain_valid = abstain_valid and _valid_budget_abstain(candidate)
 
                 for demo in variants:
+                    runtime_order_valid = (
+                        runtime_order_valid
+                        and _hypotheses_follow_runtime_order(demo)
+                    )
                     split = _question_split(demo.question_id)
                     (train_questions if split == "train" else validation_questions).add(
                         demo.question_id
@@ -651,10 +707,12 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
             "invalid_actions_have_zero_loss": invalid_masks_valid,
             "recall_restores_a_parked_executable_hypothesis": recall_valid,
             "abstain_requires_exhausted_execution_budget": abstain_valid,
+            "no_abstain_with_recallable_complete_hypothesis": abstain_valid,
             "abstain_prefixes_span_multiple_execution_budgets": (
                 len(abstain_execution_budgets) > 1
             ),
             "runtime_aligned_invalid_recovery_observations": invalid_masks_valid,
+            "hypotheses_follow_runtime_creation_order": runtime_order_valid,
             "stale_commit_recovery_is_supervised": (
                 invalid_recovery_kinds["stale_commit"] > 0
             ),
@@ -678,7 +736,7 @@ def _regenerate_unlocked(input_path: Path, output: Path) -> dict:
         raise
 
     report = {
-        "quality_schema": "hyper_r1_v18_runtime_aligned_control",
+        "quality_schema": "hyper_r1_v19_runtime_exact_control",
         "source": str(input_path),
         "source_contract": source_contract,
         "output": str(output),
