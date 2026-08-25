@@ -239,6 +239,7 @@ def evaluate_checkpoint(
     rows: Sequence[Mapping[str, Any]],
     *,
     tokenizer_path: Optional[Path],
+    base_model_path: Optional[Path],
     batch_size: int,
     max_new_tokens: int,
     device: str,
@@ -253,11 +254,26 @@ def evaluate_checkpoint(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        local_files_only=True,
-        torch_dtype=dtype,
-    ).to(device)
+    adapter_config = model_dir / "adapter_config.json"
+    if adapter_config.is_file():
+        from peft import PeftConfig, PeftModel
+
+        peft_config = PeftConfig.from_pretrained(model_dir, local_files_only=True)
+        base_source = base_model_path or Path(peft_config.base_model_name_or_path)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_source,
+            local_files_only=True,
+            torch_dtype=dtype,
+        )
+        model = PeftModel.from_pretrained(
+            base_model, model_dir, local_files_only=True
+        ).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            local_files_only=True,
+            torch_dtype=dtype,
+        ).to(device)
     model.eval()
 
     predictions: List[Dict[str, Any]] = []
@@ -361,6 +377,7 @@ def main() -> None:
     parser.add_argument("--checkpoints", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path)
+    parser.add_argument("--base-model", type=Path)
     parser.add_argument("--samples-per-data", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -378,6 +395,7 @@ def main() -> None:
                 checkpoint,
                 rows,
                 tokenizer_path=args.tokenizer,
+                base_model_path=args.base_model,
                 batch_size=args.batch_size,
                 max_new_tokens=args.max_new_tokens,
                 device=args.device,

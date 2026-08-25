@@ -312,54 +312,74 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 hf_local_path = os.path.join(local_path, "huggingface")
                 os.makedirs(hf_local_path, exist_ok=True)
 
-                if "ForTokenClassification" in model_config.architectures[0]:
-                    from transformers import AutoModelForTokenClassification
+                if hasattr(unwrap_model, "peft_config"):
+                    from peft.utils.save_and_load import get_peft_model_state_dict
 
-                    auto_model_cls = AutoModelForTokenClassification
-                elif "ForCausalLM" in model_config.architectures[0]:
-                    from transformers import AutoModelForCausalLM
-
-                    auto_model_cls = AutoModelForCausalLM
-                elif "ForConditionalGeneration" in model_config.architectures[0]:
-                    # Handle different transformers versions for Vision2Seq models
-                    import transformers
-                    from packaging import version
-
-                    if version.parse(transformers.__version__) >= version.parse("4.54.0"):
-                        # transformers >= 4.54.0 uses AutoModelForImageTextToText
-                        from transformers import AutoModelForImageTextToText
-
-                        auto_model_cls = AutoModelForImageTextToText
-                    else:
-                        # transformers < 4.54.0 uses AutoModelForVision2Seq
-                        from transformers import AutoModelForVision2Seq
-
-                        auto_model_cls = AutoModelForVision2Seq
+                    adapter_state_dict = get_peft_model_state_dict(
+                        unwrap_model, state_dict=state_dict
+                    )
+                    unwrap_model.save_pretrained(
+                        hf_local_path,
+                        state_dict=adapter_state_dict,
+                        safe_serialization=True,
+                    )
+                    log_with_rank(
+                        f"Saved LoRA adapter to {os.path.abspath(hf_local_path)}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                    del adapter_state_dict
+                    del state_dict
                 else:
-                    raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
+                    if "ForTokenClassification" in model_config.architectures[0]:
+                        from transformers import AutoModelForTokenClassification
 
-                with init_empty_weights():
-                    save_model = auto_model_cls.from_config(model_config, torch_dtype=torch.bfloat16)
-                save_model.to_empty(device="cpu")
+                        auto_model_cls = AutoModelForTokenClassification
+                    elif "ForCausalLM" in model_config.architectures[0]:
+                        from transformers import AutoModelForCausalLM
 
-                if save_model.can_generate():
-                    if generation_config is not None:
-                        save_model.generation_config = generation_config
+                        auto_model_cls = AutoModelForCausalLM
+                    elif "ForConditionalGeneration" in model_config.architectures[0]:
+                        # Handle different transformers versions for Vision2Seq models
+                        import transformers
+                        from packaging import version
+
+                        if version.parse(transformers.__version__) >= version.parse("4.54.0"):
+                            # transformers >= 4.54.0 uses AutoModelForImageTextToText
+                            from transformers import AutoModelForImageTextToText
+
+                            auto_model_cls = AutoModelForImageTextToText
+                        else:
+                            # transformers < 4.54.0 uses AutoModelForVision2Seq
+                            from transformers import AutoModelForVision2Seq
+
+                            auto_model_cls = AutoModelForVision2Seq
                     else:
-                        print(
-                            f"Warning: {self.__class__.__name__}.save_checkpoint: Generation config file not found "
-                            f"in, using a generation config created from the model config when saving hf_model."
-                        )
+                        raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
 
-                save_model.save_pretrained(hf_local_path, state_dict=state_dict)
-                log_with_rank(
-                    f"Saved hf_model to {os.path.abspath(hf_local_path)}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
-                del state_dict
-                del save_model
+                    with init_empty_weights():
+                        save_model = auto_model_cls.from_config(model_config, torch_dtype=torch.bfloat16)
+                    save_model.to_empty(device="cpu")
+
+                    if save_model.can_generate():
+                        if generation_config is not None:
+                            save_model.generation_config = generation_config
+                        else:
+                            print(
+                                f"Warning: {self.__class__.__name__}.save_checkpoint: Generation config file not found "
+                                f"in, using a generation config created from the model config when saving hf_model."
+                            )
+
+                    save_model.save_pretrained(hf_local_path, state_dict=state_dict)
+                    log_with_rank(
+                        f"Saved hf_model to {os.path.abspath(hf_local_path)}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                    del state_dict
+                    del save_model
 
             # wait for rank0 to dump hf_model to local
             torch.distributed.barrier()

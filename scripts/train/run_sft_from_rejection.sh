@@ -39,6 +39,8 @@ SFT_MAX_LENGTH=${SFT_MAX_LENGTH:-32768}
 SFT_TRUNCATION=${SFT_TRUNCATION:-error}
 MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-${SFT_MAX_LENGTH}}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-4}
+LORA_RANK=${LORA_RANK:-0}
+LORA_ALPHA=${LORA_ALPHA:-16}
 
 # -----------------------------
 # GPU detection and config
@@ -131,6 +133,7 @@ echo "Save frequency: ${SAVE_FREQ}"
 echo "Sequence limit: ${SFT_MAX_LENGTH} (${SFT_TRUNCATION})"
 echo "Micro batch   : ${MICRO_BATCH_SIZE_PER_GPU}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
+echo "LoRA           : rank=${LORA_RANK} alpha=${LORA_ALPHA}"
 echo "========================================"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -187,6 +190,8 @@ if [[ "${TRAINER}" == "engine" ]]; then
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.path="${BASE_MODEL}" \
+    model.lora_rank=${LORA_RANK} \
+    model.lora_alpha=${LORA_ALPHA} \
     model.enable_gradient_checkpointing=true \
     model.use_remove_padding=true \
   trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
@@ -216,6 +221,8 @@ else
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.partial_pretrain="${BASE_MODEL}" \
+    model.lora_rank=${LORA_RANK} \
+    model.lora_alpha=${LORA_ALPHA} \
     model.enable_gradient_checkpointing=true \
     use_remove_padding=true \
     trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \

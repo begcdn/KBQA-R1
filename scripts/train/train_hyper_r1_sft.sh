@@ -20,7 +20,7 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 schema = report.get("quality_schema")
-if schema == "hyper_r1_v20_f1_control":
+if schema == "hyper_r1_v23_runtime_comparison":
     assertions = report.get("assertions", {})
     failed_assertions = [name for name, passed in assertions.items() if not passed]
     contradictions = report.get("decision_consistency", {}).get(
@@ -28,7 +28,7 @@ if schema == "hyper_r1_v20_f1_control":
     )
     if failed_assertions or contradictions != 0:
         raise SystemExit(
-            "HyPER-R1 truthful-control corpus failed its invariants: "
+            "HyPER-R1 runtime-comparison corpus failed its invariants: "
             + json.dumps(
                 {
                     "failed_assertions": failed_assertions,
@@ -38,11 +38,10 @@ if schema == "hyper_r1_v20_f1_control":
             )
         )
     structural_report = report.get("source_contract", {})
-    if structural_report.get("quality_schema") != (
-        "hyper_r1_v13_state_covered_recovery"
-    ):
-        raise SystemExit("HyPER-R1 truthful-control source contract is invalid")
+    if structural_report.get("quality_schema") != "hyper_r1_v20_f1_control":
+        raise SystemExit("HyPER-R1 v23 source contract is invalid")
 elif schema in {
+    "hyper_r1_v20_f1_control",
     "hyper_r1_v17_truthful_control",
     "hyper_r1_v18_runtime_aligned_control",
     "hyper_r1_v19_runtime_exact_control",
