@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from safetensors.torch import save_file
 
 from scripts.evaluate_hyper_sft_checkpoints import (
     action_signature,
@@ -70,6 +71,17 @@ def test_resolve_checkpoint_rejects_missing_indexed_shard(tmp_path):
         resolve_checkpoint(tmp_path / "global_step_1")
     (model / "model-00002-of-00002.safetensors").write_bytes(b"two")
     assert resolve_checkpoint(tmp_path / "global_step_1") == model
+
+
+def test_resolve_checkpoint_rejects_empty_lora_adapter(tmp_path):
+    model = tmp_path / "global_step_1" / "huggingface"
+    model.mkdir(parents=True)
+    (model / "config.json").write_text("{}", encoding="utf-8")
+    (model / "adapter_config.json").write_text("{}", encoding="utf-8")
+    save_file({}, model / "adapter_model.safetensors")
+
+    with pytest.raises(ValueError, match="adapter contains zero tensors"):
+        resolve_checkpoint(tmp_path / "global_step_1")
 
 
 def test_behavior_screen_rejects_absent_deep_evidence():

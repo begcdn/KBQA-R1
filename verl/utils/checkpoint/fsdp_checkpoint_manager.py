@@ -34,6 +34,7 @@ from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fs
 from verl.utils.logger import log_with_rank
 
 from .checkpoint_manager import BaseCheckpointManager
+from .peft_adapter import save_peft_adapter
 
 # Setup logging
 logger = logging.getLogger(__file__)
@@ -313,23 +314,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 os.makedirs(hf_local_path, exist_ok=True)
 
                 if hasattr(unwrap_model, "peft_config"):
-                    from peft.utils.save_and_load import get_peft_model_state_dict
-
-                    adapter_state_dict = get_peft_model_state_dict(
-                        unwrap_model, state_dict=state_dict
-                    )
-                    unwrap_model.save_pretrained(
-                        hf_local_path,
-                        state_dict=adapter_state_dict,
-                        safe_serialization=True,
+                    saved_tensors, saved_parameters = save_peft_adapter(
+                        unwrap_model, state_dict, hf_local_path
                     )
                     log_with_rank(
-                        f"Saved LoRA adapter to {os.path.abspath(hf_local_path)}",
+                        "Saved LoRA adapter to "
+                        f"{os.path.abspath(hf_local_path)} "
+                        f"({saved_tensors} tensors, {saved_parameters} parameters)",
                         rank=self.rank,
                         logger=logger,
                         log_only_rank_0=True,
                     )
-                    del adapter_state_dict
                     del state_dict
                 else:
                     if "ForTokenClassification" in model_config.architectures[0]:

@@ -125,6 +125,21 @@ def _weight_files_complete(model_dir: Path) -> Tuple[bool, str]:
     config = model_dir / "config.json"
     if not config.is_file():
         return False, "missing config.json"
+    adapter_config = model_dir / "adapter_config.json"
+    if adapter_config.is_file():
+        adapter_weights = model_dir / "adapter_model.safetensors"
+        if not adapter_weights.is_file():
+            return False, "missing adapter_model.safetensors"
+        try:
+            from safetensors import safe_open
+
+            with safe_open(adapter_weights, framework="pt", device="cpu") as saved:
+                saved_keys = list(saved.keys())
+        except Exception as exc:
+            return False, f"unreadable adapter weights: {exc}"
+        if not saved_keys:
+            return False, "adapter contains zero tensors"
+        return True, f"complete adapter with {len(saved_keys)} tensors"
     indices = list(model_dir.glob("*.index.json"))
     if indices:
         try:
