@@ -43,6 +43,7 @@ LORA_RANK=${LORA_RANK:-0}
 LORA_ALPHA=${LORA_ALPHA:-16}
 ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-true}
+TRAINER_LOGGERS=${TRAINER_LOGGERS:-"['console','tensorboard']"}
 
 # -----------------------------
 # GPU detection and config
@@ -147,6 +148,7 @@ echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "LoRA           : rank=${LORA_RANK} alpha=${LORA_ALPHA}"
 echo "Attention      : ${ATTN_IMPLEMENTATION}"
 echo "Remove padding : ${USE_REMOVE_PADDING}"
+echo "Loggers        : ${TRAINER_LOGGERS}"
 echo "========================================"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -214,7 +216,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     trainer.save_freq=${SAVE_FREQ} \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_STEPS} \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger="${TRAINER_LOGGERS}" \
     optim.lr=1e-5 \
     optim.clip_grad=1.0 \
     2>&1 | tee "${LOG_DIR}/${EXP_NAME//\//_}.log"
