@@ -21,10 +21,24 @@ from verl.utils.device import (
     is_npu_available,
 )
 
+pad_input = None
+unpad_input = None
+
 if is_cuda_available:
-    from flash_attn.bert_padding import pad_input, unpad_input
+    try:
+        from flash_attn.bert_padding import pad_input, unpad_input
+    except ImportError:
+        pass
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import pad_input, unpad_input
+
+
+def _require_padding_ops():
+    if pad_input is None or unpad_input is None:
+        raise ImportError(
+            "No-padding conversion requires flash-attn on CUDA; either install "
+            "flash-attn or disable remove-padding for an SDPA run."
+        )
 
 
 def left_right_2_no_padding(data: TensorDict) -> TensorDict:
@@ -43,6 +57,7 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
     1. the return input_ids/position_ids/loss_mask are nested tensor.
     2. we will remove "attention_mask", "response" in the return data, but "response_mask" is kept.
     """
+    _require_padding_ops()
     assert "input_ids" in data, "input_ids is required in left-right padding data"
     assert "attention_mask" in data, "attention_mask is required in left-right padding data"
     assert "response_mask" in data, "response_mask is required in left-right padding data"
@@ -98,6 +113,7 @@ def no_padding_2_padding(nested_tensor: torch.Tensor, data: TensorDict) -> torch
     Returns:
         values: regular tensor right padded to max_response_len
     """
+    _require_padding_ops()
     assert "indices" in data, "indices is required in left-right padding data"
     assert "max_seq_len" in data, "max_seq_len is required in left-right padding data"
     assert "max_response_len" in data, "max_response_len is required in left-right padding data"
