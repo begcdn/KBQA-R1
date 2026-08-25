@@ -203,7 +203,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.path="${BASE_MODEL}" \
-    model.override_config.attn_implementation="${ATTN_IMPLEMENTATION}" \
+    +model.override_config.attn_implementation="${ATTN_IMPLEMENTATION}" \
     model.lora_rank=${LORA_RANK} \
     model.lora_alpha=${LORA_ALPHA} \
     model.enable_gradient_checkpointing=true \
