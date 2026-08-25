@@ -41,6 +41,8 @@ MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-${SFT_MAX_LENGTH}}
 MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-4}
 LORA_RANK=${LORA_RANK:-0}
 LORA_ALPHA=${LORA_ALPHA:-16}
+ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
+USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-true}
 
 # -----------------------------
 # GPU detection and config
@@ -143,6 +145,8 @@ echo "Sequence limit: ${SFT_MAX_LENGTH} (${SFT_TRUNCATION})"
 echo "Micro batch   : ${MICRO_BATCH_SIZE_PER_GPU}"
 echo "MaxTok/GPU    : ${MAX_TOKEN_LEN_PER_GPU}"
 echo "LoRA           : rank=${LORA_RANK} alpha=${LORA_ALPHA}"
+echo "Attention      : ${ATTN_IMPLEMENTATION}"
+echo "Remove padding : ${USE_REMOVE_PADDING}"
 echo "========================================"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -199,10 +203,11 @@ if [[ "${TRAINER}" == "engine" ]]; then
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
     model.path="${BASE_MODEL}" \
+    model.override_config.attn_implementation="${ATTN_IMPLEMENTATION}" \
     model.lora_rank=${LORA_RANK} \
     model.lora_alpha=${LORA_ALPHA} \
     model.enable_gradient_checkpointing=true \
-    model.use_remove_padding=true \
+    model.use_remove_padding=${USE_REMOVE_PADDING} \
   trainer.default_local_dir="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXP_NAME}" \
