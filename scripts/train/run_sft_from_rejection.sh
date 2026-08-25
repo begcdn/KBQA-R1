@@ -82,14 +82,23 @@ PY
   return 1
 }
 
-detect_gpu_count
+PINNED_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+if [[ -n "${PINNED_CUDA_VISIBLE_DEVICES}" ]]; then
+  GPU_COUNT=$(awk -F, '{print NF}' <<< "${PINNED_CUDA_VISIBLE_DEVICES}")
+  echo "Using explicitly pinned CUDA devices: ${PINNED_CUDA_VISIBLE_DEVICES}"
+else
+  detect_gpu_count
+fi
 
 if (( GPU_COUNT > 0 && GLOBAL_BATCH_SIZE % GPU_COUNT != 0 )); then
   echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by GPU_COUNT=${GPU_COUNT}" >&2
   exit 1
 fi
 
-if [[ "${GPU_COUNT}" -eq 16 ]]; then
+if [[ -n "${PINNED_CUDA_VISIBLE_DEVICES}" ]]; then
+  export CUDA_VISIBLE_DEVICES="${PINNED_CUDA_VISIBLE_DEVICES}"
+  NGPUS=${GPU_COUNT}
+elif [[ "${GPU_COUNT}" -eq 16 ]]; then
   export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
   NGPUS=16
   echo "Using 16 GPUs"
