@@ -44,6 +44,7 @@ LORA_ALPHA=${LORA_ALPHA:-16}
 ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-true}
 TRAINER_LOGGERS=${TRAINER_LOGGERS:-"['console','tensorboard']"}
+MODEL_DTYPE=${MODEL_DTYPE:-fp32}
 
 # -----------------------------
 # GPU detection and config
@@ -149,6 +150,7 @@ echo "LoRA           : rank=${LORA_RANK} alpha=${LORA_ALPHA}"
 echo "Attention      : ${ATTN_IMPLEMENTATION}"
 echo "Remove padding : ${USE_REMOVE_PADDING}"
 echo "Loggers        : ${TRAINER_LOGGERS}"
+echo "Model dtype    : ${MODEL_DTYPE}"
 echo "========================================"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -204,6 +206,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     data.truncation=${SFT_TRUNCATION} \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
     data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE_PER_GPU} \
+    engine.model_dtype=${MODEL_DTYPE} \
     model.path="${BASE_MODEL}" \
     +model.override_config.attn_implementation="${ATTN_IMPLEMENTATION}" \
     model.lora_rank=${LORA_RANK} \
