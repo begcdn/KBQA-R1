@@ -45,6 +45,7 @@ _TC = re.compile(
 )
 _COUNT = re.compile(rf"^COUNT\(({_EXPRESSION})\)$")
 _STOP = re.compile(rf"^STOP\(({_EXPRESSION})\)$")
+_COUNT_RESULT = re.compile(r"^callret-\d+:(.+)$")
 _ONTOLOGY_TYPE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
 )
@@ -55,7 +56,14 @@ def _is_ontology_type(value: str) -> bool:
 
 
 def normalize_values(values: Iterable[Any]) -> Tuple[str, ...]:
-    return tuple(sorted({str(value).strip() for value in values or () if str(value).strip()}))
+    normalized = set()
+    for value in values or ():
+        text = str(value).strip()
+        if not text:
+            continue
+        count_result = _COUNT_RESULT.fullmatch(text)
+        normalized.add(count_result.group(1).strip() if count_result else text)
+    return tuple(sorted(normalized))
 
 
 def normalize_gold_answers(values: Iterable[Any]) -> Tuple[str, ...]:

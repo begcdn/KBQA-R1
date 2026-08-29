@@ -4,6 +4,7 @@ from kbqa_r1.hyper_data import (
     DemonstrationBuilder as _DemonstrationBuilder,
     DemonstrationValidator,
     IneligibleProgram,
+    answer_set_f1,
     compile_optional_gold_plan,
     ProgramExecutionError,
     RelationOption,
@@ -14,6 +15,15 @@ from kbqa_r1.hyper_data import (
     step_sft_records,
     trajectory_sft_record,
 )
+
+
+def test_answer_f1_normalizes_count_executor_transport_value():
+    assert answer_set_f1(["callret-0:5"], ["5"]) == 1.0
+    assert answer_set_f1(["callret-12:0"], ["0"]) == 1.0
+
+
+def test_answer_f1_does_not_rewrite_freebase_identifiers():
+    assert answer_set_f1(["m.05"], ["5"]) == 0.0
 
 
 def DemonstrationBuilder(*args, **kwargs):
