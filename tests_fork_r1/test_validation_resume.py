@@ -1,12 +1,24 @@
 import json
 
+import numpy as np
 import torch
 
 from verl.trainer.ppo.ray_trainer_kbqa import (
     RayPPOTrainer,
+    _coerce_action_records,
     _load_completed_validation_ids,
     _normalize_generated_batch_dtypes,
 )
+
+
+def test_action_records_accept_numpy_object_arrays():
+    records = np.asarray(
+        [{"action": "Select", "node_id": "H0"}, {"action": "Commit", "node_id": "H0"}],
+        dtype=object,
+    )
+
+    assert _coerce_action_records(records) == records.tolist()
+    assert _coerce_action_records(None) == []
 
 
 def test_incremental_generation_dump_is_resumable(tmp_path):

@@ -98,6 +98,13 @@ def _load_completed_validation_ids(path):
     return completed
 
 
+def _coerce_action_records(records):
+    """Return Ray's per-sample action records as an ordinary Python list."""
+    if records is None:
+        return []
+    return list(records)
+
+
 def _normalize_generated_batch_dtypes(batch):
     """Normalize integral generation fields without destroying score precision."""
     for key, value in list(batch.items()):
@@ -1003,7 +1010,7 @@ class RayPPOTrainer:
                 )
             if "hyper_r1_action_records" in test_batch.non_tensor_batch:
                 for records in test_batch.non_tensor_batch["hyper_r1_action_records"]:
-                    records = list(records or ())
+                    records = _coerce_action_records(records)
                     selected = [
                         str(record.get("node_id", ""))
                         for record in records
