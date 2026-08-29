@@ -114,6 +114,7 @@ HYPER_R1_FRONTIER_WIDTH=${HYPER_R1_FRONTIER_WIDTH:-6}
 HYPER_RELATION_MODEL=${HYPER_RELATION_MODEL:-}
 HYPER_RELATION_DEVICE=${HYPER_RELATION_DEVICE:-cpu}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-14336}
+MAX_OBS_LENGTH=${MAX_OBS_LENGTH:-4196}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-1024}
 
 # GPU 配置
@@ -197,7 +198,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=1024 \
     data.max_start_length=2048 \
-    data.max_obs_length=4196 \
+    data.max_obs_length=${MAX_OBS_LENGTH} \
     algorithm.adv_estimator=grpo \
     algorithm.hyper_r1_enable=${HYPER_R1_ENABLE} \
     actor_rollout_ref.ref.strategy=fsdp2 \
