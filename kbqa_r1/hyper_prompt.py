@@ -55,7 +55,13 @@ def build_hyper_prompt(
     base_prompt: str = "",
     candidate_literals: Sequence[Sequence[str]] = (),
 ) -> str:
-    """Build the same student-visible protocol used by SFT and RL datasets."""
+    """Build the canonical student-visible protocol used by SFT and runtime.
+
+    ``base_prompt`` remains in the signature for callers that augment released
+    KBQA-R1 datasets, but its legacy action manual must not be copied into the
+    HyPER prompt.  Keeping both manuals exposes mutually exclusive
+    ``Find_relation`` grammars and breaks train/runtime prompt parity.
+    """
     entities = []
     for entity in candidate_entities:
         if not entity:
@@ -72,38 +78,6 @@ def build_hyper_prompt(
         literal_id = str(literal[-1])
         literals.append(f"'{surface}' ({literal_id})")
     literal_text = ", ".join(literals) or "none"
-    if base_prompt:
-        candidate_line = f"Candidate Entities: [{entity_text}]"
-        if re.search(r"(?m)^Candidate Entities:\s*.*$", base_prompt):
-            base_prompt = re.sub(
-                r"(?m)^Candidate Entities:\s*.*$",
-                lambda _match: candidate_line,
-                base_prompt,
-                count=1,
-            )
-        else:
-            base_prompt = re.sub(
-                r"(?m)^(Question:\s*)",
-                lambda match: candidate_line + "\n" + match.group(1),
-                base_prompt,
-                count=1,
-            )
-        literal_line = f"Candidate Literals: [{literal_text}]"
-        if re.search(r"(?m)^Candidate Literals:\s*.*$", base_prompt):
-            base_prompt = re.sub(
-                r"(?m)^Candidate Literals:\s*.*$",
-                lambda _match: literal_line,
-                base_prompt,
-                count=1,
-            )
-        else:
-            base_prompt = re.sub(
-                r"(?m)^(Question:\s*)",
-                lambda match: literal_line + "\n" + match.group(1),
-                base_prompt,
-                count=1,
-            )
-        return append_hyper_instructions(base_prompt)
     prompt = (
         "You are an expert assistant for querying Freebase with executable actions.\n"
         "Find_relation [ source ] opens a question-conditioned relation frontier; "
@@ -236,7 +210,7 @@ def augment_dataset_row(row: Dict[str, Any]) -> Dict[str, Any]:
             match = re.search(r"(?m)^Question:\s*(.+)$", str(content))
             question = match.group(1).strip() if match else ""
         literals = question_candidate_literals(question)
-        if entities or literals:
+        if question:
             return build_hyper_prompt(
                 question, entities, str(content), candidate_literals=literals
             )

@@ -1,9 +1,37 @@
 from kbqa_r1.hyper_prompt import (
     augment_dataset_row,
+    build_hyper_prompt,
     dataset_candidate_entities,
     extract_hyper_question,
     question_candidate_literals,
 )
+
+
+def test_runtime_prompt_discards_legacy_action_contract():
+    legacy = """You may answer directly with <answer>.
+
+Available Actions (use exact format):
+* Find_relation [entity_id | relation]
+* Count [expression]
+
+Candidate Entities: ['Old' (m.old)]
+Question: Who founded Topic?"""
+    row = {
+        "prompt": [{"role": "user", "content": legacy}],
+        "extra_info": {
+            "original_question": "Who founded Topic?",
+            "extracted_entities": [["Topic", "m.topic"]],
+        },
+    }
+
+    content = augment_dataset_row(row)["prompt"][0]["content"]
+
+    assert content == build_hyper_prompt(
+        "Who founded Topic?", [["Topic", "m.topic"]]
+    )
+    assert "Available Actions (use exact format):" not in content
+    assert "Find_relation [entity_id | relation]" not in content
+    assert "<answer>" not in content
 
 
 def test_augment_rl_prompt_once():
