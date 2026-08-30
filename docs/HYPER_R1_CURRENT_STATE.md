@@ -1,6 +1,6 @@
 # HyPER-R1 Current State
 
-Updated: 2026-08-26
+Updated: 2026-08-31
 
 This file is the authoritative handoff for the current experiment. Read it
 before proposing another training run.
@@ -12,88 +12,105 @@ hypotheses instead of irreversibly committing to one relation path. The final
 goal is improved answer F1 on strong KGQA benchmarks, not action imitation by
 itself.
 
-## Why v23 Exists
+## What Has Been Established
 
-Earlier supervised policies looked competent on teacher states but behaved
-incorrectly during autonomous execution. Observed failures included repeated
-invalid actions, stale or unknown proposal IDs, repeated state-action loops,
-committing the wrong stored hypothesis, and exhausting the turn budget.
+The v23 corpus repaired the old teacher/runtime prompt mismatch: it uses dense
+public H/P IDs, the live observation and turn clock, executable action
+affordances, and answer-F1-aligned Commit targets.
 
-The v23 corpus was rebuilt to align demonstrations with the live runtime:
-dense public IDs, the same observations and turn clock, executable action
-affordances, runtime-comparison labels, and answer-F1-aligned commit behavior.
+The first 500-step LoRA probe is invalid because its adapters contained zero
+tensors. The repaired probe saved 448 tensors and showed a consistent learning
+signal, but it was never evidence of autonomous policy quality.
 
-## Invalid Results
+A full non-LoRA v23 SFT run subsequently completed. Held-out action screens
+were strong:
 
-- The first v23 500-step LoRA run saved 40-byte adapters containing zero
-  tensors. Its behavioral screen evaluated the untouched base model and must
-  never be cited.
-- The exporter filtered LoRA weights twice. Commit `449eae9` fixes this and
-  makes both saving and evaluation reject empty adapters.
+| Checkpoint | Parsable | Action type | Exact action | Early Commit |
+|---|---:|---:|---:|---:|
+| step 2500 | 1.000 | 0.947 | 0.883 | 0.000 |
+| step 5000 | 1.000 | 0.939 | 0.898 | 0.000 |
 
-## Valid LoRA Signal Probe
+These screens prove that the policy learned teacher-state action behavior. They
+do not prove that it can recover from its own autonomous states.
 
-Run: `grailqa-hyper-r1-v23-lora500-fixed`
+## Autonomous Evaluation Finding
 
-- Model: Llama-3.1-8B-Instruct with rank-32 LoRA
-- Updates: 500 of 8,905 batches, about 5.6% of one epoch
-- Checkpoints: steps 100, 200, 300, 400, and 500
-- Every checkpoint contains 448 tensors and 83,886,080 parameters
+The executable SFT-only evaluation was paused at 1,288 questions. Preliminary
+records showed approximately:
 
-Held-out step-500 behavior:
+- fallback-assisted answer F1: 0.781;
+- trajectories with an invalid action: 14.8%;
+- repeated-action trajectories: 10.6%;
+- forced terminal/exhaustion: 17.1% under the old instrumentation.
 
-- Parsable action: 100.0%
-- Action type: 64.5%
-- Exact action: 55.1%
-- Deep-state type: 59.6%
-- Deep-state exact: 55.1%
-- Premature commit: 0.8%
+These figures identify a real autonomous-control problem, but the old run is
+not a clean policy-quality estimate. Evaluation used 16 turns while SFT and
+GRPO used 32, forced fallback answers were mixed with explicit model Commit,
+and forced trajectories were removed from actor learning. Exact historical
+turn exhaustion cannot be recovered because the old dumps did not preserve a
+terminal reason.
 
-The progression from step 100 to 500 is consistently positive. This establishes
-that v23 supervision produces learnable behavior. It is not approval for full
-SFT or GRPO. Rare central actions remain underlearned: `Widen` and `Combine`
-were never predicted at step 500.
+The dominant stale/unknown-ID behavior is exposure bias plus unrestricted text
+generation, not a return of the old prompt mismatch.
 
-## The Two-Part Probe Gate
+## Runtime Foundation Now Repaired
 
-The short LoRA probe has two purposes:
+The current branch contains these correctness repairs:
 
-1. Show that the intended policy behavior is learnable.
-2. Show that learned behavior remains coherent under autonomous live runtime
-   transitions.
+- one canonical source for graph-control affordances and SFT affordance gates;
+- one strict HyPER response parser accepting exactly one complete action;
+- a 32-turn HyPER default in data collection, evaluation, and GRPO;
+- explicit terminal provenance for model Commit, forced candidate, forced
+  empty, turn exhaustion, empty generation, and execution timeout;
+- forced-terminal reward `fallback F1 - 0.25` instead of censoring the rollout;
+- forced rollouts excluded only from same-state sibling credit, not from their
+  base trajectory advantage;
+- separate fallback-assisted, policy-only, explicit-Commit, and forced-terminal
+  metrics.
 
-Part 1 passed. Part 2 has not been run.
+Do not use the old 0.781 figure as explicit-policy F1.
 
-Single-state imitation cannot reveal temporal failures such as loops or stale
-IDs because every example begins from a clean teacher state. Do not authorize
-full non-LoRA SFT from the held-out action screen alone.
+## Current Blocker: Sound Structural Decoding
 
-## Immediate Next Experiment
+Do not launch corrective SFT or GRPO yet.
 
-Run step 500 on 20-50 questions through the exact executable inference runtime.
-Record:
+Finite graph-control and proposal actions can be enumerated exactly. Some
+logical operators (`Merge`, `Order`, `Compare`, `Time_constraint`, and `Count`)
+still contain typed relation, value, or expression arguments that are not all
+enumerated by the current observation. A finite token trie over only the graph
+actions would therefore be incomplete.
 
-- repeated invalid actions;
-- stale or unknown IDs;
-- repeated state-action loops;
-- turn or execution-budget exhaustion;
-- valid commits and agreement between the committed hypothesis and answer;
-- answer F1;
-- use of `Widen`, `Combine`, branch switching, and alternative preservation.
+The next implementation must choose one coherent contract:
 
-Interpret failures carefully. Failure to use rare actions after only 500 LoRA
-updates is limited training. Malformed, impossible, stale, or looping behavior
-is a train/runtime mismatch and blocks full SFT.
+1. enumerate every operator candidate in the public state; or
+2. implement a typed action grammar with constrained structural fields and
+   explicitly open semantic spans.
 
-## Decision Sequence
+Whichever contract is chosen must be applied identically to rollout sampling,
+old-policy log probabilities, updated-actor log probabilities, and reference/KL
+probabilities. A rollout-only mask is forbidden because it creates a behavior-
+policy/training-policy mismatch.
 
-1. Complete the small live-runtime gate.
-2. If old mismatch failures are absent, run the planned full non-LoRA v23 SFT.
-3. Select checkpoints using held-out behavior and live answer F1, not training
-   loss alone.
-4. Run benchmark-scale executable evaluation.
-5. Start GRPO only after the SFT policy is operationally coherent and provides
-   a sound initializer.
+## Next Experiment
 
-Do not extend the LoRA probe merely to satisfy the old action-screen threshold.
-Its purpose is risk detection before the actual full SFT.
+After decoder/validator equivalence passes focused tests, use only original
+training-split questions to build a compact corrective dataset:
+
+- 50% stratified ordinary v23 decisions;
+- 25% successful autonomous decisions;
+- 15% first protocol/loop/deadline recovery states;
+- 10% legal-semantic recovery states certified by executable regret;
+- at most one recovery state per trajectory;
+- question-disjoint correction train/dev splits;
+- no test failures or test questions in training.
+
+Run approximately 25,000-50,000 decisions for 1,500-2,000 low-learning-rate
+steps. Evaluate these pre-GRPO arms on correction-dev:
+
+- A0: current SFT, unmasked;
+- A1: current SFT, masked;
+- A2: corrective SFT, unmasked;
+- A3: corrective SFT, masked.
+
+Only then run a 5-10% masked GRPO pilot. Promote it only if explicit Commit,
+loops, exhaustion, execution cost, and paired answer F1 all pass their gates.
