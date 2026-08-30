@@ -171,6 +171,16 @@ class GraphActionAffordances:
     find_relation: Tuple[str, ...] = ()
 
 
+def canonical_combine_target(left: str, right: str) -> str:
+    """Return the one prompt-visible spelling for an unordered branch pair."""
+    def key(value: str) -> Tuple[int, Any]:
+        match = re.fullmatch(r"H(\d+)", str(value))
+        return (0, int(match.group(1))) if match else (1, str(value))
+
+    first, second = sorted((str(left), str(right)), key=key)
+    return f"{first}|{second}"
+
+
 def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
     """Canonicalize an executor result without erasing entity identity."""
     normalized = []
@@ -418,9 +428,11 @@ def graph_action_affordances(
     combine: Tuple[str, ...] = ()
     if has_node_capacity and has_execution_budget:
         combine = tuple(
-            f"{left}|{right}"
-            for index, left in enumerate(ordered_active)
-            for right in ordered_active[index + 1 :]
+            dict.fromkeys(
+                canonical_combine_target(left, right)
+                for index, left in enumerate(ordered_active)
+                for right in ordered_active[index + 1 :]
+            )
         )
 
     relation_sources = tuple(

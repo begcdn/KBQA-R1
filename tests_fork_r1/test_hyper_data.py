@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 from kbqa_r1.hyper_data import (
+    DemonstrationStep,
     DemonstrationBuilder as _DemonstrationBuilder,
     DemonstrationValidator,
     IneligibleProgram,
@@ -14,6 +15,7 @@ from kbqa_r1.hyper_data import (
     programs_are_intent_equivalent,
     step_sft_records,
     trajectory_sft_record,
+    _action_text,
 )
 
 
@@ -24,6 +26,12 @@ def test_answer_f1_normalizes_count_executor_transport_value():
 
 def test_answer_f1_does_not_rewrite_freebase_identifiers():
     assert answer_set_f1(["m.05"], ["5"]) == 0.0
+
+
+def test_combine_supervision_uses_the_advertised_canonical_pair_order():
+    step = DemonstrationStep("Combine", ("H3", "H0"), ("H0", "H3"))
+
+    assert "<action>Combine [ H0 | H3 ]</action>" in _action_text(step)
 
 
 def DemonstrationBuilder(*args, **kwargs):

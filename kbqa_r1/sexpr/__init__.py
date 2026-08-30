@@ -4,20 +4,36 @@ This module provides s-expression generation, validation, and execution capabili
 to replace direct SPARQL generation approach.
 """
 
+from importlib import import_module
+
 # Import constants from separate file to avoid circular imports
 from .constants import COMPARISON_MODE_MAPPING, COMPARISON_MODE_READABLE_MAPPING
 
-# Import core modules that don't have heavy dependencies
+# Keep action parsing usable for CPU-only corpus audits.
 from .action_parser import ActionParser
-from .function_builder import FunctionBuilder  
-from .sexpr_generator import SExprGenerator
-from .sexpr_validator import SExprValidator
-from .sexpr_executor import SExprExecutor
 
-# Import modules with heavy dependencies only when needed
-from .relation_retrieval import RelationRetrieval
-from .execution_validator import ExecutionValidator
-from .dynamic_relation_retrieval import DynamicRelationRetrieval
+
+_LAZY_IMPORTS = {
+    "FunctionBuilder": (".function_builder", "FunctionBuilder"),
+    "SExprGenerator": (".sexpr_generator", "SExprGenerator"),
+    "SExprValidator": (".sexpr_validator", "SExprValidator"),
+    "SExprExecutor": (".sexpr_executor", "SExprExecutor"),
+    "RelationRetrieval": (".relation_retrieval", "RelationRetrieval"),
+    "ExecutionValidator": (".execution_validator", "ExecutionValidator"),
+    "DynamicRelationRetrieval": (
+        ".dynamic_relation_retrieval",
+        "DynamicRelationRetrieval",
+    ),
+}
+
+
+def __getattr__(name):
+    if name not in _LAZY_IMPORTS:
+        raise AttributeError(name)
+    module_name, attribute = _LAZY_IMPORTS[name]
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
 
 __all__ = [
     'ActionParser',
@@ -25,9 +41,9 @@ __all__ = [
     'SExprGenerator',
     'SExprValidator',
     'SExprExecutor',
-    'RelationRetrieval',  # Commented out due to heavy dependencies
-    'ExecutionValidator',  # Commented out due to heavy dependencies
-    'DynamicRelationRetrieval',  # Commented out due to heavy dependencies
+    'RelationRetrieval',
+    'ExecutionValidator',
+    'DynamicRelationRetrieval',
     'COMPARISON_MODE_MAPPING',
     'COMPARISON_MODE_READABLE_MAPPING'
 ]

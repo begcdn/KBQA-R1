@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from .hyper_prompt import build_hyper_prompt, question_candidate_literals
 from .hyper_r1 import (
     PruneCertificate,
+    canonical_combine_target,
     combine_function_states,
     public_empty_prune_certificate,
     public_question_contract,
@@ -5196,7 +5197,8 @@ def _action_text(step: DemonstrationStep) -> str:
         body = "Abstain"
         thought = "The search budget ended without a complete justified program."
     elif step.action == "Combine":
-        body = f"Combine [ {step.arguments[0]} | {step.arguments[1]} ]"
+        pair = canonical_combine_target(step.arguments[0], step.arguments[1])
+        body = f"Combine [ {pair.replace('|', ' | ')} ]"
         thought = "Both active branches express required parts of the question."
     elif step.action == "Merge":
         body = f"Merge [ {step.arguments[0]} | {step.arguments[1]} ]"
