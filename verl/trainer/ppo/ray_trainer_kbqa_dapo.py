@@ -165,6 +165,9 @@ class RayPPOTrainerKBQADAPO(RayPPOTrainer):
                                         "enable_semantic_validation", True
                                     ),
                                     hyper_r1_enable=self.config.get("hyper_r1", {}).get("enable", False),
+                                    hyper_r1_structural_constraints=self.config.get("hyper_r1", {}).get(
+                                        "structural_constraints", False
+                                    ),
                                     hyper_r1_max_active=self.config.get("hyper_r1", {}).get("max_active", 24),
                                     hyper_r1_max_nodes=self.config.get("hyper_r1", {}).get("max_nodes", 128),
                                     hyper_r1_max_execution_attempts=self.config.get("hyper_r1", {}).get("max_execution_attempts", 24),

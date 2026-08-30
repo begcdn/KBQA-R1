@@ -406,6 +406,10 @@ hyper_r1:
   # Enable graph-state rollouts.
   enable: false
 
+  # Restrict decoding to structurally executable public-state actions. This
+  # must be shared by vLLM sampling and actor/reference log-probability replay.
+  structural_constraints: false
+
   # Number of executable hypotheses visible to the policy at once.
   max_active: 24
 

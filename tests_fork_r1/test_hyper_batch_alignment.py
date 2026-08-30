@@ -30,6 +30,7 @@ def test_multiturn_masks_and_log_probs_follow_response_compaction():
         "rollout_log_probs": torch.tensor([[0.1, 0.0]]),
         "hyper_action_ids": torch.tensor([[1, 0]]),
         "hyper_invalid_action_mask": torch.tensor([[False, False]]),
+        "hyper_constraint_turn_ids": torch.tensor([[0, -1]]),
         "hyper_tail_truncated": torch.tensor([False]),
     }
 
@@ -40,6 +41,7 @@ def test_multiturn_masks_and_log_probs_follow_response_compaction():
         next_obs_ids=torch.tensor([[33, 0]]),
         cur_action_ids=torch.tensor([[2, 0]]),
         cur_invalid_action_mask=torch.tensor([[True, False]]),
+        cur_constraint_turn_ids=torch.tensor([[1, -1]]),
     )
 
     assert result["responses"].tolist() == [[11, 22, 33]]
@@ -48,6 +50,7 @@ def test_multiturn_masks_and_log_probs_follow_response_compaction():
     )
     assert result["hyper_action_ids"].tolist() == [[1, 2, 0]]
     assert result["hyper_invalid_action_mask"].tolist() == [[False, True, False]]
+    assert result["hyper_constraint_turn_ids"].tolist() == [[0, 1, -1]]
 
 
 def test_hyper_rollout_marks_policy_token_truncation():

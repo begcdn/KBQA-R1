@@ -30,6 +30,8 @@ class SExprGenerationConfig:
     # HyPER-R1 executable hypothesis graph. Disabled for released KBQA-R1
     # compatibility and enabled explicitly in HyPER-R1 training/evaluation.
     hyper_r1_enable: bool = False
+    # Experimental gate. Enable only after rollout/actor probability parity.
+    hyper_r1_structural_constraints: bool = False
     hyper_r1_max_active: int = 24
     hyper_r1_max_nodes: int = 128
     hyper_r1_max_execution_attempts: int = 24

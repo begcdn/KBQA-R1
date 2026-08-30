@@ -14,8 +14,10 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 from kbqa_r1.answer_utils import extract_last_answer_values
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
+from kbqa_r1.token_replay import align_structural_rollout_log_probs
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
                               hyper_observation_diagnostics,
@@ -113,6 +115,11 @@ class SExprLLMGenerationManager:
         self.config = config
         self.is_validation = is_validation
         self.hyper_r1_enable = bool(getattr(config, "hyper_r1_enable", False))
+        self.hyper_structural_constraints = bool(
+            getattr(config, "hyper_r1_structural_constraints", False)
+        )
+        if self.hyper_structural_constraints and not self.hyper_r1_enable:
+            raise ValueError("HyPER structural constraints require hyper_r1_enable")
         self.hyper_relation_model = required_hyper_relation_model(config)
         self.hyper_relation_device = getattr(config, "hyper_r1_relation_device", None)
         self.hyper_graph = HypothesisGraph(
@@ -139,6 +146,7 @@ class SExprLLMGenerationManager:
         self._hyper_gold_contracts: Dict[int, dict] = {}
         self._hyper_commit_certificates: Dict[int, dict] = {}
         self._hyper_premature_answers: set[int] = set()
+        self._hyper_constraint_specs: Dict[int, List[dict]] = {}
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -611,6 +619,67 @@ class SExprLLMGenerationManager:
             sample_id,
             turn=turn,
             legal_context=self._public_frontier_signature(sample_id),
+        )
+
+    def _hyper_action_constraint(
+        self, sample_id: int, turn: int
+    ) -> HyPERActionConstraintSpec:
+        """Compile one public-state action contract for rollout and actor use."""
+        graph = self.hyper_graph.state(sample_id)
+        candidate_sources = [
+            str(entity[-1])
+            for entity in self.state_manager.get_sample_entities(sample_id)
+            if entity
+        ]
+        affordances = self.hyper_graph.action_affordances(
+            sample_id, candidate_sources=candidate_sources
+        )
+        inspect = []
+        widen = []
+        for frontier in self._hyper_frontiers.get(sample_id, ()):
+            if frontier.get("closed"):
+                continue
+            visible = [
+                str(proposal_id)
+                for proposal_id, proposal in frontier.get("proposals", {}).items()
+                if proposal.get("status") == "visible"
+            ]
+            visible, widen_source = proposal_action_targets(
+                visible,
+                str(frontier["source"]),
+                exposed=min(
+                    int(frontier["next_offset"]),
+                    len(frontier["decision"].ranked_relations),
+                ),
+                total=len(frontier["decision"].ranked_relations),
+                selected_id=graph.selected_id,
+                active_count=len(self.hyper_graph.active_nodes(sample_id)),
+                max_active=self.hyper_graph.max_active,
+                node_count=len(graph.nodes),
+                max_nodes=self.hyper_graph.max_nodes,
+                execution_attempts=graph.execution_attempts,
+                execution_budget=self.hyper_graph.max_execution_attempts,
+            )
+            inspect.extend(visible)
+            if widen_source:
+                widen.append(widen_source)
+
+        selected_expression = ""
+        if graph.selected_id is not None:
+            selected_expression = graph.nodes[graph.selected_id].target_expression
+        allow_open_operators = (
+            graph.committed_id is None
+            and self.hyper_graph.has_capacity(sample_id)
+            and self.hyper_graph.has_execution_budget(sample_id)
+        )
+        return HyPERActionConstraintSpec.build(
+            state_key=self._decision_state_key(sample_id, turn),
+            turn=turn,
+            affordances=affordances,
+            inspect=inspect,
+            widen=widen,
+            selected_expression=selected_expression,
+            allow_open_operators=allow_open_operators,
         )
 
     def _annotate_action_token_spans(
@@ -1291,6 +1360,10 @@ class SExprLLMGenerationManager:
             "hyper_invalid_action_mask",
             torch.zeros_like(responses, dtype=torch.bool),
         ).to(dtype=torch.bool)
+        constraint_turn_ids = output.batch.pop(
+            "hyper_constraint_turn_ids",
+            torch.full_like(responses, -1, dtype=torch.long),
+        ).to(dtype=torch.long)
         tail_truncated = output.batch.pop(
             "hyper_tail_truncated",
             torch.zeros(batch_size, dtype=torch.bool, device=responses.device),
@@ -1383,6 +1456,7 @@ class SExprLLMGenerationManager:
                 )
         output.batch["hyper_r1_action_ids"] = action_ids
         output.batch["hyper_r1_invalid_action_mask"] = invalid_action_mask
+        output.batch["hyper_r1_constraint_turn_ids"] = constraint_turn_ids
         output.batch["hyper_r1_execution_counts"] = execution_counts
         output.batch["hyper_r1_commit_valid"] = commit_valid
         output.batch["hyper_r1_commit_protocol_valid"] = commit_protocol_valid
@@ -1402,6 +1476,14 @@ class SExprLLMGenerationManager:
         output.non_tensor_batch["hyper_r1_graph"] = np.array(
             graph_records, dtype=object
         )
+        if self.hyper_structural_constraints:
+            output.non_tensor_batch["hyper_r1_action_constraints"] = np.asarray(
+                [
+                    self._hyper_constraint_specs.get(sample_id, [])
+                    for sample_id in range(batch_size)
+                ],
+                dtype=object,
+            )
         output.non_tensor_batch["hyper_r1_terminal_reason"] = np.array(
             [
                 self.hyper_graph.state(sample_id).terminal_reason or "none"
@@ -2366,6 +2448,7 @@ class SExprLLMGenerationManager:
                 self._hyper_protocol_valid_answer_turns.clear()
                 self._hyper_commit_certificates.clear()
                 self._hyper_premature_answers.clear()
+                self._hyper_constraint_specs.clear()
                 self._load_hyper_gold_contracts(gen_batch, batch_size)
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
@@ -2398,6 +2481,9 @@ class SExprLLMGenerationManager:
         if self.hyper_r1_enable:
             original_right_side["hyper_action_ids"] = initial_input_ids[:, []]
             original_right_side["hyper_invalid_action_mask"] = initial_input_ids[:, []].bool()
+            original_right_side["hyper_constraint_turn_ids"] = torch.full_like(
+                initial_input_ids[:, []], -1
+            )
             original_right_side["hyper_tail_truncated"] = torch.zeros(
                 batch_size, dtype=torch.bool, device=initial_input_ids.device
             )
@@ -2430,9 +2516,27 @@ class SExprLLMGenerationManager:
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
             
-            rollings_active = DataProto.from_dict(tensors={
-                k: v[active_mask] for k, v in rollings.batch.items()
-            })
+            active_indices = torch.nonzero(
+                active_mask, as_tuple=False
+            ).flatten().tolist()
+            active_non_tensors = {}
+            active_constraint_payloads = {}
+            if self.hyper_structural_constraints:
+                payloads = []
+                for sample_id in active_indices:
+                    payload = self._hyper_action_constraint(
+                        sample_id, turn
+                    ).to_dict()
+                    payloads.append(payload)
+                    active_constraint_payloads[sample_id] = payload
+                active_non_tensors["hyper_action_constraint"] = np.asarray(
+                    payloads, dtype=object
+                )
+            rollings_active = DataProto.from_dict(
+                tensors={k: v[active_mask] for k, v in rollings.batch.items()},
+                non_tensors=active_non_tensors,
+                meta_info=rollings.meta_info,
+            )
             
             # Generate responses
             gen_output = self.batch_utils.generate_with_gpu_padding(rollings_active)
@@ -2441,20 +2545,9 @@ class SExprLLMGenerationManager:
             # CRITICAL FIX: Extract rollout_log_probs from gen_output for this turn
             # rollout_log_probs come from vLLM generate_sequences() when calculate_log_probs=true
             # We need to expand them to full batch size (pad inactive samples with zeros)
-            cur_rollout_log_probs = None
+            active_rollout_log_probs = None
             if 'rollout_log_probs' in gen_output.batch:
-                # Expand to full batch size (pad inactive samples with zeros)
-                full_batch_rollout_log_probs = torch.zeros(
-                    batch_size, gen_output.batch['rollout_log_probs'].shape[1],
-                    dtype=gen_output.batch['rollout_log_probs'].dtype,
-                    device=gen_output.batch['rollout_log_probs'].device
-                )
-                full_batch_rollout_log_probs[active_mask] = gen_output.batch['rollout_log_probs']
-                cur_rollout_log_probs = full_batch_rollout_log_probs
-                
-                logger.info(f"[MISMATCH FIX] Turn {turn}: Extracted rollout_log_probs from gen_output, "
-                           f"active shape: {gen_output.batch['rollout_log_probs'].shape}, "
-                           f"expanded to full batch: {cur_rollout_log_probs.shape}")
+                active_rollout_log_probs = gen_output.batch['rollout_log_probs']
             
             if 'responses' not in gen_output.batch or gen_output.batch['responses'].shape[0] == 0:
                 logger.warning("Invalid response from generation")
@@ -2464,6 +2557,15 @@ class SExprLLMGenerationManager:
                 
             # Process responses
             responses_ids, responses_str = SExprUtils.postprocess_responses(self.tokenizer, gen_output.batch['responses'], self.config.no_think_rl)
+            if active_rollout_log_probs is not None and self.hyper_structural_constraints:
+                active_rollout_log_probs = (
+                    align_structural_rollout_log_probs(
+                        self.tokenizer,
+                        gen_output.batch['responses'],
+                        active_rollout_log_probs,
+                        responses_ids,
+                    )
+                )
             if turn==1 and "" in responses_str and SExprLLMGenerationManager._debug_save_counter < 10:
                 # 保存空响应的详细信息到文件（总共只保存10次）
                 import json
@@ -2542,15 +2644,43 @@ class SExprLLMGenerationManager:
             
             # Apply padding to match batch size
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+            cur_rollout_log_probs = None
+            if active_rollout_log_probs is not None:
+                full_batch_rollout_log_probs = torch.zeros(
+                    batch_size,
+                    active_rollout_log_probs.shape[1],
+                    dtype=active_rollout_log_probs.dtype,
+                    device=active_rollout_log_probs.device,
+                )
+                full_batch_rollout_log_probs[active_mask] = active_rollout_log_probs
+                cur_rollout_log_probs = full_batch_rollout_log_probs
+                logger.info(
+                    "Turn %s aligned rollout log probabilities: active=%s full=%s",
+                    turn,
+                    tuple(active_rollout_log_probs.shape),
+                    tuple(cur_rollout_log_probs.shape),
+                )
             
             # Execute predictions (S-Expression or SPARQL)
             next_obs, dones = self.execute_predictions(responses_str, self.tokenizer.pad_token, active_mask, turn=turn)
             cur_action_ids = None
             cur_invalid_action_mask = None
+            cur_constraint_turn_ids = None
             if self.hyper_r1_enable:
                 cur_action_ids, cur_invalid_action_mask = self._turn_credit_masks(
                     responses_ids, turn
                 )
+                if self.hyper_structural_constraints:
+                    cur_constraint_turn_ids = torch.full_like(responses_ids, -1)
+                    generated = self.tensor_fn.create_attention_mask(
+                        responses_ids
+                    ).bool()
+                    cur_constraint_turn_ids[generated] = int(turn)
+                    for sample_id in active_indices:
+                        if bool(generated[sample_id].any()):
+                            self._hyper_constraint_specs.setdefault(
+                                sample_id, []
+                            ).append(active_constraint_payloads[sample_id])
             
             # Process observations
             next_obs_ids = self._process_next_obs(next_obs)
@@ -2578,6 +2708,7 @@ class SExprLLMGenerationManager:
                 next_obs_ids=next_obs_ids,
                 cur_action_ids=cur_action_ids,
                 cur_invalid_action_mask=cur_invalid_action_mask,
+                cur_constraint_turn_ids=cur_constraint_turn_ids,
             )
             
             # 只记录最后一轮的截断统计信息 (优化版本)

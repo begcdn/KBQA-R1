@@ -194,6 +194,7 @@ rollout_is_threshold_lower=${rollout_is_threshold_lower:-null}  # optional; only
 rollout_is_veto_threshold=${rollout_is_veto_threshold:-null} # per-token veto (null to disable)
 
 hyper_r1_enable=${hyper_r1_enable:-false}
+hyper_r1_structural_constraints=${hyper_r1_structural_constraints:-false}
 if [[ "${hyper_r1_enable}" == "true" ]]; then
     max_turns=${max_turns:-32}
 else
@@ -395,6 +396,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sexpr_config.enable_semantic_validation=true \
     sexpr_config.use_complete_sparql_converter=true \
     hyper_r1.enable=${hyper_r1_enable} \
+    hyper_r1.structural_constraints=${hyper_r1_structural_constraints} \
     hyper_r1.max_active=${hyper_r1_max_active} \
     hyper_r1.max_nodes=${hyper_r1_max_nodes} \
     hyper_r1.max_execution_attempts=${hyper_r1_max_execution_attempts} \

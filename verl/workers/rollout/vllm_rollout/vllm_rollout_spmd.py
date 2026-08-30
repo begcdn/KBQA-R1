@@ -50,6 +50,7 @@ from omegaconf import ListConfig
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
 from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
 
@@ -288,6 +289,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
+        constraint_payloads = non_tensor_batch.get("hyper_action_constraint")
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
@@ -355,9 +357,33 @@ class vLLMRollout(BaseRollout):
                 engine_tokenizer.decode(vllm_inputs[0]["prompt_token_ids"][-512:]),
             )
         with self.update_sampling_params(**kwargs):
+            request_sampling_params = self.sampling_params
+            if constraint_payloads is not None:
+                from kbqa_r1.action_constraints import HyPERActionConstraintSpec
+
+                if len(constraint_payloads) != batch_size:
+                    raise RuntimeError("HyPER constraint batch does not match prompts")
+                request_sampling_params = []
+                for payload in constraint_payloads:
+                    spec = HyPERActionConstraintSpec.from_dict(payload)
+                    params = self.sampling_params.clone()
+                    # Truncation samplers would change the support again after
+                    # the grammar mask and invalidate actor/rollout parity.
+                    params.top_p = 1.0
+                    params.top_k = -1
+                    params.min_p = 0.0
+                    params.presence_penalty = 0.0
+                    params.frequency_penalty = 0.0
+                    params.repetition_penalty = 1.0
+                    params.min_tokens = 0
+                    params.guided_decoding = GuidedDecodingParams(
+                        regex=spec.response_pattern,
+                        backend="xgrammar:no-fallback",
+                    )
+                    request_sampling_params.append(params)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=request_sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )

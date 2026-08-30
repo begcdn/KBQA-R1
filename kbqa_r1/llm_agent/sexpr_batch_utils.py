@@ -6,6 +6,7 @@ Handles GPU padding, tensor operations, and batch management
 import logging
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 
 from verl import DataProto
@@ -51,7 +52,17 @@ class SExprBatchUtils:
             pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
             padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
 
-        padded_active_batch = DataProto.from_dict(padded_batch)
+        padded_non_tensors = {}
+        for key, values in active_batch.non_tensor_batch.items():
+            values = np.asarray(values, dtype=object)
+            padded_non_tensors[key] = np.concatenate(
+                [values, np.repeat(values[0:1], padding_size, axis=0)]
+            )
+        padded_active_batch = DataProto.from_dict(
+            tensors=padded_batch,
+            non_tensors=padded_non_tensors,
+            meta_info=active_batch.meta_info,
+        )
         # Ensure padded batch tensors are also long type
         for key in padded_active_batch.batch.keys():
             padded_active_batch.batch[key] = padded_active_batch.batch[key].long()
@@ -71,6 +82,10 @@ class SExprBatchUtils:
             padded_output.meta_info = trimmed_meta
             
         padded_output.batch = trimmed_batch
+        padded_output.non_tensor_batch = {
+            key: values[:-padding_size]
+            for key, values in padded_output.non_tensor_batch.items()
+        }
         return padded_output
     
     def update_rolling_state(self, rollings, cur_responses: torch.Tensor, 
@@ -225,7 +240,8 @@ class SExprBatchUtils:
                           cur_rollout_log_probs: torch.Tensor = None,
                           next_obs_ids: torch.Tensor = None,
                           cur_action_ids: torch.Tensor = None,
-                          cur_invalid_action_mask: torch.Tensor = None) -> Dict:
+                          cur_invalid_action_mask: torch.Tensor = None,
+                          cur_constraint_turn_ids: torch.Tensor = None) -> Dict:
         """Update right side state.
         
         IMPORTANT: Also handles rollout_log_probs accumulation for mismatch metrics.
@@ -295,6 +311,21 @@ class SExprBatchUtils:
         elif 'hyper_invalid_action_mask' in right_side:
             result['hyper_invalid_action_mask'] = right_side[
                 'hyper_invalid_action_mask'
+            ][:, :max_len]
+
+        if cur_constraint_turn_ids is not None:
+            previous = right_side.get(
+                'hyper_constraint_turn_ids',
+                torch.full_like(right_side['responses'], -1),
+            )
+            pieces = [previous, cur_constraint_turn_ids.to(dtype=torch.long)]
+            if next_obs_ids is not None:
+                pieces.append(torch.full_like(next_obs_ids, -1, dtype=torch.long))
+            accumulated = torch.cat(pieces, dim=1).gather(1, sorted_indices)
+            result['hyper_constraint_turn_ids'] = accumulated[:, :max_len]
+        elif 'hyper_constraint_turn_ids' in right_side:
+            result['hyper_constraint_turn_ids'] = right_side[
+                'hyper_constraint_turn_ids'
             ][:, :max_len]
         
         # CRITICAL FIX: Update rollout_log_probs in sync with responses

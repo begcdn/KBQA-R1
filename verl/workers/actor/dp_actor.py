@@ -58,11 +58,19 @@ class DataParallelPPOActor(BasePPOActor):
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+        tokenizer=None,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.tokenizer = tokenizer
+        self._hyper_constraint_masker = None
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -104,6 +112,14 @@ class DataParallelPPOActor(BasePPOActor):
         """
 
         response_length = micro_batch["responses"].size(-1)
+        constrained = "hyper_r1_action_constraints" in micro_batch
+        if constrained:
+            if self.tokenizer is None:
+                raise RuntimeError("HyPER constrained actor is missing its tokenizer")
+            if self.use_fused_kernels:
+                raise RuntimeError("HyPER constraints do not support fused actor kernels")
+            if self.use_ulysses_sp:
+                raise RuntimeError("HyPER constraints do not yet support sequence parallelism")
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -199,6 +215,44 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
+                    if constrained:
+                        from verl.utils.hyper_constraints import (
+                            HyPERXGrammarMasker,
+                            masked_entropy_from_logits,
+                        )
+
+                        if self._hyper_constraint_masker is None:
+                            self._hyper_constraint_masker = HyPERXGrammarMasker(
+                                self.tokenizer, logits_rmpad.size(-1)
+                            )
+                        inverse = torch.full(
+                            (batch_size * seqlen,),
+                            -1,
+                            dtype=torch.long,
+                            device=indices.device,
+                        )
+                        inverse[indices] = torch.arange(
+                            indices.numel(), device=indices.device
+                        )
+                        columns = torch.arange(
+                            seqlen - response_length - 1,
+                            seqlen - 1,
+                            device=indices.device,
+                        )
+                        coordinates = (
+                            torch.arange(batch_size, device=indices.device)[:, None]
+                            * seqlen
+                            + columns[None, :]
+                        )
+                        response_rows = inverse[coordinates]
+                        self._hyper_constraint_masker.apply(
+                            logits_rmpad,
+                            micro_batch["responses"],
+                            micro_batch["hyper_r1_constraint_turn_ids"],
+                            micro_batch["hyper_r1_action_constraints"],
+                            row_indices=response_rows,
+                        )
+
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -211,7 +265,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # compute entropy
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
+                        if constrained:
+                            entropy_rmpad = masked_entropy_from_logits(logits_rmpad)
+                        elif not self.config.entropy_checkpointing:
                             entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
                         else:
                             entropy_rmpad = torch.utils.checkpoint.checkpoint(
@@ -278,9 +334,27 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if constrained:
+                        from verl.utils.hyper_constraints import (
+                            HyPERXGrammarMasker,
+                            masked_entropy_from_logits,
+                        )
+
+                        if self._hyper_constraint_masker is None:
+                            self._hyper_constraint_masker = HyPERXGrammarMasker(
+                                self.tokenizer, logits.size(-1)
+                            )
+                        self._hyper_constraint_masker.apply(
+                            logits,
+                            micro_batch["responses"],
+                            micro_batch["hyper_r1_constraint_turn_ids"],
+                            micro_batch["hyper_r1_action_constraints"],
+                        )
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
+                        if constrained:
+                            entropy = masked_entropy_from_logits(logits)
+                        elif not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
@@ -350,6 +424,9 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "hyper_r1_action_constraints" in data.non_tensor_batch:
+            select_keys.append("hyper_r1_constraint_turn_ids")
+            non_tensor_select_keys.append("hyper_r1_action_constraints")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -409,6 +486,9 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if "hyper_r1_action_constraints" in data.non_tensor_batch:
+            select_keys.append("hyper_r1_constraint_turn_ids")
+            non_tensor_select_keys.append("hyper_r1_action_constraints")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 

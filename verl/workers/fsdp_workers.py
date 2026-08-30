@@ -823,7 +823,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg,
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+                tokenizer=self.tokenizer,
             )
 
         if self._is_rollout:
@@ -853,7 +856,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.ref_policy = DataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+                tokenizer=self.tokenizer,
+            )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)

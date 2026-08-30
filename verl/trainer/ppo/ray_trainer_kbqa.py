@@ -430,6 +430,28 @@ class RayPPOTrainer:
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
+        structural_constraints = self.config.get("hyper_r1", {}).get(
+            "structural_constraints", False
+        )
+        if structural_constraints:
+            if not self.config.get("hyper_r1", {}).get("enable", False):
+                raise ValueError(
+                    "HyPER structural constraints require hyper_r1.enable=true"
+                )
+            if self.config.actor_rollout_ref.rollout.name != "vllm":
+                raise ValueError(
+                    "HyPER structural constraints currently require the vLLM rollout"
+                )
+            if self.config.actor_rollout_ref.rollout.mode == "async":
+                raise ValueError(
+                    "HyPER structural constraints do not support async rollout"
+                )
+            actor_strategy = self.config.actor_rollout_ref.actor.strategy
+            if actor_strategy not in ("fsdp", "fsdp2"):
+                raise ValueError(
+                    "HyPER structural constraints currently require an FSDP actor"
+                )
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -687,6 +709,7 @@ class RayPPOTrainer:
             enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
             enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
             hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+            hyper_r1_structural_constraints=self.config.get('hyper_r1', {}).get('structural_constraints', False),
             hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
             hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
             hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
@@ -919,6 +942,7 @@ class RayPPOTrainer:
                     enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
                     enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
                     hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+                    hyper_r1_structural_constraints=self.config.get('hyper_r1', {}).get('structural_constraints', False),
                     hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
                     hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
                     hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
@@ -1702,6 +1726,7 @@ class RayPPOTrainer:
                                 enable_action_validation=self.config.get('sexpr_config', {}).get('enable_action_reasoning', True),
                                 enable_sexpr_validation=self.config.get('sexpr_config', {}).get('enable_semantic_validation', True),
                                 hyper_r1_enable=self.config.get('hyper_r1', {}).get('enable', False),
+                                hyper_r1_structural_constraints=self.config.get('hyper_r1', {}).get('structural_constraints', False),
                                 hyper_r1_max_active=self.config.get('hyper_r1', {}).get('max_active', 24),
                                 hyper_r1_max_nodes=self.config.get('hyper_r1', {}).get('max_nodes', 128),
                                 hyper_r1_max_execution_attempts=self.config.get('hyper_r1', {}).get('max_execution_attempts', 24),
