@@ -70,31 +70,30 @@ The current branch contains these correctness repairs:
 
 Do not use the old 0.781 figure as explicit-policy F1.
 
-## Current Blocker: Sound Structural Decoding
+## Structural Decoding Gate
 
-Do not launch corrective SFT or GRPO yet.
+The current branch implements a typed state-conditioned grammar. Finite graph
+actions use the exact public affordance lists, while logical operators constrain
+their structural fields and retain only the semantic spans that the public
+state cannot enumerate. The same stored turn grammar is replayed for rollout,
+old-policy, actor, and reference logits.
 
-Finite graph-control and proposal actions can be enumerated exactly. Some
-logical operators (`Merge`, `Order`, `Compare`, `Time_constraint`, and `Count`)
-still contain typed relation, value, or expression arguments that are not all
-enumerated by the current observation. A finite token trie over only the graph
-actions would therefore be incomplete.
+A live two-question gate on the step-7500 checkpoint passed with vLLM 0.10.2,
+XGrammar, the production tokenizer, the relation ranker, and Virtuoso:
 
-The next implementation must choose one coherent contract:
+- 16 generated actions, all accepted by the runtime validator;
+- zero unknown/stale IDs, malformed actions, replay disagreements, or loops;
+- two explicit model commits and no forced terminal or turn exhaustion;
+- exact committed answer sets and commit-answer F1 of 1.0 on both questions.
 
-1. enumerate every operator candidate in the public state; or
-2. implement a typed action grammar with constrained structural fields and
-   explicitly open semantic spans.
-
-Whichever contract is chosen must be applied identically to rollout sampling,
-old-policy log probabilities, updated-actor log probabilities, and reference/KL
-probabilities. A rollout-only mask is forbidden because it creates a behavior-
-policy/training-policy mismatch.
+This is an implementation and feasibility gate, not an answer-quality result.
+Two questions cannot estimate benchmark F1 or prove that the policy has learned
+good long-horizon exploration.
 
 ## Next Experiment
 
-After decoder/validator equivalence passes focused tests, use only original
-training-split questions to build a compact corrective dataset:
+Use only original training-split questions to build a compact corrective
+dataset:
 
 - 50% stratified ordinary v23 decisions;
 - 25% successful autonomous decisions;
@@ -103,6 +102,17 @@ training-split questions to build a compact corrective dataset:
 - at most one recovery state per trajectory;
 - question-disjoint correction train/dev splits;
 - no test failures or test questions in training.
+
+The deterministic assembler for this mixture is implemented, but the corpus
+is not yet available. The existing validation JSONL contains complete text
+transcripts and terminal metrics, not the certified per-decision records the
+assembler deliberately requires. Before another SFT, collect fresh masked and
+unmasked training-split rollouts with canonical decision messages, public-state
+hashes, accepted/no-progress outcomes, and exact run provenance. Protocol
+corrections must be certified against the same visible state. Semantic rows
+must name the policy's failed legal action and demonstrate positive executable
+regret against a bounded continuation oracle; internally consistent scores
+alone are not sufficient.
 
 Run approximately 25,000-50,000 decisions for 1,500-2,000 low-learning-rate
 steps. Evaluate these pre-GRPO arms on correction-dev:

@@ -186,6 +186,7 @@ def _semantic_row(qid: str, index: int):
             "executor_hash": "executor",
             "certifier_hash": "certifier",
             "epsilon": 0.01,
+            "failed_action": "Commit [ H0 ]",
             "q_values": {"Recall [ H1 ]": 1.0, "Commit [ H0 ]": 0.4},
             "optimal_actions": ["Recall [ H1 ]"],
         },
@@ -379,3 +380,44 @@ def test_semantic_optimal_set_must_match_q_values(tmp_path):
             train_size=20,
             dev_size=20,
         )
+
+
+def test_semantic_recovery_requires_positive_regret_over_failed_action(tmp_path):
+    inputs = _fixture(tmp_path)
+    rows = list(MODULE._read_jsonl(inputs["semantic_recoveries"]))
+    for row in rows:
+        row.pop("__line_number__", None)
+        row["certification"]["q_values"]["Commit [ H0 ]"] = 1.0
+        row["certification"]["optimal_actions"] = [
+            "Commit [ H0 ]",
+            "Recall [ H1 ]",
+        ]
+    _write_jsonl(inputs["semantic_recoveries"], rows)
+    with pytest.raises(ValueError, match="positive executable regret"):
+        MODULE.assemble_corrective_dataset(
+            **inputs,
+            output=tmp_path / "output",
+            train_size=20,
+            dev_size=20,
+        )
+
+
+def test_success_pool_excludes_accepted_no_progress_trajectory(tmp_path):
+    qid = "train-question"
+    rollout = _successful_rollout(qid, 0, True)
+    rollout["decisions"][0]["no_progress"] = True
+    rollout["decisions"][0]["state_before_hash"] = "same"
+    rollout["decisions"][0]["state_after_hash"] = "same"
+    path = tmp_path / "masked.jsonl"
+    _write_jsonl(path, [rollout])
+
+    successes, recoveries = MODULE._load_rollout_candidates(
+        path,
+        expected_masked=True,
+        seed=1,
+        dev_fraction=0.5,
+        test_ids={"test"},
+        train_ids={qid},
+    )
+    assert successes == []
+    assert recoveries == []

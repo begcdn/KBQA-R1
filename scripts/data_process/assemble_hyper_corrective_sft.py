@@ -36,6 +36,7 @@ from dataclasses import dataclass
 import hashlib
 import heapq
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -498,10 +499,20 @@ def _load_rollout_candidates(
             and _value(trajectory, "forced_terminal", default=False) is False
             and abs(float(_value(trajectory, "commit_answer_f1", "hyper_r1_commit_answer_f1", default=-1.0)) - 1.0) <= 1e-9
         )
-        if successful:
+        clean_success = successful
+        previous = None
+        for decision in decisions:
+            if (
+                _value(decision, "accepted", "action_accepted", default=False) is not True
+                or bool(_failure_kind(decision))
+                or bool(_value(decision, "no_progress", default=False))
+                or _second_identical_no_progress(previous, decision)
+            ):
+                clean_success = False
+                break
+            previous = decision
+        if clean_success:
             for decision in decisions:
-                if _value(decision, "accepted", "action_accepted", default=False) is not True:
-                    raise ValueError(f"successful rollout {rollout_id} contains an unaccepted action")
                 turn = int(_value(decision, "turn", "decision_index", default=-1))
                 successes.append(
                     _candidate(
@@ -592,14 +603,26 @@ def _validate_semantic_certificate(
         epsilon = float(certificate["epsilon"])
         q_values = {str(key): float(value) for key, value in certificate["q_values"].items()}
         optimal = {str(value) for value in certificate["optimal_actions"]}
+        failed_action = str(certificate["failed_action"]).strip()
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError("semantic recovery has malformed executable-regret values") from exc
-    if not (0.0 <= epsilon <= 0.1) or not q_values:
+    if (
+        not math.isfinite(epsilon)
+        or not (0.0 <= epsilon <= 0.1)
+        or not q_values
+        or not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in q_values.values())
+    ):
         raise ValueError("semantic recovery epsilon/Q values are invalid")
+    if not failed_action or failed_action == action:
+        raise ValueError("semantic recovery must identify a distinct failed action")
+    if failed_action not in q_values:
+        raise ValueError("semantic recovery failed action is absent from Q values")
     maximum = max(q_values.values())
     expected = {candidate for candidate, value in q_values.items() if value >= maximum - epsilon - 1e-12}
     if optimal != expected or action not in optimal:
         raise ValueError("semantic recovery optimal action set is inconsistent with Q values")
+    if failed_action in optimal or maximum - q_values[failed_action] <= epsilon + 1e-12:
+        raise ValueError("semantic recovery does not certify positive executable regret")
     return _digest(certificate)
 
 
