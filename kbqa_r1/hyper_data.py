@@ -4592,7 +4592,14 @@ class DemonstrationValidator:
                 node_id = step.arguments[0]
                 if node_id not in active:
                     errors.append(f"Select targets inactive {node_id}")
-                elif not demo.hypotheses[node_id].denotation:
+                elif selected == node_id:
+                    errors.append(f"Select repeats already selected {node_id}")
+                elif (
+                    not demo.hypotheses[node_id].denotation
+                    and not public_question_contract(
+                        demo.question
+                    ).count_completion_possible
+                ):
                     errors.append(f"Select targets empty {node_id}")
                 else:
                     selected = node_id

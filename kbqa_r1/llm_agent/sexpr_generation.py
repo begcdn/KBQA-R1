@@ -18,6 +18,7 @@ from kbqa_r1.answer_utils import extract_last_answer_values
 from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
+                              hyper_observation_diagnostics,
                               proposal_action_targets,
                               public_frontier_signature,
                               render_hyper_information,
@@ -907,14 +908,6 @@ class SExprLLMGenerationManager:
                 sample_id, action.action_type.value, action.arguments
             )
             if action.action_type == ActionType.WIDEN_FRONTIER:
-                if not self.hyper_graph.has_capacity(sample_id):
-                    raise RuntimeError(
-                        "the persistent hypothesis store is exhausted; exploration is closed"
-                    )
-                if not self.hyper_graph.has_execution_budget(sample_id):
-                    raise RuntimeError(
-                        "the execution budget is exhausted; exploration is closed"
-                    )
                 if graph_state.selected_id is not None:
                     raise ValueError("Widen before Select so the original frontier remains current")
                 source = str(action.arguments[0])
@@ -1465,23 +1458,46 @@ class SExprLLMGenerationManager:
 
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations (same as original)"""
-        next_obs_ids = self.tokenizer(
+        encoded = self.tokenizer(
             next_obs, 
             padding='longest',
             return_tensors='pt',
             add_special_tokens=False,
-        )['input_ids']
+        )
+        next_obs_ids = encoded['input_ids']
 
         if next_obs_ids.shape[1] > self.config.max_obs_length:
-            logger.warning(f"Observation too long: {next_obs_ids.shape[1]} > {self.config.max_obs_length}")
+            attention_mask = encoded.get('attention_mask')
+            if attention_mask is None:
+                lengths = torch.tensor(
+                    [
+                        len(self.tokenizer.encode(value, add_special_tokens=False))
+                        for value in next_obs
+                    ]
+                )
+            else:
+                lengths = attention_mask.sum(dim=1)
+            longest_index = int(torch.argmax(lengths).item())
+            longest_length = int(lengths[longest_index].item())
+            diagnostic = hyper_observation_diagnostics(
+                next_obs[longest_index],
+                sample_index=longest_index,
+                token_length=longest_length,
+            )
+            diagnostic["max_obs_length"] = int(self.config.max_obs_length)
+            logger.warning(
+                "HyPER observation diagnostic: %s",
+                json.dumps(diagnostic, sort_keys=True),
+            )
             
             # 记录完整的observation字符串到日志文件
-            self.logging_manager.log_long_observations(next_obs, next_obs_ids.shape[1])
+            self.logging_manager.log_long_observations(next_obs, longest_length)
             
             if self.hyper_r1_enable:
                 raise RuntimeError(
                     "HyPER-R1 observation truncation would remove public state or "
-                    "legal affordances; increase max_obs_length"
+                    f"legal affordances for batch sample {longest_index} "
+                    f"({longest_length}>{self.config.max_obs_length}); increase max_obs_length"
                 )
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 

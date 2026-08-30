@@ -12,6 +12,7 @@ from kbqa_r1.hyper_r1 import (
     enforce_commit_reward,
     dependency_function_state,
     graph_action_token_mask,
+    hyper_observation_diagnostics,
     penalize_invalid_actions,
     proposal_action_targets,
     public_frontier_signature,
@@ -134,6 +135,72 @@ def test_recall_restores_runtime_creation_order_in_every_affordance():
     assert "Park=[H0,H1,H2]" in rendered
     assert "Commit(nonempty active)=[H0,H1,H2]" in rendered
     assert "Combine=[H0|H1,H0|H2,H1|H2]" in rendered
+
+
+def test_graph_action_affordances_are_the_rendered_runtime_targets():
+    graph = HypothesisGraph(max_active=4, max_nodes=8, max_execution_attempts=6)
+    graph.register_public_question(0, "Which entity satisfies the condition?")
+    answer = add(graph, "r.answer", ["m.answer"])
+    empty = add(graph, "r.empty", [])
+    parked = add(graph, "r.parked", ["m.other"])
+    graph.park(0, parked.node_id)
+
+    affordances = graph.action_affordances(0, candidate_sources=("m.topic",))
+    rendered = graph.serialize(0, candidate_sources=("m.topic",))
+
+    assert affordances.select == (answer.node_id,)
+    assert affordances.park == (answer.node_id, empty.node_id)
+    assert affordances.commit == (answer.node_id,)
+    assert affordances.combine == (f"{answer.node_id}|{empty.node_id}",)
+    assert affordances.prune == (empty.node_id,)
+    assert affordances.recall == (parked.node_id,)
+    assert affordances.find_relation == ("m.topic",)
+    assert f"Select=[{answer.node_id}]" in rendered
+    assert f"Prune candidates=[{empty.node_id}]" in rendered
+    assert f"Recall=[{parked.node_id}]" in rendered
+
+
+def test_selected_and_terminal_states_update_shared_affordances():
+    graph = HypothesisGraph(max_active=3)
+    answer = add(graph, "r.answer", ["m.answer"])
+    alternative = add(graph, "r.alternative", ["m.alternative"])
+
+    graph.select(0, answer.node_id)
+    selected = graph.action_affordances(0, candidate_sources=("m.topic",))
+    assert selected.select == (alternative.node_id,)
+    assert selected.find_relation == ("expression1",)
+
+    graph.commit(0, answer.node_id)
+    terminal = graph.action_affordances(0, candidate_sources=("m.topic",))
+    assert not any(vars(terminal).values())
+
+
+def test_observation_diagnostics_identify_state_growth_sources():
+    observation = """<information>
+<hypothesis_graph>
+active=2 capacity=24 stored=7 parked=3 execution_attempts=5/24 turns_used=14/16 turns_remaining=2 selected=none committed=none
+H0 [active] parents=ROOT operation=expand via=r.a depth=0 path=r.a answers=1: m.a
+H4 [active] parents=H0 operation=expand via=r.b depth=1 path=r.a -> r.b answers=1: m.b
+Available targets: Select=[H0,H4]; Park=[H0,H4]; Commit(nonempty active)=[H0,H4].
+</hypothesis_graph>
+<proposal_catalog>
+Available proposal targets: Inspect=[P0,P1]; Widen=[m.topic].
+</proposal_catalog>
+</information>"""
+
+    diagnostics = hyper_observation_diagnostics(
+        observation, sample_index=3, token_length=8229
+    )
+
+    assert diagnostics["sample_index"] == 3
+    assert diagnostics["token_length"] == 8229
+    assert diagnostics["active"] == 2
+    assert diagnostics["stored"] == 7
+    assert diagnostics["parked"] == 3
+    assert diagnostics["turns_used"] == 14
+    assert diagnostics["proposal_catalogs"] == 1
+    assert diagnostics["visible_graph_rows"] == 2
+    assert diagnostics["target_line_characters"] > 100
 
 
 def test_same_denotation_with_different_meaning_stays_distinct():
@@ -589,6 +656,49 @@ def test_proposal_affordances_respect_selection_and_resource_budgets():
     )
     assert inspect == ()
     assert widen is None
+
+    inspect, widen = proposal_action_targets(
+        ("P0",),
+        "m.topic",
+        exposed=1,
+        total=4,
+        selected_id=None,
+        active_count=2,
+        max_active=2,
+        node_count=4,
+        max_nodes=4,
+        execution_attempts=3,
+        execution_budget=3,
+    )
+    assert inspect == ()
+    assert widen == "m.topic"
+
+
+def test_symbolic_relation_browsing_remains_legal_when_execution_is_closed():
+    graph = HypothesisGraph(max_active=2, max_nodes=2, max_execution_attempts=1)
+    add(graph, "r.answer", ["m.answer"])
+    graph.state(0).execution_attempts = 1
+
+    affordances = graph.action_affordances(0, candidate_sources=("m.topic",))
+
+    assert affordances.combine == ()
+    assert affordances.find_relation == ("m.topic",)
+    assert graph.execution_error(
+        0,
+        opens_frontier=True,
+        frontier_width=6,
+        opens_new_root=True,
+        operation="Find_relation",
+    ) is None
+
+    graph.park(0, "H0")
+    assert graph.execution_error(
+        0,
+        opens_frontier=True,
+        frontier_width=6,
+        opens_new_root=True,
+        operation="Find_relation",
+    ) is None
 
 
 def test_serialization_pairs_readable_labels_with_stable_entity_ids():

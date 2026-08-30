@@ -158,6 +158,19 @@ class PruneCertificate:
     empty_preserving_completion: bool
 
 
+@dataclass(frozen=True)
+class GraphActionAffordances:
+    """Exact graph-control targets exposed to the policy in one state."""
+
+    select: Tuple[str, ...] = ()
+    park: Tuple[str, ...] = ()
+    commit: Tuple[str, ...] = ()
+    combine: Tuple[str, ...] = ()
+    prune: Tuple[str, ...] = ()
+    recall: Tuple[str, ...] = ()
+    find_relation: Tuple[str, ...] = ()
+
+
 def normalize_denotation(values: Iterable[str]) -> Tuple[str, ...]:
     """Canonicalize an executor result without erasing entity identity."""
     normalized = []
@@ -345,10 +358,137 @@ def proposal_action_targets(
     inspect = tuple(str(value) for value in visible_ids) if can_inspect else ()
     widen = (
         str(source)
-        if can_inspect and selected_id is None and exposed < total
+        if selected_id is None and exposed < total
         else None
     )
     return inspect, widen
+
+
+def graph_action_affordances(
+    nodes: Sequence[Mapping[str, Any]],
+    *,
+    active_ids: Sequence[str],
+    selected_id: Optional[str],
+    committed_id: Optional[str],
+    max_active: int,
+    node_count: int,
+    max_nodes: Optional[int],
+    parked_nodes: Sequence[Mapping[str, Any]],
+    execution_calls: int,
+    execution_budget: Optional[int],
+    count_completion_possible: bool,
+    candidate_sources: Sequence[str],
+) -> GraphActionAffordances:
+    """Derive protocol-legal graph targets from one public state.
+
+    The result is suitable for prompt rendering and constrained generation. It
+    intentionally does not rank semantically preferable actions.
+    """
+    if committed_id is not None:
+        return GraphActionAffordances()
+
+    node_by_id = {str(node["node_id"]): node for node in nodes}
+    ordered_active = tuple(str(node_id) for node_id in active_ids)
+    select = tuple(
+        node_id
+        for node_id in ordered_active
+        if node_id != selected_id
+        and (
+            count_completion_possible
+            or normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+        )
+    )
+    commit = tuple(
+        node_id
+        for node_id in ordered_active
+        if normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+    )
+    parked = tuple(str(node["node_id"]) for node in parked_nodes)
+    recall = parked if len(ordered_active) < max_active else ()
+    prune = tuple(
+        node_id
+        for node_id in ordered_active
+        if not count_completion_possible
+        and not normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
+    )
+    has_node_capacity = max_nodes is None or node_count < max_nodes
+    has_execution_budget = (
+        execution_budget is None or execution_calls < execution_budget
+    )
+    combine: Tuple[str, ...] = ()
+    if has_node_capacity and has_execution_budget:
+        combine = tuple(
+            f"{left}|{right}"
+            for index, left in enumerate(ordered_active)
+            for right in ordered_active[index + 1 :]
+        )
+
+    relation_sources = tuple(
+        dict.fromkeys(str(value) for value in candidate_sources if str(value))
+    )
+    if selected_id is not None:
+        selected_target = str(
+            node_by_id.get(str(selected_id), {}).get("target_expression", "")
+        ).strip()
+        relation_sources = (selected_target,) if selected_target else ()
+    return GraphActionAffordances(
+        select=select,
+        park=ordered_active,
+        commit=commit,
+        combine=combine,
+        prune=prune,
+        recall=recall,
+        find_relation=relation_sources,
+    )
+
+
+def hyper_observation_diagnostics(
+    observation: str,
+    *,
+    sample_index: int,
+    token_length: int,
+) -> Dict[str, Any]:
+    """Summarize an oversized public state without copying it into the log."""
+    text = str(observation)
+    state_match = re.search(
+        r"active=(\d+)\s+capacity=(\d+)\s+stored=(\d+)\s+"
+        r"parked=(\d+)\s+execution_attempts=(\d+)(?:/(\d+))?"
+        r"(?:\s+turns_used=(\d+)/(\d+))?",
+        text,
+    )
+    state_values = tuple(state_match.groups()) if state_match else ()
+    target_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip().startswith(
+            ("Available targets:", "Available proposal targets:")
+        )
+    ]
+    return {
+        "event": "hyper_observation_too_long",
+        "sample_index": int(sample_index),
+        "token_length": int(token_length),
+        "character_length": len(text),
+        "active": int(state_values[0]) if state_values else None,
+        "capacity": int(state_values[1]) if state_values else None,
+        "stored": int(state_values[2]) if state_values else None,
+        "parked": int(state_values[3]) if state_values else None,
+        "execution_attempts": int(state_values[4]) if state_values else None,
+        "execution_budget": (
+            int(state_values[5]) if state_values and state_values[5] else None
+        ),
+        "turns_used": (
+            int(state_values[6]) if state_values and state_values[6] else None
+        ),
+        "max_turns": (
+            int(state_values[7]) if state_values and state_values[7] else None
+        ),
+        "proposal_catalogs": text.count("<proposal_catalog>"),
+        "visible_graph_rows": len(
+            re.findall(r"(?m)^H\d+ \[(?:active|committed)\]", text)
+        ),
+        "target_line_characters": sum(len(line) for line in target_lines),
+    }
 
 
 def serialize_frontier(
@@ -409,59 +549,30 @@ def serialize_frontier(
             f"depth={int(node.get('depth', 0))} "
             f"path={path} answers={len(denotation)}: {answers}"
         )
-    ordered_active = [str(node_id) for node_id in active_ids]
-    select_targets = [
-        node_id
-        for node_id in ordered_active
-        if count_completion_possible
-        or normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
-    ]
-    commit_targets = [
-        node_id
-        for node_id in ordered_active
-        if normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
-    ]
-    parked_ids = [str(node["node_id"]) for node in parked_nodes]
-    recall_targets = parked_ids if len(ordered_active) < max_active else []
-    prune_targets = [
-        node_id
-        for node_id in ordered_active
-        if not count_completion_possible
-        and not normalize_denotation(node_by_id.get(node_id, {}).get("denotation", ()))
-    ]
-    has_node_capacity = max_nodes is None or node_count < max_nodes
-    has_execution_budget = (
-        execution_budget is None or execution_calls < execution_budget
+    affordances = graph_action_affordances(
+        nodes,
+        active_ids=active_ids,
+        selected_id=selected_id,
+        committed_id=committed_id,
+        max_active=max_active,
+        node_count=node_count,
+        max_nodes=max_nodes,
+        parked_nodes=parked_nodes,
+        execution_calls=execution_calls,
+        execution_budget=execution_budget,
+        count_completion_possible=count_completion_possible,
+        candidate_sources=candidate_sources,
     )
-    combine_targets = []
-    if has_node_capacity and has_execution_budget:
-        combine_targets = [
-            f"{left}|{right}"
-            for index, left in enumerate(ordered_active)
-            for right in ordered_active[index + 1 :]
-        ]
-    relation_sources = list(
-        dict.fromkeys(str(value) for value in candidate_sources if str(value))
-    )
-    if selected_id is not None:
-        selected_target = str(
-            node_by_id.get(str(selected_id), {}).get("target_expression", "")
-        ).strip()
-        relation_sources = [selected_target] if selected_target else []
-    if committed_id is not None:
-        relation_sources = []
-    if not has_node_capacity or not has_execution_budget:
-        relation_sources = []
     show = lambda values: ",".join(values) if values else "none"
     lines.append(
         "Available targets: "
-        f"Select=[{show(select_targets)}]; "
-        f"Park=[{show(ordered_active)}]; "
-        f"Commit(nonempty active)=[{show(commit_targets)}]; "
-        f"Combine=[{show(combine_targets)}]; "
-        f"Prune candidates=[{show(prune_targets)}]; "
-        f"Recall=[{show(recall_targets)}]; "
-        f"Find_relation sources=[{show(relation_sources)}]. "
+        f"Select=[{show(affordances.select)}]; "
+        f"Park=[{show(affordances.park)}]; "
+        f"Commit(nonempty active)=[{show(affordances.commit)}]; "
+        f"Combine=[{show(affordances.combine)}]; "
+        f"Prune candidates=[{show(affordances.prune)}]; "
+        f"Recall=[{show(affordances.recall)}]; "
+        f"Find_relation sources=[{show(affordances.find_relation)}]. "
         "Do not use an ID or source absent from its action-specific list."
     )
     lines.append(
@@ -869,20 +980,21 @@ class HypothesisGraph:
             )
         if active and graph.selected_id is None and not opens_new_root:
             return "Select an active hypothesis before any executable continuation."
-        if not active and graph.nodes and graph.selected_id is None:
+        if (
+            not active
+            and graph.nodes
+            and graph.selected_id is None
+            and not opens_new_root
+        ):
             return "No active hypothesis can be continued."
         if not graph.nodes and not opens_frontier and not opens_new_root:
             return "Begin the executable frontier with Find_relation."
-        if not self.has_execution_budget(sample_id) and (
-            opens_frontier or operation_name in {"widen", "inspect"}
-        ):
+        if not self.has_execution_budget(sample_id) and operation_name == "inspect":
             return (
                 "The execution budget is exhausted. Exploration is closed; "
                 "Select or recall a supported nonempty hypothesis and Commit it."
             )
-        if not self.has_capacity(sample_id) and (
-            opens_frontier or operation_name in {"widen", "inspect"}
-        ):
+        if not self.has_capacity(sample_id) and operation_name == "inspect":
             return (
                 "The persistent hypothesis store is exhausted. Exploration is "
                 "closed; Select or recall a supported nonempty hypothesis and Commit it."
@@ -1183,6 +1295,30 @@ class HypothesisGraph:
             lineage.append(current)
             current = graph.nodes[current].parent_id
         return lineage
+
+    def action_affordances(
+        self,
+        sample_id: int,
+        candidate_sources: Sequence[str] = (),
+    ) -> GraphActionAffordances:
+        """Return the same graph targets rendered in the policy observation."""
+        graph = self.state(sample_id)
+        nodes = [node.__dict__ for node in graph.nodes.values()]
+        parked = [node.__dict__ for node in self.parked_nodes(sample_id)]
+        return graph_action_affordances(
+            nodes,
+            active_ids=[node.node_id for node in self.active_nodes(sample_id)],
+            selected_id=graph.selected_id,
+            committed_id=graph.committed_id,
+            max_active=self.max_active,
+            node_count=len(graph.nodes),
+            max_nodes=self.max_nodes,
+            parked_nodes=parked,
+            execution_calls=graph.execution_attempts,
+            execution_budget=self.max_execution_attempts,
+            count_completion_possible=self.count_completion_possible(sample_id),
+            candidate_sources=candidate_sources,
+        )
 
     def serialize(
         self,
