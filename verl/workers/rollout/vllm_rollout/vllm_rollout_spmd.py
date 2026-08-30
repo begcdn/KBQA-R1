@@ -376,10 +376,10 @@ class vLLMRollout(BaseRollout):
                     params.frequency_penalty = 0.0
                     params.repetition_penalty = 1.0
                     params.min_tokens = 0
-                    params.guided_decoding = GuidedDecodingParams(
-                        regex=spec.response_pattern,
-                        backend="xgrammar:no-fallback",
-                    )
+                    guided_kwargs = {"regex": spec.response_pattern}
+                    if not is_version_ge(pkg="vllm", minver="0.10.0"):
+                        guided_kwargs["backend"] = "xgrammar:no-fallback"
+                    params.guided_decoding = GuidedDecodingParams(**guided_kwargs)
                     request_sampling_params.append(params)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id

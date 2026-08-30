@@ -108,6 +108,13 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
 FSDP_MODEL_DTYPE=${FSDP_MODEL_DTYPE:-fp32}
 HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
 HYPER_R1_STRUCTURAL_CONSTRAINTS=${HYPER_R1_STRUCTURAL_CONSTRAINTS:-false}
+if [[ "${HYPER_R1_STRUCTURAL_CONSTRAINTS}" == "true" ]]; then
+    GUIDED_DECODING_BACKEND=xgrammar
+    GUIDED_DECODING_DISABLE_FALLBACK=true
+else
+    GUIDED_DECODING_BACKEND=auto
+    GUIDED_DECODING_DISABLE_FALLBACK=false
+fi
 HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-24}
 HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-128}
 HYPER_R1_MAX_EXECUTION_ATTEMPTS=${HYPER_R1_MAX_EXECUTION_ATTEMPTS:-24}
@@ -229,6 +236,8 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.actor.state_masking=true \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.rollout.name=vllm \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.guided_decoding_backend=${GUIDED_DECODING_BACKEND} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.guided_decoding_disable_fallback=${GUIDED_DECODING_DISABLE_FALLBACK} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${TENSOR_MODEL_PARALLEL_SIZE} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_BATCHED_TOKENS} \

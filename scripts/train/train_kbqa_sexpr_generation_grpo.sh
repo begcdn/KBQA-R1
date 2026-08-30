@@ -195,6 +195,13 @@ rollout_is_veto_threshold=${rollout_is_veto_threshold:-null} # per-token veto (n
 
 hyper_r1_enable=${hyper_r1_enable:-false}
 hyper_r1_structural_constraints=${hyper_r1_structural_constraints:-false}
+if [[ "${hyper_r1_structural_constraints}" == "true" ]]; then
+    guided_decoding_backend=xgrammar
+    guided_decoding_disable_fallback=true
+else
+    guided_decoding_backend=auto
+    guided_decoding_disable_fallback=false
+fi
 if [[ "${hyper_r1_enable}" == "true" ]]; then
     max_turns=${max_turns:-32}
 else
@@ -343,6 +350,8 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_cascade_attn=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.guided_decoding_backend=${guided_decoding_backend} \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.guided_decoding_disable_fallback=${guided_decoding_disable_fallback} \
     actor_rollout_ref.actor.optim.lr=${actor_lr} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
