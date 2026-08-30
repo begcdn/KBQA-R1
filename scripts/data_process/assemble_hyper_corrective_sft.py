@@ -58,6 +58,7 @@ MIXTURE = {
 }
 ASSEMBLY_SCHEMA_VERSION = "hyper-corrective-assembly-v1"
 SEMANTIC_CERTIFICATE_VERSION = "hyper-semantic-recovery-v1"
+MAX_SELECTED_STATES_PER_QUESTION = 8
 REQUIRED_PROVENANCE = {
     "repository_commit",
     "checkpoint_sha256",
@@ -721,10 +722,13 @@ def _stratified_sample(
     seed: int,
     excluded_states: set[str],
     recovery_rollouts: set[str],
+    question_counts: dict[str, int],
 ) -> list[Candidate]:
     groups: dict[tuple[str, ...], list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         if candidate.state_hash in excluded_states:
+            continue
+        if question_counts.get(candidate.question_id, 0) >= MAX_SELECTED_STATES_PER_QUESTION:
             continue
         if "recovery" in candidate.category and candidate.rollout_id in recovery_rollouts:
             continue
@@ -739,9 +743,10 @@ def _stratified_sample(
         candidate = values[offset]
         if candidate.state_hash not in excluded_states and not (
             "recovery" in candidate.category and candidate.rollout_id in recovery_rollouts
-        ):
+        ) and question_counts.get(candidate.question_id, 0) < MAX_SELECTED_STATES_PER_QUESTION:
             chosen.append(candidate)
             excluded_states.add(candidate.state_hash)
+            question_counts[candidate.question_id] = question_counts.get(candidate.question_id, 0) + 1
             if "recovery" in candidate.category:
                 recovery_rollouts.add(candidate.rollout_id)
         offset += 1
@@ -932,6 +937,7 @@ def assemble_corrective_dataset(
     for partition in ("train", "dev"):
         excluded_states: set[str] = set()
         recovery_rollouts: set[str] = set()
+        question_counts: dict[str, int] = {}
         # Select scarce recoveries first; later pools cannot duplicate their
         # public states. Protocol recovery has precedence over semantic rows
         # from the same rollout.
@@ -949,6 +955,7 @@ def assemble_corrective_dataset(
                     seed=seed,
                     excluded_states=excluded_states,
                     recovery_rollouts=recovery_rollouts,
+                    question_counts=question_counts,
                 )
             )
 
@@ -1020,6 +1027,7 @@ def assemble_corrective_dataset(
             "assembler_commit": _git_commit(repository_root),
             "student_visible_recovery_marker": False,
             "fixed_state_weight": 1.0,
+            "maximum_selected_states_per_question": MAX_SELECTED_STATES_PER_QUESTION,
             "seed": seed,
             "dev_fraction": dev_fraction,
             "mixture_percent": MIXTURE,

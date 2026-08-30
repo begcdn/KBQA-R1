@@ -289,6 +289,12 @@ def test_assembles_exact_deterministic_question_disjoint_mixture(tmp_path):
     assert train_qids.isdisjoint(dev_qids)
     assert "held-out-test" not in train_qids | dev_qids
     assert all(row["extra_info"]["state_weight"] == 1.0 for row in train + dev)
+    for rows in (train, dev):
+        counts = {}
+        for row in rows:
+            qid = row["extra_info"]["question_id"]
+            counts[qid] = counts.get(qid, 0) + 1
+        assert max(counts.values()) <= MODULE.MAX_SELECTED_STATES_PER_QUESTION
     assert all("recovery mode" not in str(row["messages"]).lower() for row in train + dev)
     recovery_rollouts = [
         row["extra_info"]["source_rollout_id"]
