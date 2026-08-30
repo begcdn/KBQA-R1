@@ -707,6 +707,13 @@ class SExprActionProcessor:
         - Requires at least one existing expression path in function_state
         - If absent, mark action invalid and DO NOT attempt execution
         """
+        if not action.arguments or len(action.arguments) != 2:
+            action.is_valid = False
+            action.error_message = (
+                "Time_constraint requires exactly 2 arguments: [relation | time]"
+            )
+            return action
+
         # Debug: print full persistent function_state for TC
         fs_len = len(function_state) if function_state is not None else 0
         logger.info(f"[TC-DEBUG] Persistent function_state length: {fs_len}")
@@ -805,6 +812,7 @@ class SExprActionProcessor:
                 action.is_valid = False
                 action.error_message = info
                 action.raw_text = (action.raw_text or '') + "\n" + info
+                return action
 
 
         action.is_valid = True
