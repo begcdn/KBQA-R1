@@ -47,6 +47,8 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from kbqa_r1.action_constraints import HyPERActionConstraintSpec
+
 
 MIXTURE = {
     "ordinary_v23": 50,
@@ -435,10 +437,17 @@ def _second_identical_no_progress(
         return False
     if not bool(_value(previous, "no_progress", default=False)):
         return False
-    before = str(_value(previous, "state_before_hash", default=""))
-    after = str(_value(previous, "state_after_hash", default=""))
-    current_before = str(_value(current, "state_before_hash", default=""))
+    before = str(_value(previous, "progress_before_hash", default=""))
+    after = str(_value(previous, "progress_after_hash", default=""))
+    current_before = str(_value(current, "progress_before_hash", default=""))
     return bool(before and before == after == current_before)
+
+
+def _constraint_spec(record: Mapping[str, Any]) -> HyPERActionConstraintSpec:
+    payload = _value(record, "constraint_spec", "action_constraint")
+    if not isinstance(payload, Mapping):
+        raise ValueError("decision record lacks its state-conditioned constraint spec")
+    return HyPERActionConstraintSpec.from_dict(payload)
 
 
 def _correction_messages(
@@ -454,13 +463,21 @@ def _correction_messages(
     certifier_hash = str(correction.get("certifier_hash", "")).strip()
     if not certifier_hash:
         raise ValueError(f"{failure_kind} correction lacks certifier_hash")
-    expected_state = str(_value(decision, "state_before_hash", default=""))
-    if not expected_state or str(correction.get("state_hash", "")) != expected_state:
-        raise ValueError(f"{failure_kind} correction state hash mismatch")
     corrected, _ = _target_action(correction.get("messages"))
     observed = _message_copy(decision.get("messages"))
     if corrected[:-1] != observed[:-1]:
         raise ValueError(f"{failure_kind} correction changes the student-visible state")
+    expected_state = _state_hash(observed)
+    if (
+        str(_value(decision, "state_before_hash", default="")) != expected_state
+        or str(correction.get("state_hash", "")) != expected_state
+    ):
+        raise ValueError(f"{failure_kind} correction state hash mismatch")
+    spec = _constraint_spec(decision)
+    if str(correction.get("constraint_digest", "")) != spec.digest:
+        raise ValueError(f"{failure_kind} correction constraint digest mismatch")
+    if not spec.accepts_response(corrected[-1]["content"]):
+        raise ValueError(f"{failure_kind} correction is outside the legal action language")
     if failure_kind == "deadline" and correction.get("completion_reachable") is not True:
         raise ValueError("deadline correction is not certified reachable")
     return corrected, certifier_hash
@@ -500,6 +517,8 @@ def _load_rollout_candidates(
             and abs(float(_value(trajectory, "commit_answer_f1", "hyper_r1_commit_answer_f1", default=-1.0)) - 1.0) <= 1e-9
         )
         clean_success = successful
+        if not decisions or not _decision_action(decisions[-1]).startswith("Commit ["):
+            clean_success = False
         previous = None
         for decision in decisions:
             if (
@@ -593,6 +612,12 @@ def _validate_semantic_certificate(
         raise ValueError("semantic recovery certificate state hash mismatch")
     if str(certificate.get("target_action", "")).strip() != action:
         raise ValueError("semantic recovery target differs from certified action")
+    spec = _constraint_spec(row)
+    if str(certificate.get("constraint_digest", "")) != spec.digest:
+        raise ValueError("semantic recovery constraint digest mismatch")
+    messages, _ = _target_action(row.get("messages"))
+    if not spec.accepts_response(messages[-1]["content"]):
+        raise ValueError("semantic recovery target is outside the legal action language")
     for key in ("ranker_sha256", "freebase_sha256"):
         if str(certificate.get(key, "")) != str(provenance[key]):
             raise ValueError(f"semantic recovery {key} differs from run provenance")
@@ -604,12 +629,14 @@ def _validate_semantic_certificate(
         q_values = {str(key): float(value) for key, value in certificate["q_values"].items()}
         optimal = {str(value) for value in certificate["optimal_actions"]}
         failed_action = str(certificate["failed_action"]).strip()
+        legal_actions = {str(value) for value in certificate["legal_actions"]}
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError("semantic recovery has malformed executable-regret values") from exc
     if (
         not math.isfinite(epsilon)
         or not (0.0 <= epsilon <= 0.1)
         or not q_values
+        or not legal_actions
         or not all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in q_values.values())
     ):
         raise ValueError("semantic recovery epsilon/Q values are invalid")
@@ -617,6 +644,8 @@ def _validate_semantic_certificate(
         raise ValueError("semantic recovery must identify a distinct failed action")
     if failed_action not in q_values:
         raise ValueError("semantic recovery failed action is absent from Q values")
+    if set(q_values) != legal_actions:
+        raise ValueError("semantic recovery Q values do not cover its legal candidate set")
     maximum = max(q_values.values())
     expected = {candidate for candidate, value in q_values.items() if value >= maximum - epsilon - 1e-12}
     if optimal != expected or action not in optimal:

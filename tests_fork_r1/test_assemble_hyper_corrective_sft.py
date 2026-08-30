@@ -57,6 +57,16 @@ def _messages(question_id: str, state: str, action: str):
     return messages
 
 
+def _constraint(messages, actions):
+    spec = MODULE.HyPERActionConstraintSpec(
+        state_key="runtime-state",
+        turn=0,
+        exact_actions=tuple(actions),
+        allow_open_operators=False,
+    )
+    return spec.to_dict(), MODULE._state_hash(messages)
+
+
 def _partitioned_qids(seed: int, dev_fraction: float, count: int):
     result = {"train": [], "dev": []}
     index = 0
@@ -116,14 +126,23 @@ def _successful_rollout(qid: str, index: int, masked: bool):
         "family": "success",
         "decisions": [
             {
-                "turn": index % 4,
+                "turn": 0,
                 "accepted": True,
                 "messages": _messages(
                     qid,
                     f"successful-{masked}-{index}",
                     "Inspect [ P0 ]",
                 ),
-            }
+            },
+            {
+                "turn": 1,
+                "accepted": True,
+                "messages": _messages(
+                    qid,
+                    f"successful-commit-{masked}-{index}",
+                    "Commit [ H0 ]",
+                ),
+            },
         ],
     }
 
@@ -131,7 +150,10 @@ def _successful_rollout(qid: str, index: int, masked: bool):
 def _protocol_rollout(qid: str, index: int, masked: bool):
     bad_messages = _messages(qid, f"protocol-{masked}-{index}", "Inspect [ P999 ]")
     correction = _messages(qid, f"protocol-{masked}-{index}", "Widen [ m.root ]")
-    state_hash = f"protocol-state-{qid}-{masked}"
+    constraint, state_hash = _constraint(
+        bad_messages,
+        ["Inspect [ P0 ]", "Widen [ m.root ]"],
+    )
     return {
         "rollout_id": f"protocol-{qid}-{masked}",
         "question_id": qid,
@@ -148,11 +170,13 @@ def _protocol_rollout(qid: str, index: int, masked: bool):
                 "accepted": False,
                 "failure_kind": "protocol",
                 "state_before_hash": state_hash,
+                "constraint_spec": constraint,
                 "messages": bad_messages,
                 "correction": {
                     "messages": correction,
                     "legal_target_certified": True,
                     "state_hash": state_hash,
+                    "constraint_digest": constraint["digest"],
                     "certifier_hash": "legal-set",
                 },
             }
@@ -162,7 +186,10 @@ def _protocol_rollout(qid: str, index: int, masked: bool):
 
 def _semantic_row(qid: str, index: int):
     messages = _messages(qid, f"semantic-{index}", "Recall [ H1 ]")
-    state_hash = MODULE._state_hash(messages)
+    constraint, state_hash = _constraint(
+        messages,
+        ["Recall [ H1 ]", "Commit [ H0 ]"],
+    )
     return {
         "rollout_id": f"semantic-{qid}",
         "question_id": qid,
@@ -171,6 +198,7 @@ def _semantic_row(qid: str, index: int):
         "turn": 8,
         "family": "semantic",
         "messages": messages,
+        "constraint_spec": constraint,
         "certification": {
             "schema_version": MODULE.SEMANTIC_CERTIFICATE_VERSION,
             "certified": True,
@@ -181,12 +209,14 @@ def _semantic_row(qid: str, index: int):
             "first_meaningful_failure": True,
             "state_hash": state_hash,
             "target_action": "Recall [ H1 ]",
+            "constraint_digest": constraint["digest"],
             "ranker_sha256": "ranker",
             "freebase_sha256": "freebase",
             "executor_hash": "executor",
             "certifier_hash": "certifier",
             "epsilon": 0.01,
             "failed_action": "Commit [ H0 ]",
+            "legal_actions": ["Recall [ H1 ]", "Commit [ H0 ]"],
             "q_values": {"Recall [ H1 ]": 1.0, "Commit [ H0 ]": 0.4},
             "optimal_actions": ["Recall [ H1 ]"],
         },
@@ -273,7 +303,11 @@ def test_selects_second_identical_no_progress_before_later_protocol_failure(tmp_
     first = _messages(qid, "loop", "Find_relation [ m.root ]")
     second = _messages(qid, "loop", "Find_relation [ m.root ]")
     correction = _messages(qid, "loop", "Widen [ m.root ]")
-    state_hash = "same-state"
+    constraint, state_hash = _constraint(
+        first,
+        ["Find_relation [ m.root ]", "Widen [ m.root ]"],
+    )
+    progress_hash = "same-progress"
     rollout = {
         "rollout_id": "loop-rollout",
         "question_id": qid,
@@ -289,7 +323,9 @@ def test_selects_second_identical_no_progress_before_later_protocol_failure(tmp_
                 "action": "Find_relation [ m.root ]",
                 "no_progress": True,
                 "state_before_hash": state_hash,
-                "state_after_hash": state_hash,
+                "progress_before_hash": progress_hash,
+                "progress_after_hash": progress_hash,
+                "constraint_spec": constraint,
                 "messages": first,
             },
             {
@@ -297,24 +333,39 @@ def test_selects_second_identical_no_progress_before_later_protocol_failure(tmp_
                 "action": "Find_relation [ m.root ]",
                 "no_progress": True,
                 "state_before_hash": state_hash,
-                "state_after_hash": state_hash,
+                "progress_before_hash": progress_hash,
+                "progress_after_hash": progress_hash,
+                "constraint_spec": constraint,
                 "messages": second,
                 "correction": {
                     "messages": correction,
                     "legal_target_certified": True,
                     "state_hash": state_hash,
+                    "constraint_digest": constraint["digest"],
                     "certifier_hash": "legal-set",
                 },
             },
             {
                 "turn": 2,
                 "failure_kind": "protocol",
-                "state_before_hash": "later",
+                "state_before_hash": MODULE._state_hash(
+                    _messages(qid, "later", "Inspect [ P999 ]")
+                ),
+                "constraint_spec": _constraint(
+                    _messages(qid, "later", "Inspect [ P999 ]"),
+                    ["Inspect [ P0 ]"],
+                )[0],
                 "messages": _messages(qid, "later", "Inspect [ P999 ]"),
                 "correction": {
                     "messages": _messages(qid, "later", "Inspect [ P0 ]"),
                     "legal_target_certified": True,
-                    "state_hash": "later",
+                    "state_hash": MODULE._state_hash(
+                        _messages(qid, "later", "Inspect [ P999 ]")
+                    ),
+                    "constraint_digest": _constraint(
+                        _messages(qid, "later", "Inspect [ P999 ]"),
+                        ["Inspect [ P0 ]"],
+                    )[0]["digest"],
                     "certifier_hash": "legal-set",
                 },
             },
@@ -402,12 +453,47 @@ def test_semantic_recovery_requires_positive_regret_over_failed_action(tmp_path)
         )
 
 
+def test_semantic_certificate_must_cover_declared_legal_candidates(tmp_path):
+    inputs = _fixture(tmp_path)
+    rows = list(MODULE._read_jsonl(inputs["semantic_recoveries"]))
+    for row in rows:
+        row.pop("__line_number__", None)
+        row["certification"]["legal_actions"].append("Park [ H0 ]")
+    _write_jsonl(inputs["semantic_recoveries"], rows)
+    with pytest.raises(ValueError, match="do not cover"):
+        MODULE.assemble_corrective_dataset(
+            **inputs,
+            output=tmp_path / "output",
+            train_size=20,
+            dev_size=20,
+        )
+
+
+def test_protocol_correction_state_hash_is_bound_to_visible_messages(tmp_path):
+    inputs = _fixture(tmp_path)
+    rows = list(MODULE._read_jsonl(inputs["masked_rollouts"]))
+    for row in rows:
+        row.pop("__line_number__", None)
+        if not row["trajectory_success"]:
+            row["decisions"][0]["state_before_hash"] = "forged"
+            row["decisions"][0]["correction"]["state_hash"] = "forged"
+            break
+    _write_jsonl(inputs["masked_rollouts"], rows)
+    with pytest.raises(ValueError, match="state hash mismatch"):
+        MODULE.assemble_corrective_dataset(
+            **inputs,
+            output=tmp_path / "output",
+            train_size=20,
+            dev_size=20,
+        )
+
+
 def test_success_pool_excludes_accepted_no_progress_trajectory(tmp_path):
     qid = "train-question"
     rollout = _successful_rollout(qid, 0, True)
     rollout["decisions"][0]["no_progress"] = True
-    rollout["decisions"][0]["state_before_hash"] = "same"
-    rollout["decisions"][0]["state_after_hash"] = "same"
+    rollout["decisions"][0]["progress_before_hash"] = "same"
+    rollout["decisions"][0]["progress_after_hash"] = "same"
     path = tmp_path / "masked.jsonl"
     _write_jsonl(path, [rollout])
 
