@@ -357,8 +357,6 @@ def compute_advantage(
         )
 
         deliberate = ~data.batch["hyper_r1_forced_terminal"].to(dtype=torch.bool)
-        data.batch["advantages"][~deliberate] = 0.0
-        data.batch["returns"][~deliberate] = 0.0
 
         advantages, compared_mask = apply_grouped_decision_credit(
             data.batch["advantages"],
@@ -1045,6 +1043,10 @@ class RayPPOTrainer:
                     "hyper_r1_commit_answer_f1",
                     "hyper_r1_commit_intent_equivalent",
                     "hyper_r1_abstained",
+                    "hyper_r1_explicit_model_commit",
+                    "hyper_r1_forced_terminal",
+                    "hyper_r1_forced_empty",
+                    "hyper_r1_turn_exhausted",
                 }
                 missing_hyper_fields = required_hyper_fields.difference(
                     test_batch.batch.keys()
@@ -1066,6 +1068,7 @@ class RayPPOTrainer:
                         "hyper_r1_commit_intent_equivalent"
                     ],
                     abstained=test_batch.batch["hyper_r1_abstained"],
+                    forced_terminal=test_batch.batch["hyper_r1_forced_terminal"],
                     invalid_penalty=float(
                         self.config.algorithm.get(
                             "hyper_r1_invalid_commit_penalty", 0.25
@@ -1073,6 +1076,11 @@ class RayPPOTrainer:
                     ),
                     semantic_bonus=float(
                         self.config.algorithm.get("hyper_r1_semantic_bonus", 0.1)
+                    ),
+                    forced_terminal_penalty=float(
+                        self.config.algorithm.get(
+                            "hyper_r1_forced_terminal_penalty", 0.25
+                        )
                     ),
                 )
                 reward_extra_infos_dict["hyper_r1_commit_valid"].extend(
@@ -1121,6 +1129,19 @@ class RayPPOTrainer:
                     .cpu()
                     .tolist()
                 )
+                for field in (
+                    "hyper_r1_explicit_model_commit",
+                    "hyper_r1_forced_terminal",
+                    "hyper_r1_forced_empty",
+                    "hyper_r1_turn_exhausted",
+                ):
+                    reward_extra_infos_dict[field].extend(
+                        float(value)
+                        for value in test_batch.batch[field]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
@@ -1949,6 +1970,9 @@ class RayPPOTrainer:
                                 "hyper_r1_commit_intent_equivalent",
                                 "hyper_r1_abstained",
                                 "hyper_r1_forced_terminal",
+                                "hyper_r1_explicit_model_commit",
+                                "hyper_r1_forced_empty",
+                                "hyper_r1_turn_exhausted",
                                 "hyper_r1_premature_answer",
                                 "response_mask",
                             }
@@ -1972,6 +1996,9 @@ class RayPPOTrainer:
                                     "hyper_r1_commit_intent_equivalent"
                                 ],
                                 abstained=batch.batch["hyper_r1_abstained"],
+                                forced_terminal=batch.batch[
+                                    "hyper_r1_forced_terminal"
+                                ],
                                 invalid_penalty=float(
                                     self.config.algorithm.get(
                                         "hyper_r1_invalid_commit_penalty", 0.25
@@ -1980,6 +2007,11 @@ class RayPPOTrainer:
                                 semantic_bonus=float(
                                     self.config.algorithm.get(
                                         "hyper_r1_semantic_bonus", 0.0
+                                    )
+                                ),
+                                forced_terminal_penalty=float(
+                                    self.config.algorithm.get(
+                                        "hyper_r1_forced_terminal_penalty", 0.25
                                     )
                                 ),
                             )
@@ -2060,6 +2092,30 @@ class RayPPOTrainer:
                             )
                             metrics["hyper_r1/abstain_rate"] = float(
                                 batch.batch["hyper_r1_abstained"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/explicit_model_commit_rate"] = float(
+                                batch.batch["hyper_r1_explicit_model_commit"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/forced_terminal_rate"] = float(
+                                batch.batch["hyper_r1_forced_terminal"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/forced_empty_rate"] = float(
+                                batch.batch["hyper_r1_forced_empty"]
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                            metrics["hyper_r1/turn_exhaustion_rate"] = float(
+                                batch.batch["hyper_r1_turn_exhausted"]
                                 .float()
                                 .mean()
                                 .item()

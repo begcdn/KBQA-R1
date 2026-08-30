@@ -371,7 +371,7 @@ def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
 def _augment_recall(demo: HyperDemonstration) -> tuple[HyperDemonstration, bool]:
     """Park the preserved branch during a real probe, then Recall it."""
     steps = list(demo.steps)
-    max_turns = int(demo.private_metadata.get("max_turns", 24))
+    max_turns = int(demo.private_metadata.get("max_turns", 32))
     if len(steps) + 2 > max_turns:
         return demo, False
 

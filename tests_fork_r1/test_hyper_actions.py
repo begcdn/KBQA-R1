@@ -75,3 +75,28 @@ def test_actions_from_multiple_blocks_keep_distinct_offsets():
         "Select [ H1 ]",
         "Commit [ H1 ]",
     ]
+
+
+def test_single_action_response_requires_one_complete_payload():
+    parser = ActionParser()
+    valid = "<think>free reasoning</think><action> Select [ H2 ] </action>"
+
+    action = parser.parse_single_action_response(valid)
+
+    assert action is not None
+    assert action.action_type == ActionType.SELECT_HYPOTHESIS
+    assert valid[slice(*action.source_span)] == "Select [ H2 ]"
+
+
+def test_single_action_response_rejects_protocol_extras():
+    parser = ActionParser()
+
+    assert parser.parse_single_action_response(
+        "<action>Select [ H2 ] trailing commentary</action>"
+    ) is None
+    assert parser.parse_single_action_response(
+        "<action>Select [ H2 ]\nCommit [ H2 ]</action>"
+    ) is None
+    assert parser.parse_single_action_response(
+        "<action>Select [ H2 ]</action><action>Commit [ H2 ]</action>"
+    ) is None

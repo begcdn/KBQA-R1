@@ -71,6 +71,7 @@ export hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.0}
 export hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
 export hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus:-0.0}
 export hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
+export hyper_r1_forced_terminal_penalty=${hyper_r1_forced_terminal_penalty:-0.25}
 export max_turns=${max_turns:-32}
 export max_prompt_length=${max_prompt_length:-32768}
 export max_obs_length=${max_obs_length:-8192}

@@ -4431,7 +4431,7 @@ class DemonstrationValidator:
         max_execution_attempts = int(
             demo.private_metadata.get("max_execution_attempts", 24)
         )
-        max_turns = int(demo.private_metadata.get("max_turns", 24))
+        max_turns = int(demo.private_metadata.get("max_turns", 32))
         execution_attempts = 0
 
         def recall(node_id: str) -> None:

@@ -818,6 +818,22 @@ def test_forced_terminal_rollouts_do_not_supply_or_receive_local_credit():
     assert compared[1].sum().item() == 0
 
 
+def test_forced_terminal_penalty_preserves_fallback_value_but_discourages_delay():
+    rewards = torch.zeros((3, 3))
+    mask = torch.tensor([[1, 1, 0], [1, 1, 0], [1, 1, 0]])
+
+    result = enforce_commit_reward(
+        rewards,
+        mask,
+        torch.tensor([False, False, True]),
+        torch.tensor([0.8, 0.0, 1.0]),
+        forced_terminal=torch.tensor([True, True, False]),
+        forced_terminal_penalty=0.25,
+    )
+
+    assert result.sum(dim=-1).tolist() == pytest.approx([0.55, -0.25, 1.0])
+
+
 def test_decision_state_distinguishes_remaining_turn_budget():
     graph = HypothesisGraph(max_active=3)
     add(graph, "r.answer", ["m.answer"])
@@ -1005,6 +1021,16 @@ def test_forced_terminal_without_nonempty_candidate_returns_empty_prediction():
     assert graph.force_terminal(0) is None
     assert graph.state(0).committed_id is None
     assert graph.state(0).terminal_kind == "forced_empty"
+
+
+def test_forced_terminal_preserves_the_exact_stop_reason():
+    graph = HypothesisGraph(max_active=2)
+    add(graph, "r.answer", ["m.answer"])
+
+    graph.force_terminal(0, reason="turn_exhausted")
+
+    assert graph.state(0).terminal_reason == "turn_exhausted"
+    assert graph.to_dict(0)["terminal_reason"] == "turn_exhausted"
     assert graph.is_terminal(0)
 
 

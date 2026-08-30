@@ -22,6 +22,10 @@ METRICS = (
     "hyper_r1_commit_intent_equivalent",
     "hyper_r1_premature_answer",
     "hyper_r1_abstained",
+    "hyper_r1_explicit_model_commit",
+    "hyper_r1_forced_terminal",
+    "hyper_r1_forced_empty",
+    "hyper_r1_turn_exhausted",
     "hyper_r1_preserved_alternatives",
     "hyper_r1_branch_switch",
     "hyper_r1_used_widen",
@@ -47,6 +51,38 @@ def _metric_means(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
         values = [float(row[key]) for row in materialized if row.get(key) is not None]
         if values:
             result[key] = mean(values)
+    if any("hyper_r1_explicit_model_commit" in row for row in materialized):
+        f1_values = [
+            float(row.get("hyper_r1_commit_answer_f1", 0.0))
+            for row in materialized
+        ]
+        explicit = [
+            row
+            for row in materialized
+            if float(row.get("hyper_r1_explicit_model_commit", 0.0)) > 0
+        ]
+        forced = [
+            row
+            for row in materialized
+            if float(row.get("hyper_r1_forced_terminal", 0.0)) > 0
+        ]
+        result["fallback_assisted_mean_f1"] = mean(f1_values)
+        result["policy_only_mean_f1"] = mean(
+            float(row.get("hyper_r1_commit_answer_f1", 0.0))
+            if float(row.get("hyper_r1_explicit_model_commit", 0.0)) > 0
+            else 0.0
+            for row in materialized
+        )
+        if explicit:
+            result["explicit_commit_mean_f1"] = mean(
+                float(row.get("hyper_r1_commit_answer_f1", 0.0))
+                for row in explicit
+            )
+        if forced:
+            result["forced_terminal_mean_f1"] = mean(
+                float(row.get("hyper_r1_commit_answer_f1", 0.0))
+                for row in forced
+            )
     return result
 
 

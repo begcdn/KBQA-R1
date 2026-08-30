@@ -370,9 +370,11 @@ class SExprLLMGenerationManager:
             "valid": certificate.valid,
         }
 
-    def _force_hyper_terminal(self, sample_id: int, turn: int) -> None:
+    def _force_hyper_terminal(
+        self, sample_id: int, turn: int, *, reason: str
+    ) -> None:
         """Convert a hard stop into an oracle-free benchmark prediction."""
-        node = self.hyper_graph.force_terminal(sample_id)
+        node = self.hyper_graph.force_terminal(sample_id, reason=reason)
         contract = self._hyper_gold_contracts.get(sample_id)
         if node is None:
             from kbqa_r1.hyper_data import answer_set_f1
@@ -391,8 +393,6 @@ class SExprLLMGenerationManager:
         else:
             certificate = self._certify_hyper_commit(sample_id)
         self._hyper_commit_certificates[sample_id] = certificate
-        self._hyper_protocol_valid_answer_turns[sample_id] = int(turn)
-        self._hyper_valid_answer_turns[sample_id] = int(turn)
 
     def _get_independent_gpu_manager(self):
         """
@@ -651,7 +651,8 @@ class SExprLLMGenerationManager:
         self, prediction: str, sample_id: int, turn: int
     ) -> List[ActionResult]:
         """Parse once and retain exact spans for valid and malformed actions."""
-        actions = self.action_parser.parse_actions_from_text(prediction)
+        strict_action = self.action_parser.parse_single_action_response(prediction)
+        actions = [strict_action] if strict_action is not None else []
         self._annotate_action_token_spans(prediction, actions)
         self._hyper_turn_actions[(sample_id, int(turn))] = list(actions)
 
@@ -1321,6 +1322,15 @@ class SExprLLMGenerationManager:
         forced_terminal = torch.zeros(
             batch_size, dtype=torch.bool, device=responses.device
         )
+        explicit_model_commit = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        forced_empty = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
+        turn_exhausted = torch.zeros(
+            batch_size, dtype=torch.bool, device=responses.device
+        )
         premature_answer = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
         action_records = []
         graph_records = []
@@ -1350,6 +1360,13 @@ class SExprLLMGenerationManager:
                 "forced_candidate",
                 "forced_empty",
             }
+            explicit_model_commit[sample_id] = (
+                graph.terminal_kind == "explicit_commit"
+            )
+            forced_empty[sample_id] = graph.terminal_kind == "forced_empty"
+            turn_exhausted[sample_id] = (
+                graph.terminal_reason == "turn_exhausted"
+            )
             premature_answer[sample_id] = sample_id in self._hyper_premature_answers
             records = list(self._hyper_action_records.get(sample_id, []))
             action_records.append(records)
@@ -1375,12 +1392,22 @@ class SExprLLMGenerationManager:
         output.batch["hyper_r1_gold_contract_available"] = gold_contract_available
         output.batch["hyper_r1_abstained"] = abstained
         output.batch["hyper_r1_forced_terminal"] = forced_terminal
+        output.batch["hyper_r1_explicit_model_commit"] = explicit_model_commit
+        output.batch["hyper_r1_forced_empty"] = forced_empty
+        output.batch["hyper_r1_turn_exhausted"] = turn_exhausted
         output.batch["hyper_r1_premature_answer"] = premature_answer
         output.non_tensor_batch["hyper_r1_action_records"] = np.array(
             action_records, dtype=object
         )
         output.non_tensor_batch["hyper_r1_graph"] = np.array(
             graph_records, dtype=object
+        )
+        output.non_tensor_batch["hyper_r1_terminal_reason"] = np.array(
+            [
+                self.hyper_graph.state(sample_id).terminal_reason or "none"
+                for sample_id in range(batch_size)
+            ],
+            dtype=object,
         )
         return output
     
@@ -1657,7 +1684,9 @@ class SExprLLMGenerationManager:
                     # Update timeout tracking
                     self._record_timeout(i, turn)
                     if self.hyper_r1_enable:
-                        self._force_hyper_terminal(i, turn)
+                        self._force_hyper_terminal(
+                            i, turn, reason="execution_timeout"
+                        )
                     # Mark as inactive in active_mask if available
                     if active_mask is not None:
                         active_mask[i] = False
@@ -1685,7 +1714,13 @@ class SExprLLMGenerationManager:
         # Parse actions from prediction using <action></action> tags
         actions = self._hyper_turn_actions.get((index, int(turn)))
         if actions is None:
-            actions = self.action_parser.parse_actions_from_text(prediction)
+            if self.hyper_r1_enable:
+                strict_action = self.action_parser.parse_single_action_response(
+                    prediction
+                )
+                actions = [strict_action] if strict_action is not None else []
+            else:
+                actions = self.action_parser.parse_actions_from_text(prediction)
         
         # Log all S-Expression processing samples
         if actions:
@@ -2498,7 +2533,9 @@ class SExprLLMGenerationManager:
                     for sample_id in torch.nonzero(
                         active_mask, as_tuple=False
                     ).flatten().tolist():
-                        self._force_hyper_terminal(sample_id, turn)
+                        self._force_hyper_terminal(
+                            sample_id, turn, reason="empty_generation"
+                        )
                 active_mask = torch.zeros_like(active_mask)
                 meta_info['done'] = ~active_mask
                 continue
@@ -2598,7 +2635,11 @@ class SExprLLMGenerationManager:
             for sample_id in torch.nonzero(
                 active_mask, as_tuple=False
             ).flatten().tolist():
-                self._force_hyper_terminal(sample_id, self.config.max_turns)
+                self._force_hyper_terminal(
+                    sample_id,
+                    self.config.max_turns,
+                    reason="turn_exhausted",
+                )
             active_mask = torch.zeros_like(active_mask)
             meta_info['done'] = ~active_mask
 

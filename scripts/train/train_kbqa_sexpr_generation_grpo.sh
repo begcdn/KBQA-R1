@@ -193,13 +193,17 @@ rollout_is_threshold=${rollout_is_threshold:-4.0}    # float => enable; "" or nu
 rollout_is_threshold_lower=${rollout_is_threshold_lower:-null}  # optional; only meaningful for mask mode
 rollout_is_veto_threshold=${rollout_is_veto_threshold:-null} # per-token veto (null to disable)
 
-max_turns=${max_turns:-6}
+hyper_r1_enable=${hyper_r1_enable:-false}
+if [[ "${hyper_r1_enable}" == "true" ]]; then
+    max_turns=${max_turns:-32}
+else
+    max_turns=${max_turns:-6}
+fi
 max_prompt_length=${max_prompt_length:-14336}
 max_obs_length=${max_obs_length:-3072}
 # Reduce max_response_length to avoid GPU memory issues
 max_response_length=${max_response_length:-1024}
 actor_lr=${actor_lr:-1e-6}
-hyper_r1_enable=${hyper_r1_enable:-false}
 hyper_r1_max_active=${hyper_r1_max_active:-24}
 hyper_r1_max_nodes=${hyper_r1_max_nodes:-128}
 hyper_r1_max_execution_attempts=${hyper_r1_max_execution_attempts:-24}
@@ -210,6 +214,7 @@ hyper_r1_budget_cost=${hyper_r1_budget_cost:-0.05}
 hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty:-0.25}
 hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus:-0.1}
 hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty:-0.25}
+hyper_r1_forced_terminal_penalty=${hyper_r1_forced_terminal_penalty:-0.25}
 structure_format_score=${structure_format_score:-0.1}
 
 if (( GPU_COUNT < 4 )); then
@@ -309,6 +314,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     algorithm.hyper_r1_invalid_commit_penalty=${hyper_r1_invalid_commit_penalty} \
     algorithm.hyper_r1_semantic_bonus=${hyper_r1_semantic_bonus} \
     algorithm.hyper_r1_invalid_action_penalty=${hyper_r1_invalid_action_penalty} \
+    algorithm.hyper_r1_forced_terminal_penalty=${hyper_r1_forced_terminal_penalty} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.dtype=float16 \
     actor_rollout_ref.ref.dtype=float16 \

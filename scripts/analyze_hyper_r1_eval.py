@@ -93,6 +93,7 @@ def summarize(rows: Iterable[dict]) -> dict:
         result = {
             "questions": len(items),
             "mean_f1": mean(f1) if f1 else 0.0,
+            "fallback_assisted_mean_f1": mean(f1) if f1 else 0.0,
             "exact_match": mean(value == 1.0 for value in f1) if f1 else 0.0,
             "mean_execution_attempts": mean(execution) if execution else None,
         }
@@ -103,6 +104,10 @@ def summarize(rows: Iterable[dict]) -> dict:
             "widen_usage_rate": "hyper_r1_used_widen",
             "preserved_alternatives_rate": "hyper_r1_preserved_alternatives",
             "premature_answer_rate": "hyper_r1_premature_answer",
+            "explicit_model_commit_rate": "hyper_r1_explicit_model_commit",
+            "forced_terminal_rate": "hyper_r1_forced_terminal",
+            "forced_empty_rate": "hyper_r1_forced_empty",
+            "turn_exhaustion_rate": "hyper_r1_turn_exhausted",
         }
         for output_key, row_key in optional_rates.items():
             values = [_number(item, row_key) for item in items if row_key in item]
@@ -113,6 +118,33 @@ def summarize(rows: Iterable[dict]) -> dict:
             if "hyper_r1_max_active" in item
         ]
         result["mean_max_active_frontier"] = mean(frontier) if frontier else None
+        explicit_items = [
+            item
+            for item in items
+            if _number(item, "hyper_r1_explicit_model_commit") > 0
+        ]
+        forced_items = [
+            item for item in items if _number(item, "hyper_r1_forced_terminal") > 0
+        ]
+        has_terminal_split = any(
+            "hyper_r1_explicit_model_commit" in item for item in items
+        )
+        result["explicit_commit_mean_f1"] = (
+            mean(_f1(item) for item in explicit_items) if explicit_items else None
+        )
+        result["forced_terminal_mean_f1"] = (
+            mean(_f1(item) for item in forced_items) if forced_items else None
+        )
+        result["policy_only_mean_f1"] = (
+            mean(
+                _f1(item)
+                if _number(item, "hyper_r1_explicit_model_commit") > 0
+                else 0.0
+                for item in items
+            )
+            if has_terminal_split
+            else None
+        )
         for name, key in (
             ("branch_switch_f1", "hyper_r1_branch_switch"),
             ("conjunction_f1", "hyper_r1_used_combine"),

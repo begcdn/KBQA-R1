@@ -255,6 +255,34 @@ class ActionParser:
                         actions.append(action_result)
         
         return actions
+
+    def parse_single_action_response(self, text: str) -> Optional[ActionResult]:
+        """Parse the exact one-action response contract used by HyPER-R1.
+
+        Reasoning outside the action tag remains unrestricted. The tagged
+        payload must contain exactly one complete action and no commentary or
+        second action.
+        """
+        action_matches = list(
+            re.finditer(r"<action>(.*?)</action>", text, re.DOTALL | re.IGNORECASE)
+        )
+        if len(action_matches) != 1:
+            return None
+        action_match = action_matches[0]
+        payload = action_match.group(1)
+        result = self.parse_action(payload)
+        if result is None or not result.is_valid or result.source_span is None:
+            return None
+        expected_span = (
+            len(payload) - len(payload.lstrip()),
+            len(payload.rstrip()),
+        )
+        if result.source_span != expected_span:
+            return None
+        start, end = result.source_span
+        base = action_match.start(1)
+        result.source_span = (base + start, base + end)
+        return result
     
     def validate_action_sequence(self, actions: List[ActionResult]) -> Tuple[bool, str]:
          #FIXME, the validate_action used for an action sequence but not a solo action, we should implement a validate function that for a solo action.

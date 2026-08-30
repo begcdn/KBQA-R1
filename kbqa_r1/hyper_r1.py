@@ -130,6 +130,7 @@ class HypothesisGraphState:
     max_turns: Optional[int] = None
     last_preferred_nonempty_id: Optional[str] = None
     terminal_kind: Optional[str] = None
+    terminal_reason: Optional[str] = None
     question_contract: Optional["PublicQuestionContract"] = None
     prune_certificates: Dict[str, "PruneCertificate"] = field(default_factory=dict)
 
@@ -1144,9 +1145,12 @@ class HypothesisGraph:
         graph.committed_id = node_id
         graph.last_preferred_nonempty_id = node_id
         graph.terminal_kind = "explicit_commit"
+        graph.terminal_reason = "explicit_commit"
         return node
 
-    def force_terminal(self, sample_id: int) -> Optional[HypothesisNode]:
+    def force_terminal(
+        self, sample_id: int, *, reason: str = "forced_terminal"
+    ) -> Optional[HypothesisNode]:
         """End a rollout on an oracle-free public candidate, or the empty set.
 
         The environment honors the policy's latest explicit preference first.
@@ -1189,6 +1193,7 @@ class HypothesisGraph:
         graph.terminal_kind = (
             "forced_candidate" if chosen is not None else "forced_empty"
         )
+        graph.terminal_reason = str(reason)
         return chosen
 
     def is_terminal(self, sample_id: int) -> bool:
@@ -1366,6 +1371,7 @@ class HypothesisGraph:
             "committed_id": graph.committed_id,
             "abstained": graph.abstained,
             "terminal_kind": graph.terminal_kind,
+            "terminal_reason": graph.terminal_reason,
             "turns_used": graph.turns_used,
             "max_turns": graph.max_turns,
             "last_preferred_nonempty_id": graph.last_preferred_nonempty_id,
@@ -1499,7 +1505,9 @@ def enforce_commit_reward(
     commit_answer_f1: torch.Tensor,
     commit_intent_equivalent: Optional[torch.Tensor] = None,
     abstained: Optional[torch.Tensor] = None,
+    forced_terminal: Optional[torch.Tensor] = None,
     invalid_penalty: float = 0.25,
+    forced_terminal_penalty: float = 0.25,
     semantic_bonus: float = 0.0,
 ) -> torch.Tensor:
     """Use benchmark answer F1 as the terminal task reward.
@@ -1529,14 +1537,22 @@ def enforce_commit_reward(
         abstained = torch.zeros_like(commit_protocol_valid, dtype=torch.bool)
     if abstained.ndim != 1 or abstained.shape[0] != token_rewards.shape[0]:
         raise ValueError("abstained must contain one value per rollout")
+    if forced_terminal is None:
+        forced_terminal = torch.zeros_like(commit_protocol_valid, dtype=torch.bool)
+    if forced_terminal.ndim != 1 or forced_terminal.shape[0] != token_rewards.shape[0]:
+        raise ValueError("forced_terminal must contain one value per rollout")
     result = torch.zeros_like(token_rewards)
-    legal_commit = commit_protocol_valid.to(dtype=torch.bool)
-    invalid = ~legal_commit
+    forced = forced_terminal.to(dtype=torch.bool)
+    legal_commit = commit_protocol_valid.to(dtype=torch.bool) & ~forced
+    invalid = ~legal_commit & ~forced
     answer_f1 = commit_answer_f1.to(dtype=result.dtype).clamp(0.0, 1.0)
     terminal_reward = answer_f1
     lengths = response_mask.long().sum(dim=-1).clamp_min(1) - 1
     rows = torch.arange(result.shape[0], device=result.device)
     result[rows[legal_commit], lengths[legal_commit]] = terminal_reward[legal_commit]
+    result[rows[forced], lengths[forced]] = (
+        answer_f1[forced] - abs(float(forced_terminal_penalty))
+    )
     result[rows[invalid], lengths[invalid]] = -abs(float(invalid_penalty))
     return result
 

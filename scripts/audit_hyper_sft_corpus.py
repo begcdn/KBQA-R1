@@ -66,12 +66,11 @@ def assert_supervised_action_afforded(
     row_index: int,
 ) -> bool:
     """Reject graph-control supervision unavailable in the current state."""
-    actions = ActionParser().parse_actions_from_text(str(target))
-    if len(actions) != 1:
+    action = ActionParser().parse_single_action_response(str(target))
+    if action is None:
         raise RuntimeError(
             f"row {row_index} does not contain exactly one parseable target action"
         )
-    action = actions[0]
     if action.action_type == ActionType.ABSTAIN:
         raise RuntimeError(
             f"row {row_index} supervises Abstain although runtime F1 mode disables it"
