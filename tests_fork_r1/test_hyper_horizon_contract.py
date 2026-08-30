@@ -9,17 +9,21 @@ def _read(path: str) -> str:
 
 
 def test_hyper_entrypoints_default_to_32_turns():
-    assert "SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-32}" in _read(
-        "scripts/evaluate_hyper_r1.sh"
-    )
+    evaluation = _read("scripts/evaluate_hyper_r1.sh")
+    assert "SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-32}" in evaluation
+    assert "HYPER_R1_STRUCTURAL_CONSTRAINTS=${HYPER_R1_STRUCTURAL_CONSTRAINTS:-true}" in evaluation
 
     rejection = _read("scripts/data_process/rejection_sampling_simple.sh")
     assert "SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-32}" in rejection
     assert "SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-7}" in rejection
+    assert "hyper_r1.structural_constraints=${HYPER_R1_STRUCTURAL_CONSTRAINTS}" in rejection
 
     grpo = _read("scripts/train/train_kbqa_sexpr_generation_grpo.sh")
     assert "max_turns=${max_turns:-32}" in grpo
     assert "max_turns=${max_turns:-6}" in grpo
+
+    hyper_grpo = _read("scripts/train/train_hyper_r1_grpo.sh")
+    assert "hyper_r1_structural_constraints=${hyper_r1_structural_constraints:-true}" in hyper_grpo
 
 
 def test_hyper_corpus_helpers_do_not_use_old_24_turn_fallback():

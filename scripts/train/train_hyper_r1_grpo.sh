@@ -61,6 +61,7 @@ export DATASET_TYPE DATA_DIR TRAIN_FILE VAL_FILE
 export MODEL_PATH=${MODEL_PATH:-"${HYPER_SFT_MODEL}"}
 
 export hyper_r1_enable=true
+export hyper_r1_structural_constraints=${hyper_r1_structural_constraints:-true}
 export hyper_r1_max_active=${hyper_r1_max_active:-24}
 export hyper_r1_max_nodes=${hyper_r1_max_nodes:-128}
 export hyper_r1_max_execution_attempts=${hyper_r1_max_execution_attempts:-24}

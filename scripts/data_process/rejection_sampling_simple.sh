@@ -107,6 +107,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-null}         # null processes the full split
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
 FSDP_MODEL_DTYPE=${FSDP_MODEL_DTYPE:-fp32}
 HYPER_R1_ENABLE=${HYPER_R1_ENABLE:-false}
+HYPER_R1_STRUCTURAL_CONSTRAINTS=${HYPER_R1_STRUCTURAL_CONSTRAINTS:-false}
 HYPER_R1_MAX_ACTIVE=${HYPER_R1_MAX_ACTIVE:-24}
 HYPER_R1_MAX_NODES=${HYPER_R1_MAX_NODES:-128}
 HYPER_R1_MAX_EXECUTION_ATTEMPTS=${HYPER_R1_MAX_EXECUTION_ATTEMPTS:-24}
@@ -261,6 +262,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     sexpr_config.enable_semantic_validation=true \
     sexpr_config.use_complete_sparql_converter=true \
     hyper_r1.enable=${HYPER_R1_ENABLE} \
+    hyper_r1.structural_constraints=${HYPER_R1_STRUCTURAL_CONSTRAINTS} \
     hyper_r1.max_active=${HYPER_R1_MAX_ACTIVE} \
     hyper_r1.max_nodes=${HYPER_R1_MAX_NODES} \
     hyper_r1.max_execution_attempts=${HYPER_R1_MAX_EXECUTION_ATTEMPTS} \
