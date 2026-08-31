@@ -103,16 +103,21 @@ dataset:
 - question-disjoint correction train/dev splits;
 - no test failures or test questions in training.
 
-The deterministic assembler for this mixture is implemented, but the corpus
-is not yet available. The existing validation JSONL contains complete text
-transcripts and terminal metrics, not the certified per-decision records the
-assembler deliberately requires. Before another SFT, collect fresh masked and
-unmasked training-split rollouts with canonical decision messages, public-state
-hashes, accepted/no-progress outcomes, and exact run provenance. Protocol
-corrections must be certified against the same visible state. Semantic rows
-must name the policy's failed legal action and demonstrate positive executable
-regret against a bounded continuation oracle; internally consistent scores
-alone are not sufficient.
+The deterministic assembler and production decision-trace collector are now
+implemented, but the corpus is not yet available. Every live turn records the
+canonical model-visible messages, raw response and action, accepted or failed
+transition observation, message-bound state hash, turn-independent progress
+hashes, and the exact state-conditioned constraint digest. Masked and unmasked
+rollouts compute the same contract; only masked decoding applies it. Each
+trajectory also binds its final Commit or forced terminal state to the exact
+node, turn, and answer F1. Validation and rollout JSONL persist these records
+at the top level without inferring corrections or Q-values.
+
+Before another SFT, collect fresh masked and unmasked training-split rollouts
+with exact run provenance. Protocol corrections must be certified against the
+same visible state. Semantic rows must name the policy's failed legal action
+and demonstrate positive executable regret against a bounded continuation
+oracle; internally consistent scores alone are not sufficient.
 
 Run approximately 25,000-50,000 decisions for 1,500-2,000 low-learning-rate
 steps. Evaluate these pre-GRPO arms on correction-dev:
