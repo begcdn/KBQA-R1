@@ -66,6 +66,10 @@ def test_masked_and_unmasked_capture_the_same_decision_contract():
         assert record["state_before_hash"] == manager._trace_hash(
             record["messages"][:-1]
         )
+        assert record["execution_state_hash"]
+        assert record["execution_snapshot_hash"] == manager._trace_hash(
+            record["private_execution_state"]
+        )
         assert ("hyper_action_constraint" in non_tensors) is masked
         records.append(record)
 
@@ -145,6 +149,11 @@ def test_execution_state_round_trip_preserves_graph_and_relation_catalog():
 
     snapshot = manager._capture_hyper_execution_state(0)
     json.dumps(snapshot, allow_nan=False)
+    execution_hash = manager._hyper_execution_state_hash(snapshot)
+    changed_observation = dict(snapshot)
+    changed_observation["latest_observation"] = "<information>failure</information>"
+    assert manager._hyper_execution_state_hash(changed_observation) == execution_hash
+    assert manager._trace_hash(changed_observation) != manager._trace_hash(snapshot)
     manager.state_manager.clear_sample_state(0)
     manager.hyper_graph.clear(0)
     manager._hyper_frontiers[0] = []

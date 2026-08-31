@@ -35,6 +35,12 @@ def _state_hash(messages: list[Mapping[str, Any]]) -> str:
     return _digest(messages[:-1])
 
 
+def _execution_state_hash(snapshot: Mapping[str, Any]) -> str:
+    executable = deepcopy(dict(snapshot))
+    executable.pop("latest_observation", None)
+    return _digest(executable)
+
+
 def _is_exact_explicit_success(row: Mapping[str, Any]) -> bool:
     return (
         row.get("trajectory_success") is True
@@ -94,6 +100,18 @@ def _same_state_correction(
     if str(failed.get("state_before_hash") or "") != state_hash:
         return None
 
+    failed_execution_hash = str(failed.get("execution_state_hash") or "")
+    execution_snapshot = failed.get("private_execution_state")
+    if execution_snapshot is not None:
+        if not isinstance(execution_snapshot, Mapping):
+            return None
+        if str(failed.get("execution_snapshot_hash") or "") != _digest(
+            execution_snapshot
+        ):
+            return None
+        if failed_execution_hash != _execution_state_hash(execution_snapshot):
+            return None
+
     payload = failed.get("constraint_spec")
     if not isinstance(payload, Mapping):
         return None
@@ -114,6 +132,10 @@ def _same_state_correction(
     for candidate in decisions[failure_index + 1 :]:
         if str(candidate.get("progress_before_hash") or "") != after:
             break
+        if failed_execution_hash and str(
+            candidate.get("execution_state_hash") or ""
+        ) != failed_execution_hash:
+            continue
         response = str(candidate.get("raw_response") or "")
         if candidate.get("accepted") is not True or not spec.accepts_response(response):
             continue
@@ -132,6 +154,7 @@ def _same_state_correction(
             "failure_kind": failure_kind,
             "state_hash": state_hash,
             "progress_hash": after,
+            "execution_state_hash": failed_execution_hash,
             "constraint_digest": spec.digest,
             "failed_response_outside_contract": True,
             "target_response": response,

@@ -152,3 +152,31 @@ def test_clean_rollout_is_preserved_without_fabricated_correction():
 
     assert status == "clean"
     assert "correction" not in row["decisions"][0]
+
+
+def test_rejects_later_action_from_a_different_executable_state():
+    failed = _decision(
+        2,
+        "<think>bad</think>\n<action>Select [ H9 ]</action>",
+        accepted=False,
+        failure="stale_id",
+    )
+    snapshot = {
+        "schema_version": "hyper-execution-state-v1",
+        "latest_observation": "before",
+        "graph": {"node": "H1"},
+    }
+    failed["private_execution_state"] = snapshot
+    failed["execution_snapshot_hash"] = MODULE._digest(snapshot)
+    failed["execution_state_hash"] = MODULE._execution_state_hash(snapshot)
+    corrected = _decision(
+        3,
+        "<think>recover</think>\n<action>Select [ H1 ]</action>",
+        accepted=True,
+    )
+    corrected["execution_state_hash"] = "different-state"
+
+    row, status = MODULE.certify_rollout(_rollout([failed, corrected]))
+
+    assert row is None
+    assert status == "first_failure_uncertified"

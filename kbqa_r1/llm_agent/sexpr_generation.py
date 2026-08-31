@@ -748,6 +748,12 @@ class SExprLLMGenerationManager:
             ),
         }
 
+    def _hyper_execution_state_hash(self, snapshot: Mapping[str, Any]) -> str:
+        """Hash transition state while ignoring the last rendered observation."""
+        executable = deepcopy(dict(snapshot))
+        executable.pop("latest_observation", None)
+        return self._trace_hash(executable)
+
     def _restore_hyper_execution_state(
         self, sample_id: int, snapshot: Mapping[str, Any]
     ) -> None:
@@ -890,7 +896,10 @@ class SExprLLMGenerationManager:
             "context": context,
             "state_before_hash": self._trace_hash(context),
             "progress_before_hash": self._hyper_progress_hash(sample_id),
-            "execution_state_hash": self._trace_hash(execution_state),
+            "execution_state_hash": self._hyper_execution_state_hash(
+                execution_state
+            ),
+            "execution_snapshot_hash": self._trace_hash(execution_state),
             "private_execution_state": execution_state,
             "constraint_spec": dict(constraint_spec),
         }
