@@ -3,6 +3,7 @@ Enhanced LLM Generation Manager with S-Expression support
 Replaces SPARQL-based generation with action-based reasoning and S-Expression execution
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -61,6 +62,11 @@ from .timeout_detector import TimeoutDetector, TimeoutTracker
 # Configure logger with proper level
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))  # Default to INFO for S-Expression logs
+
+_HYPER_ACTION_BLOCK = re.compile(r"<action>\s*(.*?)\s*</action>", re.I | re.S)
+_HYPER_INFORMATION_BLOCK = re.compile(
+    r"<information>.*?</information>", re.I | re.S
+)
 
 
 def _metadata_mapping(value: Any) -> Mapping[str, Any]:
@@ -147,6 +153,10 @@ class SExprLLMGenerationManager:
         self._hyper_commit_certificates: Dict[int, dict] = {}
         self._hyper_premature_answers: set[int] = set()
         self._hyper_constraint_specs: Dict[int, List[dict]] = {}
+        self._hyper_decision_traces: Dict[int, List[dict]] = {}
+        self._hyper_pending_decisions: Dict[Tuple[int, int], dict] = {}
+        self._hyper_trace_roots: Dict[int, dict] = {}
+        self._hyper_latest_observations: Dict[int, str] = {}
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
@@ -620,6 +630,188 @@ class SExprLLMGenerationManager:
             turn=turn,
             legal_context=self._public_frontier_signature(sample_id),
         )
+
+    @staticmethod
+    def _trace_hash(value: Any) -> str:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def _hyper_progress_hash(self, sample_id: int) -> str:
+        """Hash policy state without the turn clock used by deadline rendering."""
+        graph = dict(self.hyper_graph.to_dict(sample_id))
+        for field in ("sample_id", "turns_used", "max_turns"):
+            graph.pop(field, None)
+        return self._trace_hash(
+            {
+                "graph": graph,
+                "legal_context": self._public_frontier_signature(sample_id),
+            }
+        )
+
+    @staticmethod
+    def _canonical_trace_prompt(raw_prompt: Any) -> dict:
+        if hasattr(raw_prompt, "tolist"):
+            raw_prompt = raw_prompt.tolist()
+        if not isinstance(raw_prompt, (list, tuple)) or len(raw_prompt) != 1:
+            raise RuntimeError(
+                "HyPER decision tracing requires one raw user message; set "
+                "data.return_raw_chat=true"
+            )
+        message = raw_prompt[0]
+        if not isinstance(message, Mapping) or message.get("role") != "user":
+            raise RuntimeError("HyPER raw prompt must contain one user message")
+        content = str(message.get("content", ""))
+        if "HyPER-R1 executable hypothesis graph:" not in content:
+            raise RuntimeError("HyPER raw prompt is not the canonical policy prompt")
+        return {"role": "user", "content": content, "loss_mask": 0}
+
+    def _initialize_hyper_decision_traces(self, gen_batch, batch_size: int) -> None:
+        raw_prompts = gen_batch.non_tensor_batch.get("raw_prompt")
+        if raw_prompts is None or len(raw_prompts) != batch_size:
+            raise RuntimeError(
+                "HyPER decision tracing requires aligned raw prompts; set "
+                "data.return_raw_chat=true"
+            )
+        extra_rows = gen_batch.non_tensor_batch.get("extra_info")
+        uid_rows = gen_batch.non_tensor_batch.get("uid")
+        self._hyper_decision_traces = {sample_id: [] for sample_id in range(batch_size)}
+        for sample_id in range(batch_size):
+            extra = (
+                _metadata_mapping(extra_rows[sample_id])
+                if extra_rows is not None and sample_id < len(extra_rows)
+                else {}
+            )
+            question_id = str(
+                extra.get("question_id") or extra.get("id") or ""
+            ).strip()
+            if not question_id:
+                raise RuntimeError(
+                    f"HyPER decision trace sample {sample_id} has no question_id"
+                )
+            base_rollout_id = str(
+                uid_rows[sample_id]
+                if uid_rows is not None and sample_id < len(uid_rows)
+                else extra.get("rollout_id") or extra.get("demo_id") or question_id
+            )
+            rollout_id = (
+                f"{base_rollout_id}:call{self._call_counter}:sample{sample_id}"
+            )
+            source_split = str(
+                extra.get("source_split")
+                or extra.get("dataset_split")
+                or extra.get("split")
+                or ("validation" if self.is_validation else "train")
+            )
+            self._hyper_trace_roots[sample_id] = {
+                "schema_version": "hyper-autonomous-trace-v1",
+                "rollout_id": rollout_id,
+                "question_id": question_id,
+                "source_split": source_split,
+                "masked": bool(self.hyper_structural_constraints),
+                "family": str(extra.get("family") or "unknown"),
+                "prompt": self._canonical_trace_prompt(raw_prompts[sample_id]),
+            }
+
+    def _begin_hyper_turn_trace(
+        self, sample_id: int, turn: int, constraint_spec: Mapping[str, Any]
+    ) -> None:
+        root = self._hyper_trace_roots[sample_id]
+        context = [dict(root["prompt"])]
+        latest = self._hyper_latest_observations.get(sample_id)
+        if latest:
+            context.extend(
+                [
+                    {"role": "assistant", "content": "", "loss_mask": 0},
+                    {"role": "user", "content": latest, "loss_mask": 0},
+                ]
+            )
+        self._hyper_pending_decisions[(sample_id, int(turn))] = {
+            "turn": int(turn),
+            "context": context,
+            "state_before_hash": self._trace_hash(context),
+            "progress_before_hash": self._hyper_progress_hash(sample_id),
+            "constraint_spec": dict(constraint_spec),
+        }
+
+    @staticmethod
+    def _trace_observation(rendered: str) -> str:
+        match = _HYPER_INFORMATION_BLOCK.search(str(rendered or ""))
+        return match.group(0) if match else ""
+
+    def _finish_hyper_turn_trace(
+        self,
+        sample_id: int,
+        turn: int,
+        raw_response: str,
+        rendered_observation: str,
+    ) -> None:
+        pending = self._hyper_pending_decisions.pop((sample_id, int(turn)))
+        observation = self._trace_observation(rendered_observation)
+        if observation:
+            self._hyper_latest_observations[sample_id] = observation
+        accepted_records = [
+            record
+            for record in self._hyper_action_records.get(sample_id, ())
+            if int(record.get("turn", -1)) == int(turn)
+        ]
+        accepted = len(accepted_records) == 1
+        action_match = _HYPER_ACTION_BLOCK.search(str(raw_response or ""))
+        raw_action = action_match.group(1).strip() if action_match else ""
+        progress_after = self._hyper_progress_hash(sample_id)
+        failure_kind = ""
+        if not accepted:
+            lowered = observation.lower()
+            failure_kind = (
+                "stale_id"
+                if "unknown or unexposed" in lowered or "unknown hypothesis" in lowered
+                else "protocol"
+            )
+        messages = list(pending.pop("context"))
+        messages.append(
+            {
+                "role": "assistant",
+                "content": str(raw_response or ""),
+                "loss_mask": 1,
+            }
+        )
+        self._hyper_decision_traces[sample_id].append(
+            {
+                **pending,
+                "messages": messages,
+                "raw_response": str(raw_response or ""),
+                "raw_action": raw_action,
+                "policy_action": raw_action,
+                "accepted": accepted,
+                "failure_kind": failure_kind,
+                "observation": observation,
+                "acceptance_observation": observation if accepted else "",
+                "failure_observation": observation if not accepted else "",
+                "progress_after_hash": progress_after,
+                "no_progress": pending["progress_before_hash"] == progress_after,
+            }
+        )
+
+    def _prepare_hyper_turn_contracts(
+        self, active_indices: Sequence[int], turn: int
+    ) -> tuple[dict, dict[int, dict]]:
+        """Compute every legal contract; expose it to decoding only when masked."""
+        payload_by_sample = {}
+        for sample_id in active_indices:
+            payload = self._hyper_action_constraint(sample_id, turn).to_dict()
+            payload_by_sample[sample_id] = payload
+            self._begin_hyper_turn_trace(sample_id, turn, payload)
+        non_tensors = {}
+        if self.hyper_structural_constraints:
+            non_tensors["hyper_action_constraint"] = np.asarray(
+                [payload_by_sample[sample_id] for sample_id in active_indices],
+                dtype=object,
+            )
+        return non_tensors, payload_by_sample
 
     def _hyper_action_constraint(
         self, sample_id: int, turn: int
@@ -1407,6 +1599,7 @@ class SExprLLMGenerationManager:
         premature_answer = torch.zeros(batch_size, dtype=torch.bool, device=responses.device)
         action_records = []
         graph_records = []
+        decision_traces = []
         for sample_id in range(batch_size):
             graph = self.hyper_graph.state(sample_id)
             graph_records.append(self.hyper_graph.to_dict(sample_id))
@@ -1443,6 +1636,42 @@ class SExprLLMGenerationManager:
             premature_answer[sample_id] = sample_id in self._hyper_premature_answers
             records = list(self._hyper_action_records.get(sample_id, []))
             action_records.append(records)
+            root = dict(self._hyper_trace_roots[sample_id])
+            root.pop("prompt", None)
+            terminal_turn = next(
+                (
+                    int(record["turn"])
+                    for record in reversed(
+                        self._hyper_decision_traces.get(sample_id, [])
+                    )
+                    if record.get("accepted")
+                    and str(record.get("policy_action", "")).startswith("Commit [")
+                ),
+                -1,
+            )
+            answer_f1 = float(certificate.get("answer_f1", 0.0))
+            explicit_commit = graph.terminal_kind == "explicit_commit"
+            forced = graph.terminal_kind in {"forced_candidate", "forced_empty"}
+            decision_traces.append(
+                {
+                    **root,
+                    "trajectory_success": bool(explicit_commit and answer_f1 == 1.0),
+                    "explicit_model_commit": bool(explicit_commit),
+                    "forced_terminal": bool(forced),
+                    "commit_answer_f1": answer_f1,
+                    "terminal_binding": {
+                        "terminal_kind": graph.terminal_kind or "none",
+                        "terminal_reason": graph.terminal_reason or "none",
+                        "committed_node_id": graph.committed_id or "",
+                        "decision_turn": terminal_turn,
+                        "explicit_model_commit": bool(explicit_commit),
+                        "commit_answer_f1": answer_f1,
+                    },
+                    "decisions": list(
+                        self._hyper_decision_traces.get(sample_id, [])
+                    ),
+                }
+            )
             expected = {int(record["action_index"]) for record in records}
             observed = {
                 int(value)
@@ -1475,6 +1704,9 @@ class SExprLLMGenerationManager:
         )
         output.non_tensor_batch["hyper_r1_graph"] = np.array(
             graph_records, dtype=object
+        )
+        output.non_tensor_batch["hyper_r1_decision_trace"] = np.array(
+            decision_traces, dtype=object
         )
         if self.hyper_structural_constraints:
             output.non_tensor_batch["hyper_r1_action_constraints"] = np.asarray(
@@ -2449,11 +2681,16 @@ class SExprLLMGenerationManager:
                 self._hyper_commit_certificates.clear()
                 self._hyper_premature_answers.clear()
                 self._hyper_constraint_specs.clear()
+                self._hyper_decision_traces.clear()
+                self._hyper_pending_decisions.clear()
+                self._hyper_trace_roots.clear()
+                self._hyper_latest_observations.clear()
                 self._load_hyper_gold_contracts(gen_batch, batch_size)
             # 解析并缓存每个样本在提示中的候选实体，供后续动作校验使用
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
             if self.hyper_r1_enable:
                 self._load_hyper_public_contracts(batch_size)
+                self._initialize_hyper_decision_traces(gen_batch, batch_size)
 
         
         # Enhanced logging for testing (controlled frequency)
@@ -2521,16 +2758,12 @@ class SExprLLMGenerationManager:
             ).flatten().tolist()
             active_non_tensors = {}
             active_constraint_payloads = {}
-            if self.hyper_structural_constraints:
-                payloads = []
-                for sample_id in active_indices:
-                    payload = self._hyper_action_constraint(
-                        sample_id, turn
-                    ).to_dict()
-                    payloads.append(payload)
-                    active_constraint_payloads[sample_id] = payload
-                active_non_tensors["hyper_action_constraint"] = np.asarray(
-                    payloads, dtype=object
+            if self.hyper_r1_enable:
+                (
+                    active_non_tensors,
+                    active_constraint_payloads,
+                ) = self._prepare_hyper_turn_contracts(
+                    active_indices, turn
                 )
             rollings_active = DataProto.from_dict(
                 tensors={k: v[active_mask] for k, v in rollings.batch.items()},
@@ -2632,11 +2865,19 @@ class SExprLLMGenerationManager:
             if len(responses_str) == 0 or all(not s for s in responses_str):
                 logger.warning("Empty responses after postprocessing")
                 if self.hyper_r1_enable:
-                    for sample_id in torch.nonzero(
+                    empty_sample_ids = torch.nonzero(
                         active_mask, as_tuple=False
-                    ).flatten().tolist():
+                    ).flatten().tolist()
+                    for sample_id in empty_sample_ids:
                         self._force_hyper_terminal(
                             sample_id, turn, reason="empty_generation"
+                        )
+                    for position, sample_id in enumerate(empty_sample_ids):
+                        self._finish_hyper_turn_trace(
+                            sample_id,
+                            turn,
+                            responses_str[position] if position < len(responses_str) else "",
+                            "",
                         )
                 active_mask = torch.zeros_like(active_mask)
                 meta_info['done'] = ~active_mask
@@ -2667,6 +2908,13 @@ class SExprLLMGenerationManager:
             cur_invalid_action_mask = None
             cur_constraint_turn_ids = None
             if self.hyper_r1_enable:
+                for sample_id in active_indices:
+                    self._finish_hyper_turn_trace(
+                        sample_id,
+                        turn,
+                        responses_str[sample_id],
+                        next_obs[sample_id],
+                    )
                 cur_action_ids, cur_invalid_action_mask = self._turn_credit_masks(
                     responses_ids, turn
                 )

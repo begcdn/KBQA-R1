@@ -46,6 +46,34 @@ def test_incremental_generation_dump_is_resumable(tmp_path):
     }
 
 
+def test_generation_dump_serializes_hyper_trace_at_top_level(tmp_path):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.global_steps = 0
+    trace = {
+        "rollout_id": "rollout-1",
+        "question_id": "question-1",
+        "source_split": "train",
+        "masked": False,
+        "decisions": [{"turn": 0, "state_before_hash": "abc"}],
+    }
+
+    trainer._dump_generations(
+        inputs=["prompt"],
+        outputs=["response"],
+        gts=[[]],
+        scores=[0.0],
+        reward_extra_infos_dict={},
+        dump_path=str(tmp_path),
+        decision_traces=[trace],
+    )
+
+    row = json.loads((tmp_path / "0.jsonl").read_text())
+    assert row["rollout_id"] == "rollout-1"
+    assert row["masked"] is False
+    assert row["decisions"] == trace["decisions"]
+    assert "hyper_r1_decision_trace" not in row
+
+
 def test_resume_loader_ignores_interrupted_final_line(tmp_path):
     path = tmp_path / "progress.jsonl"
     path.write_text('{"metadata": {"id": "complete"}}\n{"metadata":')

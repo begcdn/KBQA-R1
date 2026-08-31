@@ -565,6 +565,7 @@ class RayPPOTrainer:
         reward_extra_infos_dict,
         dump_path,
         metadata=None,
+        decision_traces=None,
         filename=None,
         append=False,
     ):
@@ -584,6 +585,10 @@ class RayPPOTrainer:
             if len(metadata) != n:
                 raise ValueError("generation metadata must align with dumped samples")
             base_data["metadata"] = metadata
+        if decision_traces is not None:
+            if len(decision_traces) != n:
+                raise ValueError("decision traces must align with dumped samples")
+            base_data["hyper_r1_decision_trace"] = decision_traces
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -592,6 +597,11 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
+            trace = entry.pop("hyper_r1_decision_trace", None)
+            if trace is not None:
+                if not isinstance(trace, Mapping):
+                    raise ValueError("HyPER decision trace must be a mapping")
+                entry.update(dict(trace))
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "a" if append else "w", encoding="utf-8") as f:
@@ -631,6 +641,9 @@ class RayPPOTrainer:
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                decision_traces=batch.non_tensor_batch.get(
+                    "hyper_r1_decision_trace"
+                ),
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -770,6 +783,7 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         sample_metadata = []
+        sample_decision_traces = []
         max_val_samples = getattr(self.config.trainer, "max_val_samples", None)
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         incremental_dump = bool(self.config.trainer.get("incremental_validation_dump", False))
@@ -1014,6 +1028,9 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            traces = test_batch.non_tensor_batch.get("hyper_r1_decision_trace")
+            if traces is not None:
+                sample_decision_traces.extend(traces.tolist())
 
             if "hyper_r1_execution_counts" in test_batch.batch:
                 execution_counts = (
@@ -1204,6 +1221,11 @@ class RayPPOTrainer:
                     reward_extra_infos_dict=batch_extra_infos,
                     dump_path=val_data_dir,
                     metadata=sample_metadata[batch_dump_start:batch_dump_end],
+                    decision_traces=(
+                        sample_decision_traces[batch_dump_start:batch_dump_end]
+                        if sample_decision_traces
+                        else None
+                    ),
                     filename="progress.jsonl",
                     append=True,
                 )
@@ -1260,6 +1282,7 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
                 metadata=sample_metadata,
+                decision_traces=(sample_decision_traces or None),
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
