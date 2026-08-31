@@ -144,7 +144,7 @@ def test_execution_state_round_trip_preserves_graph_and_relation_catalog():
     expected_frontier = manager._public_frontier_signature(0)
 
     snapshot = manager._capture_hyper_execution_state(0)
-    json.dumps(snapshot)
+    json.dumps(snapshot, allow_nan=False)
     manager.state_manager.clear_sample_state(0)
     manager.hyper_graph.clear(0)
     manager._hyper_frontiers[0] = []

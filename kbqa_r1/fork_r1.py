@@ -8,6 +8,7 @@ only to the tokens that produced the factual action.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
@@ -68,6 +69,9 @@ class ForkDecision:
         result = asdict(self)
         result["state_before"] = list(self.state_before)
         result["entities"] = [list(entity) for entity in self.entities]
+        result["resolver_margin"] = (
+            self.resolver_margin if math.isfinite(self.resolver_margin) else None
+        )
         return result
 
     @classmethod
@@ -106,7 +110,11 @@ class ForkDecision:
             relation_prompt=str(value["relation_prompt"]),
             chosen_relation=str(value["chosen_relation"]),
             ranked_relations=tuple(candidates),
-            resolver_margin=float(value["resolver_margin"]),
+            resolver_margin=(
+                float("inf")
+                if value.get("resolver_margin") is None
+                else float(value["resolver_margin"])
+            ),
             state_before=tuple(str(item) for item in value.get("state_before", ())),
             expression_counter=int(value.get("expression_counter", 0)),
             entities=tuple((str(entity[0]), str(entity[1])) for entity in entities),

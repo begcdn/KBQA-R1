@@ -1,3 +1,4 @@
+import json
 import unittest
 
 import torch
@@ -110,6 +111,15 @@ class ForkR1Test(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "ranked relation"):
             ForkDecision.from_dict(payload)
+
+    def test_single_relation_margin_round_trip_is_strict_json(self):
+        original = decision(resolver_margin=float("inf"))
+        payload = original.to_dict()
+
+        json.dumps(payload, allow_nan=False)
+
+        self.assertIsNone(payload["resolver_margin"])
+        self.assertEqual(ForkDecision.from_dict(payload), original)
 
     def test_entity_fork_adds_start_before_join(self):
         original = decision(entity_argument="m.02")
