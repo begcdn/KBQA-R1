@@ -16,7 +16,7 @@ from typing import Any, Iterable, Mapping, Sequence, Tuple
 from .hyper_r1 import GraphActionAffordances
 
 
-HYPER_ACTION_CONSTRAINT_VERSION = "hyper-action-v1"
+HYPER_ACTION_CONSTRAINT_VERSION = "hyper-action-v2"
 
 
 def _unique(values: Iterable[str]) -> Tuple[str, ...]:
@@ -125,8 +125,11 @@ class HyPERActionConstraintSpec:
     @property
     def response_pattern(self) -> str:
         # Reasoning remains a policy choice. The decoder constrains the complete
-        # envelope and exactly one action payload.
-        thinking = r"(?:<think>(?:.|\n)*</think>\s*)?"
+        # envelope and exactly one action payload.  Excluding ``<`` makes the
+        # first closing tag an unambiguous boundary for streaming grammar
+        # engines; an unrestricted ``.*`` can swallow ``</think><action>`` and
+        # leave the supposedly constrained action in the free-form region.
+        thinking = r"(?:<think>[^<]*</think>\s*)?"
         return rf"{thinking}<action>\s*{self.action_pattern}\s*</action>"
 
     @property

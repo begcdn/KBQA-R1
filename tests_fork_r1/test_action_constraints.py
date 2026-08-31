@@ -72,6 +72,20 @@ def test_constraint_rejects_impossible_or_malformed_actions(response):
     assert not _spec().accepts_response(response)
 
 
+def test_thinking_cannot_swallow_an_earlier_action_boundary():
+    response = (
+        "<think>reasoning</think><action>Commit [ H99 ]</action>"
+        "</think><action>Select [ H0 ]</action>"
+    )
+    assert not _spec().accepts_response(response)
+
+
+def test_thinking_rejects_literal_tag_openers():
+    assert not _spec().accepts_response(
+        "<think>use H0 < H2</think><action>Select [ H0 ]</action>"
+    )
+
+
 def test_constraint_round_trip_is_digest_checked():
     spec = _spec()
     restored = HyPERActionConstraintSpec.from_dict(spec.to_dict())
@@ -82,6 +96,11 @@ def test_constraint_round_trip_is_digest_checked():
     corrupted["turn"] = 4
     with pytest.raises(ValueError, match="digest mismatch"):
         HyPERActionConstraintSpec.from_dict(corrupted)
+
+    stale = spec.to_dict()
+    stale["version"] = "hyper-action-v1"
+    with pytest.raises(ValueError, match="unsupported HyPER constraint version"):
+        HyPERActionConstraintSpec.from_dict(stale)
 
 
 @pytest.mark.parametrize(

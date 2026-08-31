@@ -358,14 +358,17 @@ class vLLMRollout(BaseRollout):
             )
         with self.update_sampling_params(**kwargs):
             request_sampling_params = self.sampling_params
+            constraint_specs = None
             if constraint_payloads is not None:
                 from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 
                 if len(constraint_payloads) != batch_size:
                     raise RuntimeError("HyPER constraint batch does not match prompts")
                 request_sampling_params = []
+                constraint_specs = []
                 for payload in constraint_payloads:
                     spec = HyPERActionConstraintSpec.from_dict(payload)
+                    constraint_specs.append(spec)
                     params = self.sampling_params.clone()
                     # Truncation samplers would change the support again after
                     # the grammar mask and invalidate actor/rollout parity.
@@ -394,16 +397,39 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
-            for output in outputs:
+            engine_tokenizer = (
+                self.inference_engine.get_tokenizer()
+                if constraint_specs is not None or debug_vllm_io
+                else None
+            )
+            for request_index, output in enumerate(outputs):
                 for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
+                    sample = output.outputs[sample_id]
+                    response_ids = sample.token_ids
                     if debug_vllm_io and not response:
-                        engine_tokenizer = self.inference_engine.get_tokenizer()
                         logger.warning("[HYPER-VLLM-IO] response ids: %s", response_ids[:32])
                         logger.warning(
                             "[HYPER-VLLM-IO] response text: %r",
                             engine_tokenizer.decode(response_ids[:512]),
                         )
+                    if constraint_specs is not None:
+                        # The distributed vLLM path may omit CompletionOutput.text
+                        # even when token_ids contain a complete response. Token IDs
+                        # are authoritative and are what the environment consumes.
+                        generated_text = engine_tokenizer.decode(
+                            response_ids, skip_special_tokens=True
+                        )
+                        spec = constraint_specs[request_index]
+                        if not spec.accepts_response(generated_text):
+                            raise RuntimeError(
+                                "vLLM returned a response outside the HyPER "
+                                f"constraint request={request_index} sample={sample_id} "
+                                f"digest={spec.digest} turn={spec.turn} "
+                                f"prompt_tokens={len(vllm_inputs[request_index]['prompt_token_ids'])} "
+                                f"generated_tokens={len(response_ids)} "
+                                f"finish_reason={sample.finish_reason!r} "
+                                f"stop_reason={sample.stop_reason!r}: {generated_text!r}"
+                            )
                     response.append(response_ids)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
