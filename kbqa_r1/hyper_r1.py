@@ -12,12 +12,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
 import json
+import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import re
 
 import torch
 
 from .answer_utils import extract_last_answer_values
+
+
+HYPOTHESIS_GRAPH_SNAPSHOT_VERSION = "hyper-hypothesis-graph-snapshot-v1"
 
 
 class HypothesisStatus(str, Enum):
@@ -807,6 +811,409 @@ class HypothesisGraph:
             self._samples.clear()
         else:
             self._samples.pop(sample_id, None)
+
+    def snapshot_sample_state(self, sample_id: int) -> Dict[str, Any]:
+        """Return one complete JSON-safe executable graph snapshot."""
+        graph = self.state(sample_id)
+        question_contract = None
+        if graph.question_contract is not None:
+            question_contract = {
+                "question": graph.question_contract.question,
+                "count_required": graph.question_contract.count_required,
+            }
+        return {
+            "schema_version": HYPOTHESIS_GRAPH_SNAPSHOT_VERSION,
+            "capacity": {
+                "max_active": self.max_active,
+                "max_nodes": self.max_nodes,
+                "max_execution_attempts": self.max_execution_attempts,
+            },
+            "state": {
+                "sample_id": graph.sample_id,
+                "nodes": [
+                    {
+                        "node_id": node.node_id,
+                        "sample_id": node.sample_id,
+                        "function_state": list(node.function_state),
+                        "target_expression": node.target_expression,
+                        "sexpr": node.sexpr,
+                        "denotation": list(node.denotation),
+                        "parent_id": node.parent_id,
+                        "operation": node.operation,
+                        "denotation_labels": dict(node.denotation_labels),
+                        "parent_ids": list(node.parent_ids),
+                        "relation_id": node.relation_id,
+                        "relation_prompt": node.relation_prompt,
+                        "resolver_score": node.resolver_score,
+                        "depth": node.depth,
+                        "status": node.status.value,
+                        "semantic_status": node.semantic_status.value,
+                        "equivalent_to": node.equivalent_to,
+                        "provenance": list(node.provenance),
+                    }
+                    for node in graph.nodes.values()
+                ],
+                "edges": [
+                    {
+                        "source": edge.source,
+                        "target": edge.target,
+                        "kind": edge.kind.value,
+                        "label": edge.label,
+                    }
+                    for edge in graph.edges
+                ],
+                "selected_id": graph.selected_id,
+                "committed_id": graph.committed_id,
+                "abstained": graph.abstained,
+                "execution_attempts": graph.execution_attempts,
+                "execution_calls": graph.execution_calls,
+                "next_node_index": graph.next_node_index,
+                "turns_used": graph.turns_used,
+                "max_turns": graph.max_turns,
+                "last_preferred_nonempty_id": graph.last_preferred_nonempty_id,
+                "terminal_kind": graph.terminal_kind,
+                "terminal_reason": graph.terminal_reason,
+                "question_contract": question_contract,
+                "prune_certificates": {
+                    node_id: {
+                        "kind": certificate.kind,
+                        "node_id": certificate.node_id,
+                        "evidence": list(certificate.evidence),
+                        "empty_preserving_completion": (
+                            certificate.empty_preserving_completion
+                        ),
+                    }
+                    for node_id, certificate in sorted(
+                        graph.prune_certificates.items()
+                    )
+                },
+            },
+        }
+
+    def restore_sample_state(
+        self, sample_id: int, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Validate and atomically restore one executable graph snapshot."""
+
+        def exact_mapping(
+            value: Any, expected: set[str], name: str
+        ) -> Mapping[str, Any]:
+            if not isinstance(value, Mapping) or set(value) != expected:
+                raise ValueError(f"malformed {name}")
+            if not all(isinstance(key, str) for key in value):
+                raise ValueError(f"malformed {name} keys")
+            return value
+
+        def integer(value: Any, name: str, minimum: int = 0) -> int:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                raise ValueError(f"malformed {name}")
+            return value
+
+        def boolean(value: Any, name: str) -> bool:
+            if not isinstance(value, bool):
+                raise ValueError(f"malformed {name}")
+            return value
+
+        def string(value: Any, name: str, *, nonempty: bool = False) -> str:
+            if not isinstance(value, str) or (nonempty and not value):
+                raise ValueError(f"malformed {name}")
+            return value
+
+        def optional_string(value: Any, name: str) -> Optional[str]:
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"malformed {name}")
+            return value
+
+        def string_list(value: Any, name: str) -> List[str]:
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise ValueError(f"malformed {name}")
+            return list(value)
+
+        if isinstance(sample_id, bool) or not isinstance(sample_id, int) or sample_id < 0:
+            raise ValueError("malformed target sample_id")
+        root = exact_mapping(
+            snapshot,
+            {"schema_version", "capacity", "state"},
+            "hypothesis graph snapshot",
+        )
+        if root["schema_version"] != HYPOTHESIS_GRAPH_SNAPSHOT_VERSION:
+            raise ValueError("unsupported hypothesis graph snapshot version")
+        capacity = exact_mapping(
+            root["capacity"],
+            {"max_active", "max_nodes", "max_execution_attempts"},
+            "snapshot capacity",
+        )
+        restored_capacity = (
+            integer(capacity["max_active"], "max_active", 2),
+            integer(capacity["max_nodes"], "max_nodes", 2),
+            integer(
+                capacity["max_execution_attempts"],
+                "max_execution_attempts",
+                1,
+            ),
+        )
+        if restored_capacity[1] < restored_capacity[0]:
+            raise ValueError("malformed snapshot capacity ordering")
+        if restored_capacity != (
+            self.max_active,
+            self.max_nodes,
+            self.max_execution_attempts,
+        ):
+            raise ValueError("snapshot capacity settings do not match graph")
+
+        state = exact_mapping(
+            root["state"],
+            {
+                "sample_id",
+                "nodes",
+                "edges",
+                "selected_id",
+                "committed_id",
+                "abstained",
+                "execution_attempts",
+                "execution_calls",
+                "next_node_index",
+                "turns_used",
+                "max_turns",
+                "last_preferred_nonempty_id",
+                "terminal_kind",
+                "terminal_reason",
+                "question_contract",
+                "prune_certificates",
+            },
+            "hypothesis graph state",
+        )
+        source_sample_id = integer(state["sample_id"], "source sample_id")
+        raw_nodes = state["nodes"]
+        raw_edges = state["edges"]
+        if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+            raise ValueError("malformed graph nodes or edges")
+
+        node_fields = {
+            "node_id",
+            "sample_id",
+            "function_state",
+            "target_expression",
+            "sexpr",
+            "denotation",
+            "parent_id",
+            "operation",
+            "denotation_labels",
+            "parent_ids",
+            "relation_id",
+            "relation_prompt",
+            "resolver_score",
+            "depth",
+            "status",
+            "semantic_status",
+            "equivalent_to",
+            "provenance",
+        }
+        nodes: Dict[str, HypothesisNode] = {}
+        for index, raw_node in enumerate(raw_nodes):
+            node = exact_mapping(raw_node, node_fields, f"node {index}")
+            node_id = string(node["node_id"], f"node {index} id", nonempty=True)
+            if not re.fullmatch(r"H\d+", node_id) or node_id in nodes:
+                raise ValueError(f"malformed or duplicate node id: {node_id}")
+            if integer(node["sample_id"], f"node {node_id} sample_id") != source_sample_id:
+                raise ValueError(f"node {node_id} sample_id mismatch")
+            labels = node["denotation_labels"]
+            if not isinstance(labels, Mapping) or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in labels.items()
+            ):
+                raise ValueError(f"malformed node {node_id} denotation labels")
+            score = node["resolver_score"]
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))
+            ):
+                raise ValueError(f"malformed node {node_id} resolver score")
+            try:
+                status = HypothesisStatus(node["status"])
+                semantic_status = HypothesisSemanticStatus(node["semantic_status"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"malformed node {node_id} enum") from exc
+            nodes[node_id] = HypothesisNode(
+                node_id=node_id,
+                sample_id=sample_id,
+                function_state=tuple(
+                    string_list(node["function_state"], f"node {node_id} function_state")
+                ),
+                target_expression=string(
+                    node["target_expression"], f"node {node_id} target_expression"
+                ),
+                sexpr=string(node["sexpr"], f"node {node_id} sexpr"),
+                denotation=tuple(
+                    string_list(node["denotation"], f"node {node_id} denotation")
+                ),
+                parent_id=optional_string(
+                    node["parent_id"], f"node {node_id} parent_id"
+                ),
+                operation=string(node["operation"], f"node {node_id} operation"),
+                denotation_labels=dict(labels),
+                parent_ids=tuple(
+                    string_list(node["parent_ids"], f"node {node_id} parent_ids")
+                ),
+                relation_id=optional_string(
+                    node["relation_id"], f"node {node_id} relation_id"
+                ),
+                relation_prompt=optional_string(
+                    node["relation_prompt"], f"node {node_id} relation_prompt"
+                ),
+                resolver_score=float(score),
+                depth=integer(node["depth"], f"node {node_id} depth"),
+                status=status,
+                semantic_status=semantic_status,
+                equivalent_to=optional_string(
+                    node["equivalent_to"], f"node {node_id} equivalent_to"
+                ),
+                provenance=string_list(
+                    node["provenance"], f"node {node_id} provenance"
+                ),
+            )
+
+        node_ids = set(nodes)
+        for node in nodes.values():
+            references = [*node.parent_ids]
+            if node.parent_id is not None:
+                references.append(node.parent_id)
+            if node.equivalent_to is not None:
+                references.append(node.equivalent_to)
+            if any(reference not in node_ids for reference in references):
+                raise ValueError(f"node {node.node_id} references an unknown node")
+
+        edge_fields = {"source", "target", "kind", "label"}
+        edges: List[HypothesisEdge] = []
+        for index, raw_edge in enumerate(raw_edges):
+            edge = exact_mapping(raw_edge, edge_fields, f"edge {index}")
+            source = string(edge["source"], f"edge {index} source", nonempty=True)
+            target = string(edge["target"], f"edge {index} target", nonempty=True)
+            if source not in node_ids or target not in node_ids:
+                raise ValueError(f"edge {index} references an unknown node")
+            try:
+                kind = HypothesisEdgeKind(edge["kind"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"malformed edge {index} kind") from exc
+            edges.append(
+                HypothesisEdge(
+                    source=source,
+                    target=target,
+                    kind=kind,
+                    label=string(edge["label"], f"edge {index} label"),
+                )
+            )
+
+        def referenced_node(value: Any, name: str) -> Optional[str]:
+            node_id = optional_string(value, name)
+            if node_id is not None and node_id not in node_ids:
+                raise ValueError(f"{name} references an unknown node")
+            return node_id
+
+        selected_id = referenced_node(state["selected_id"], "selected_id")
+        committed_id = referenced_node(state["committed_id"], "committed_id")
+        last_preferred = referenced_node(
+            state["last_preferred_nonempty_id"], "last_preferred_nonempty_id"
+        )
+        if selected_id is not None and nodes[selected_id].status != HypothesisStatus.ACTIVE:
+            raise ValueError("selected hypothesis is not active")
+        if committed_id is not None and nodes[committed_id].status != HypothesisStatus.COMMITTED:
+            raise ValueError("committed hypothesis is not committed")
+
+        turns_used = integer(state["turns_used"], "turns_used")
+        max_turns = state["max_turns"]
+        if max_turns is not None:
+            max_turns = integer(max_turns, "max_turns", 1)
+            if turns_used > max_turns:
+                raise ValueError("turns_used exceeds max_turns")
+        next_node_index = integer(state["next_node_index"], "next_node_index")
+        if nodes and next_node_index <= max(int(node_id[1:]) for node_id in nodes):
+            raise ValueError("next_node_index does not follow existing nodes")
+
+        raw_contract = state["question_contract"]
+        question_contract = None
+        if raw_contract is not None:
+            contract = exact_mapping(
+                raw_contract,
+                {"question", "count_required"},
+                "public question contract",
+            )
+            count_required = contract["count_required"]
+            if count_required is not None:
+                count_required = boolean(count_required, "count_required")
+            question_contract = PublicQuestionContract(
+                question=string(contract["question"], "contract question"),
+                count_required=count_required,
+            )
+
+        raw_certificates = state["prune_certificates"]
+        if not isinstance(raw_certificates, Mapping) or not all(
+            isinstance(key, str) for key in raw_certificates
+        ):
+            raise ValueError("malformed prune certificate map")
+        certificate_fields = {
+            "kind",
+            "node_id",
+            "evidence",
+            "empty_preserving_completion",
+        }
+        prune_certificates: Dict[str, PruneCertificate] = {}
+        for key, raw_certificate in raw_certificates.items():
+            certificate = exact_mapping(
+                raw_certificate,
+                certificate_fields,
+                f"prune certificate {key}",
+            )
+            node_id = string(
+                certificate["node_id"], f"prune certificate {key} node_id"
+            )
+            if key != node_id or node_id not in node_ids:
+                raise ValueError(f"prune certificate {key} node mismatch")
+            prune_certificates[key] = PruneCertificate(
+                kind=string(certificate["kind"], f"prune certificate {key} kind"),
+                node_id=node_id,
+                evidence=tuple(
+                    string_list(
+                        certificate["evidence"],
+                        f"prune certificate {key} evidence",
+                    )
+                ),
+                empty_preserving_completion=boolean(
+                    certificate["empty_preserving_completion"],
+                    f"prune certificate {key} empty_preserving_completion",
+                ),
+            )
+
+        restored = HypothesisGraphState(
+            sample_id=sample_id,
+            nodes=nodes,
+            edges=edges,
+            selected_id=selected_id,
+            committed_id=committed_id,
+            abstained=boolean(state["abstained"], "abstained"),
+            execution_attempts=integer(
+                state["execution_attempts"], "execution_attempts"
+            ),
+            execution_calls=integer(state["execution_calls"], "execution_calls"),
+            next_node_index=next_node_index,
+            turns_used=turns_used,
+            max_turns=max_turns,
+            last_preferred_nonempty_id=last_preferred,
+            terminal_kind=optional_string(state["terminal_kind"], "terminal_kind"),
+            terminal_reason=optional_string(
+                state["terminal_reason"], "terminal_reason"
+            ),
+            question_contract=question_contract,
+            prune_certificates=prune_certificates,
+        )
+        self._samples[sample_id] = restored
 
     def add_executed(
         self,

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -17,7 +18,7 @@ import torch
 from verl import DataProto
 from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 from kbqa_r1.answer_utils import extract_last_answer_values
-from kbqa_r1.fork_r1 import ForkDecision, append_intervened_join
+from kbqa_r1.fork_r1 import ForkDecision, RelationCandidate, append_intervened_join
 from kbqa_r1.token_replay import align_structural_rollout_log_probs
 from kbqa_r1.hyper_r1 import (HypothesisGraph, combine_function_states,
                               dependency_function_state,
@@ -654,6 +655,134 @@ class SExprLLMGenerationManager:
         )
 
     @staticmethod
+    def _snapshot_hyper_frontier(frontier: Mapping[str, Any]) -> dict:
+        decision = frontier.get("decision")
+        if not isinstance(decision, ForkDecision):
+            raise RuntimeError("HyPER frontier has no restorable ForkDecision")
+        proposals = {}
+        for proposal_id, proposal in frontier.get("proposals", {}).items():
+            candidate = proposal.get("candidate")
+            if not isinstance(candidate, RelationCandidate):
+                raise RuntimeError("HyPER proposal has no restorable relation candidate")
+            proposals[str(proposal_id)] = {
+                "candidate": {
+                    "relation": candidate.relation,
+                    "score": float(candidate.score),
+                },
+                "rank": int(proposal["rank"]),
+                "status": str(proposal["status"]),
+            }
+        return {
+            "source": str(frontier["source"]),
+            "decision": decision.to_dict(),
+            "parent_id": frontier.get("parent_id"),
+            "contrast_group": str(frontier.get("contrast_group") or ""),
+            "proposals": proposals,
+            "next_offset": int(frontier.get("next_offset", 0)),
+            "closed": bool(frontier.get("closed", False)),
+        }
+
+    @staticmethod
+    def _restore_hyper_frontier(
+        snapshot: Mapping[str, Any], sample_id: int
+    ) -> dict:
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("HyPER frontier snapshot must be a mapping")
+        proposals = snapshot.get("proposals", {})
+        if not isinstance(proposals, Mapping):
+            raise ValueError("HyPER frontier proposals must be a mapping")
+        restored_proposals = {}
+        for proposal_id, proposal in proposals.items():
+            if not isinstance(proposal, Mapping):
+                raise ValueError("invalid HyPER proposal snapshot")
+            candidate = proposal.get("candidate")
+            if not isinstance(candidate, Mapping):
+                raise ValueError("invalid HyPER proposal candidate snapshot")
+            relation = str(candidate.get("relation") or "").strip()
+            if not relation:
+                raise ValueError("HyPER proposal candidate has no relation")
+            restored_proposals[str(proposal_id)] = {
+                "candidate": RelationCandidate(
+                    relation=relation,
+                    score=float(candidate.get("score", 0.0)),
+                ),
+                "rank": int(proposal["rank"]),
+                "status": str(proposal["status"]),
+            }
+        decision_payload = dict(snapshot["decision"])
+        decision_payload["sample_id"] = int(sample_id)
+        return {
+            "source": str(snapshot["source"]),
+            "decision": ForkDecision.from_dict(decision_payload),
+            "parent_id": snapshot.get("parent_id"),
+            "contrast_group": str(snapshot.get("contrast_group") or ""),
+            "proposals": restored_proposals,
+            "next_offset": int(snapshot.get("next_offset", 0)),
+            "closed": bool(snapshot.get("closed", False)),
+        }
+
+    def _capture_hyper_execution_state(self, sample_id: int) -> dict:
+        """Capture one JSON-safe pre-action state for exact counterfactual replay."""
+        return {
+            "schema_version": "hyper-execution-state-v1",
+            "sample_id": int(sample_id),
+            "sexpr": self.state_manager.snapshot_sample_state(sample_id),
+            "graph": self.hyper_graph.snapshot_sample_state(sample_id),
+            "frontiers": [
+                self._snapshot_hyper_frontier(frontier)
+                for frontier in self._hyper_frontiers.get(sample_id, ())
+            ],
+            "next_proposal_index": int(
+                self._hyper_next_proposal_index.get(sample_id, 0)
+            ),
+            "action_records": deepcopy(
+                self._hyper_action_records.get(sample_id, ())
+            ),
+            "latest_observation": str(
+                self._hyper_latest_observations.get(sample_id, "")
+            ),
+            # Gold contracts are private replay evidence. They are never part
+            # of the student-visible messages or action language.
+            "private_gold_contract": deepcopy(
+                self._hyper_gold_contracts.get(sample_id, {})
+            ),
+        }
+
+    def _restore_hyper_execution_state(
+        self, sample_id: int, snapshot: Mapping[str, Any]
+    ) -> None:
+        """Restore a captured state without carrying state from another branch."""
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("HyPER execution snapshot must be a mapping")
+        if snapshot.get("schema_version") != "hyper-execution-state-v1":
+            raise ValueError("unsupported HyPER execution snapshot")
+        self.state_manager.restore_sample_state(sample_id, snapshot["sexpr"])
+        self.hyper_graph.restore_sample_state(sample_id, snapshot["graph"])
+        frontiers = snapshot.get("frontiers", ())
+        if not isinstance(frontiers, (list, tuple)):
+            raise ValueError("HyPER execution snapshot has invalid frontiers")
+        self._hyper_frontiers[sample_id] = [
+            self._restore_hyper_frontier(frontier, sample_id)
+            for frontier in frontiers
+        ]
+        self._hyper_next_proposal_index[sample_id] = int(
+            snapshot.get("next_proposal_index", 0)
+        )
+        self._hyper_action_records[sample_id] = deepcopy(
+            list(snapshot.get("action_records", ()))
+        )
+        latest = str(snapshot.get("latest_observation") or "")
+        if latest:
+            self._hyper_latest_observations[sample_id] = latest
+        else:
+            self._hyper_latest_observations.pop(sample_id, None)
+        private_contract = snapshot.get("private_gold_contract", {})
+        if private_contract:
+            self._hyper_gold_contracts[sample_id] = deepcopy(private_contract)
+        else:
+            self._hyper_gold_contracts.pop(sample_id, None)
+
+    @staticmethod
     def _canonical_trace_prompt(raw_prompt: Any) -> dict:
         if hasattr(raw_prompt, "tolist"):
             raw_prompt = raw_prompt.tolist()
@@ -755,11 +884,14 @@ class SExprLLMGenerationManager:
                     {"role": "user", "content": latest, "loss_mask": 0},
                 ]
             )
+        execution_state = self._capture_hyper_execution_state(sample_id)
         self._hyper_pending_decisions[(sample_id, int(turn))] = {
             "turn": int(turn),
             "context": context,
             "state_before_hash": self._trace_hash(context),
             "progress_before_hash": self._hyper_progress_hash(sample_id),
+            "execution_state_hash": self._trace_hash(execution_state),
+            "private_execution_state": execution_state,
             "constraint_spec": dict(constraint_spec),
         }
 

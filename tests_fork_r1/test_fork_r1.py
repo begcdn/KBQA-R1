@@ -97,6 +97,20 @@ class ForkR1Test(unittest.TestCase):
             ],
         )
 
+    def test_decision_round_trip_preserves_ranked_catalog(self):
+        original = decision()
+
+        restored = ForkDecision.from_dict(original.to_dict())
+
+        self.assertEqual(restored, original)
+
+    def test_decision_restore_rejects_malformed_catalog(self):
+        payload = decision().to_dict()
+        payload["ranked_relations"] = ["not-a-candidate"]
+
+        with self.assertRaisesRegex(ValueError, "ranked relation"):
+            ForkDecision.from_dict(payload)
+
     def test_entity_fork_adds_start_before_join(self):
         original = decision(entity_argument="m.02")
         state = append_intervened_join(original)

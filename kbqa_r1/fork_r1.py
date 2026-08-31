@@ -70,6 +70,50 @@ class ForkDecision:
         result["entities"] = [list(entity) for entity in self.entities]
         return result
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ForkDecision":
+        """Restore the JSON-safe form emitted by :meth:`to_dict`."""
+        if not isinstance(value, Mapping):
+            raise TypeError("ForkDecision snapshot must be a mapping")
+        ranked = value.get("ranked_relations")
+        if not isinstance(ranked, (list, tuple)):
+            raise ValueError("ForkDecision snapshot has no ranked relations")
+        candidates = []
+        for candidate in ranked:
+            if not isinstance(candidate, Mapping):
+                raise ValueError("invalid ranked relation snapshot")
+            relation = str(candidate.get("relation") or "").strip()
+            if not relation:
+                raise ValueError("ranked relation snapshot has no relation")
+            candidates.append(
+                RelationCandidate(
+                    relation=relation,
+                    score=float(candidate.get("score", 0.0)),
+                )
+            )
+        entities = value.get("entities", ())
+        if not isinstance(entities, (list, tuple)) or any(
+            not isinstance(entity, (list, tuple)) or len(entity) != 2
+            for entity in entities
+        ):
+            raise ValueError("invalid ForkDecision entity snapshot")
+        return cls(
+            sample_id=int(value["sample_id"]),
+            turn=int(value["turn"]),
+            action_index=int(value["action_index"]),
+            step_number=int(value["step_number"]),
+            entity_argument=str(value["entity_argument"]),
+            relation_prompt=str(value["relation_prompt"]),
+            chosen_relation=str(value["chosen_relation"]),
+            ranked_relations=tuple(candidates),
+            resolver_margin=float(value["resolver_margin"]),
+            state_before=tuple(str(item) for item in value.get("state_before", ())),
+            expression_counter=int(value.get("expression_counter", 0)),
+            entities=tuple((str(entity[0]), str(entity[1])) for entity in entities),
+            prompt=str(value.get("prompt", "")),
+            raw_action=str(value.get("raw_action", "")),
+        )
+
 
 def relation_name(selected: Any) -> str:
     """Return a relation id/name from KBQA-R1's resolver result formats."""
