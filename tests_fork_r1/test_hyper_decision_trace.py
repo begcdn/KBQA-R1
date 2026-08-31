@@ -1,6 +1,8 @@
 from types import MethodType, SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 
 from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 from kbqa_r1.hyper_r1 import HypothesisGraph
@@ -11,6 +13,8 @@ def _manager(masked: bool):
     manager = SExprLLMGenerationManager.__new__(SExprLLMGenerationManager)
     manager.hyper_structural_constraints = masked
     manager.hyper_graph = HypothesisGraph()
+    manager.hyper_frontier_width = 6
+    manager.tokenizer = SimpleNamespace(pad_token_id=0)
     manager._hyper_frontiers = {}
     manager._hyper_trace_roots = {
         0: {
@@ -135,11 +139,38 @@ def test_trace_roots_make_repeated_rollouts_unique_and_preserve_split():
                 dtype=object,
             ),
             "uid": np.asarray(["shared", "shared"], dtype=object),
+            "raw_prompt_ids": np.asarray([[1, 2], [1, 2]], dtype=object),
         }
     )
 
-    manager._initialize_hyper_decision_traces(batch, 2)
+    manager._initialize_hyper_decision_traces(
+        batch, 2, torch.tensor([[0, 1, 2], [0, 1, 2]])
+    )
 
     roots = manager._hyper_trace_roots
     assert roots[0]["rollout_id"] != roots[1]["rollout_id"]
     assert roots[0]["source_split"] == roots[1]["source_split"] == "train"
+
+
+def test_trace_initialization_rejects_prompt_token_mismatch():
+    manager = _manager(False)
+    manager._call_counter = 1
+    manager.is_validation = False
+    batch = SimpleNamespace(
+        non_tensor_batch={
+            "raw_prompt": np.asarray(
+                [[{"role": "user", "content": (
+                    "Question: q\n\nHyPER-R1 executable hypothesis graph:\n- contract"
+                )}]],
+                dtype=object,
+            ),
+            "raw_prompt_ids": np.asarray([[1, 2, 3]], dtype=object),
+            "extra_info": np.asarray([{"question_id": "q"}], dtype=object),
+            "uid": np.asarray(["rollout"], dtype=object),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="model-visible token IDs"):
+        manager._initialize_hyper_decision_traces(
+            batch, 1, torch.tensor([[0, 1, 9]])
+        )

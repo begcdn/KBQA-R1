@@ -670,17 +670,42 @@ class SExprLLMGenerationManager:
             raise RuntimeError("HyPER raw prompt is not the canonical policy prompt")
         return {"role": "user", "content": content, "loss_mask": 0}
 
-    def _initialize_hyper_decision_traces(self, gen_batch, batch_size: int) -> None:
+    def _initialize_hyper_decision_traces(
+        self,
+        gen_batch,
+        batch_size: int,
+        initial_input_ids: torch.Tensor,
+    ) -> None:
         raw_prompts = gen_batch.non_tensor_batch.get("raw_prompt")
         if raw_prompts is None or len(raw_prompts) != batch_size:
             raise RuntimeError(
                 "HyPER decision tracing requires aligned raw prompts; set "
                 "data.return_raw_chat=true"
             )
+        raw_prompt_ids = gen_batch.non_tensor_batch.get("raw_prompt_ids")
+        if raw_prompt_ids is None or len(raw_prompt_ids) != batch_size:
+            raise RuntimeError(
+                "HyPER decision tracing requires aligned raw_prompt_ids"
+            )
+        if initial_input_ids.shape[0] != batch_size:
+            raise RuntimeError("HyPER trace prompts do not align with the rollout batch")
         extra_rows = gen_batch.non_tensor_batch.get("extra_info")
         uid_rows = gen_batch.non_tensor_batch.get("uid")
         self._hyper_decision_traces = {sample_id: [] for sample_id in range(batch_size)}
         for sample_id in range(batch_size):
+            expected_ids = raw_prompt_ids[sample_id]
+            if hasattr(expected_ids, "tolist"):
+                expected_ids = expected_ids.tolist()
+            expected_ids = [int(value) for value in expected_ids]
+            visible_ids = initial_input_ids[sample_id].detach().cpu().tolist()
+            pad_id = self.tokenizer.pad_token_id
+            while visible_ids and visible_ids[0] == pad_id:
+                visible_ids.pop(0)
+            if visible_ids != expected_ids:
+                raise RuntimeError(
+                    "HyPER decision trace prompt differs from model-visible token IDs; "
+                    "increase max_start_length or repair dataset prompt metadata"
+                )
             extra = (
                 _metadata_mapping(extra_rows[sample_id])
                 if extra_rows is not None and sample_id < len(extra_rows)
@@ -2690,7 +2715,9 @@ class SExprLLMGenerationManager:
             SExprUtils.initialize_candidate_entities_from_prompts(self.tokenizer, self.state_manager, initial_input_ids, batch_size)
             if self.hyper_r1_enable:
                 self._load_hyper_public_contracts(batch_size)
-                self._initialize_hyper_decision_traces(gen_batch, batch_size)
+                self._initialize_hyper_decision_traces(
+                    gen_batch, batch_size, initial_input_ids
+                )
 
         
         # Enhanced logging for testing (controlled frequency)
