@@ -122,6 +122,83 @@ def test_rejects_legal_action_that_failed_inside_the_executor():
     assert status == "first_failure_uncertified"
 
 
+def test_exact_state_replay_can_certify_legal_executor_failure():
+    failed = _decision(
+        2,
+        "<think>legal but rejected</think>\n<action>Select [ H1 ]</action>",
+        accepted=False,
+        failure="protocol",
+    )
+    snapshot = {
+        "schema_version": "hyper-execution-state-v1",
+        "latest_observation": "before",
+        "graph": {"node": "H1"},
+    }
+    failed["private_execution_state"] = snapshot
+    failed["execution_snapshot_hash"] = MODULE._digest(snapshot)
+    failed["execution_state_hash"] = MODULE._execution_state_hash(snapshot)
+    corrected = _decision(
+        3,
+        "<think>recover</think>\n<action>Commit [ H1 ]</action>",
+        accepted=True,
+    )
+    corrected["execution_state_hash"] = "later-turn-clock"
+    calls = []
+
+    def replay(row, failed_decision, candidate, suffix):
+        calls.append((row, failed_decision, candidate, suffix))
+        return {
+            "certified": True,
+            "failed_reproduced": True,
+            "target_accepted": True,
+            "target_made_progress": True,
+            "explicit_exact_completion": True,
+            "intent_equivalent": True,
+            "answer_f1": 1.0,
+        }
+
+    row, status = MODULE.certify_rollout(
+        _rollout([failed, corrected]),
+        replay_verifier=replay,
+    )
+
+    assert status == "certified_recovery"
+    correction = row["decisions"][0]["correction"]
+    assert correction["evidence"]["exact_state_replayed"] is True
+    assert correction["evidence"]["failed_response_outside_contract"] is False
+    assert correction["evidence"]["replay"]["answer_f1"] == 1.0
+    assert calls[0][2]["raw_action"] == "Commit [ H1 ]"
+
+
+def test_exact_state_replay_fails_closed_when_suffix_is_not_verified():
+    failed = _decision(
+        2,
+        "<think>legal but rejected</think>\n<action>Select [ H1 ]</action>",
+        accepted=False,
+        failure="protocol",
+    )
+    corrected = _decision(
+        3,
+        "<think>recover</think>\n<action>Commit [ H1 ]</action>",
+        accepted=True,
+    )
+
+    row, status = MODULE.certify_rollout(
+        _rollout([failed, corrected]),
+        replay_verifier=lambda *_: {
+            "certified": True,
+            "failed_reproduced": True,
+            "target_accepted": True,
+            "target_made_progress": True,
+            "explicit_exact_completion": True,
+            "intent_equivalent": False,
+        },
+    )
+
+    assert row is None
+    assert status == "first_failure_uncertified"
+
+
 def test_rejects_recovery_without_exact_explicit_completion():
     failed = _decision(
         2,

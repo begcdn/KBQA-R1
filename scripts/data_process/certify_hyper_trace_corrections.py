@@ -15,12 +15,16 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 
 
-CERTIFIER_VERSION = "hyper-same-state-correction-v1"
+CERTIFIER_VERSION = "hyper-same-state-correction-v2"
+ReplayVerifier = Callable[
+    [Mapping[str, Any], Mapping[str, Any], Mapping[str, Any], Sequence[Mapping[str, Any]]],
+    Mapping[str, Any] | None,
+]
 
 
 def _canonical_json(value: Any) -> str:
@@ -86,6 +90,7 @@ def _same_state_correction(
     decisions: list[Mapping[str, Any]],
     failure_index: int,
     failure_kind: str,
+    replay_verifier: ReplayVerifier | None = None,
 ) -> dict[str, Any] | None:
     failed = decisions[failure_index]
     before = str(failed.get("progress_before_hash") or "")
@@ -121,23 +126,47 @@ def _same_state_correction(
         return None
 
     failed_response = str(failed.get("raw_response") or "")
-    # Existing traces do not contain a restorable full executor snapshot.  A
-    # same-state certificate is therefore sound only for structural rejection:
-    # the response was outside the original action contract and no legal
-    # transition was entered.  Legal actions that later failed execution need
-    # the separate counterfactual replayer and must not be relabeled here.
-    if spec.accepts_response(failed_response):
+    failed_inside_contract = spec.accepts_response(failed_response)
+    # A legal-looking response that failed inside the executor is not a
+    # correction example by itself.  It becomes one only when an exact-state
+    # replayer independently reproduces the failure and verifies a successful
+    # suffix from the same saved state.
+    if failed_inside_contract and replay_verifier is None:
         return None
 
-    for candidate in decisions[failure_index + 1 :]:
+    for candidate_index in range(failure_index + 1, len(decisions)):
+        candidate = decisions[candidate_index]
         if str(candidate.get("progress_before_hash") or "") != after:
             break
-        if failed_execution_hash and str(
-            candidate.get("execution_state_hash") or ""
-        ) != failed_execution_hash:
-            continue
         response = str(candidate.get("raw_response") or "")
         if candidate.get("accepted") is not True or not spec.accepts_response(response):
+            continue
+        candidate_execution_hash = str(candidate.get("execution_state_hash") or "")
+        execution_hash_changed = bool(
+            failed_execution_hash
+            and candidate_execution_hash != failed_execution_hash
+        )
+        replay_evidence: Mapping[str, Any] | None = None
+        if replay_verifier is not None:
+            replay_evidence = replay_verifier(
+                row,
+                failed,
+                candidate,
+                decisions[candidate_index:],
+            )
+            if not isinstance(replay_evidence, Mapping):
+                continue
+            required_replay_checks = (
+                "certified",
+                "failed_reproduced",
+                "target_accepted",
+                "target_made_progress",
+                "explicit_exact_completion",
+                "intent_equivalent",
+            )
+            if any(replay_evidence.get(key) is not True for key in required_replay_checks):
+                continue
+        elif execution_hash_changed:
             continue
         corrected = deepcopy(messages)
         corrected[-1] = {
@@ -156,10 +185,13 @@ def _same_state_correction(
             "progress_hash": after,
             "execution_state_hash": failed_execution_hash,
             "constraint_digest": spec.digest,
-            "failed_response_outside_contract": True,
+            "failed_response_outside_contract": not failed_inside_contract,
+            "exact_state_replayed": replay_evidence is not None,
             "target_response": response,
             "explicit_exact_completion": True,
         }
+        if replay_evidence is not None:
+            evidence["replay"] = deepcopy(dict(replay_evidence))
         return {
             "messages": corrected,
             "legal_target_certified": True,
@@ -172,7 +204,10 @@ def _same_state_correction(
     return None
 
 
-def certify_rollout(row: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def certify_rollout(
+    row: Mapping[str, Any],
+    replay_verifier: ReplayVerifier | None = None,
+) -> tuple[dict[str, Any] | None, str]:
     decisions = sorted(
         (deepcopy(value) for value in row.get("decisions", [])),
         key=lambda value: int(value.get("turn", -1)),
@@ -191,6 +226,7 @@ def certify_rollout(row: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]
         decisions,
         failure_index,
         failure_kind,
+        replay_verifier,
     )
     if correction is None:
         return None, "first_failure_uncertified"
@@ -200,7 +236,10 @@ def certify_rollout(row: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]
     return result, "certified_recovery"
 
 
-def certify_rows(rows: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def certify_rows(
+    rows: Iterable[Mapping[str, Any]],
+    replay_verifier: ReplayVerifier | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
     output = []
     counts: dict[str, int] = {
         "input_rollouts": 0,
@@ -211,7 +250,7 @@ def certify_rows(rows: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
     }
     for row in rows:
         counts["input_rollouts"] += 1
-        certified, status = certify_rollout(row)
+        certified, status = certify_rollout(row, replay_verifier)
         if status == "clean":
             counts["clean_rollouts"] += 1
         elif status == "certified_recovery":
