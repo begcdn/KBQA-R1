@@ -24,7 +24,11 @@ must also carry ``correction`` with canonical ``messages``,
 the ordered decision records.
 
 Semantic JSONL uses one certified state per line.  Its ``messages`` contain the
-chosen target and ``certification`` follows ``hyper-semantic-recovery-v1``.
+chosen target.  Terminal Commit corrections use exhaustive
+``hyper-semantic-recovery-v1`` certificates; open nonterminal corrections use
+paired ``hyper-semantic-recovery-v2`` certificates whose target reaches the
+global semantic-utility upper bound under the same bounded continuation used
+for the model's observed action.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ MIXTURE = {
 }
 ASSEMBLY_SCHEMA_VERSION = "hyper-corrective-assembly-v1"
 SEMANTIC_CERTIFICATE_VERSION = "hyper-semantic-recovery-v1"
+PAIRWISE_SEMANTIC_CERTIFICATE_VERSION = "hyper-semantic-recovery-v2"
 MAX_SELECTED_STATES_PER_QUESTION = 8
 REQUIRED_PROVENANCE = {
     "repository_commit",
@@ -596,7 +601,11 @@ def _validate_semantic_certificate(
     certificate = row.get("certification")
     if not isinstance(certificate, Mapping):
         raise ValueError("semantic recovery has no certification object")
-    if certificate.get("schema_version") != SEMANTIC_CERTIFICATE_VERSION:
+    schema_version = certificate.get("schema_version")
+    if schema_version not in {
+        SEMANTIC_CERTIFICATE_VERSION,
+        PAIRWISE_SEMANTIC_CERTIFICATE_VERSION,
+    }:
         raise ValueError("semantic recovery has an unsupported certificate schema")
     required_true = (
         "certified",
@@ -625,6 +634,68 @@ def _validate_semantic_certificate(
     for key in ("executor_hash", "certifier_hash"):
         if not str(certificate.get(key, "")).strip():
             raise ValueError(f"semantic recovery lacks {key}")
+    if schema_version == PAIRWISE_SEMANTIC_CERTIFICATE_VERSION:
+        try:
+            epsilon = float(certificate["epsilon"])
+            target_q = float(certificate["target_q"])
+            failed_q = float(certificate["failed_q"])
+            upper_bound = float(certificate["utility_upper_bound"])
+            failed_action = str(certificate["failed_action"]).strip()
+            target_outcome = certificate["target_outcome"]
+            failed_outcome = certificate["failed_outcome"]
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("semantic recovery has malformed pairwise-regret values") from exc
+        if (
+            not all(math.isfinite(value) for value in (epsilon, target_q, failed_q, upper_bound))
+            or not (0.0 <= epsilon <= 0.1)
+            or abs(upper_bound - 1.0) > 1e-9
+            or abs(target_q - upper_bound) > 1e-9
+            or not (0.0 <= failed_q <= upper_bound)
+        ):
+            raise ValueError("semantic recovery pairwise utility values are invalid")
+        if failed_action == action or not failed_action:
+            raise ValueError("semantic recovery must identify a distinct failed action")
+        if not spec.accepts_response(f"<action>{failed_action}</action>"):
+            raise ValueError("semantic recovery failed action is outside the legal action language")
+        if target_q - failed_q <= epsilon + 1e-12:
+            raise ValueError("semantic recovery does not certify positive executable regret")
+        required_pairwise = {
+            "global_upper_bound_achieved": True,
+            "no_hidden_action_injection": True,
+            "decision_scope": "paired_teacher_and_observed_action_at_exact_state",
+            "continuation_policy": "bounded_gold_oracle_after_first_action",
+            "teacher_source": "private_gold_program_runtime_actions_only",
+        }
+        if any(certificate.get(key) != value for key, value in required_pairwise.items()):
+            raise ValueError("semantic recovery pairwise protocol metadata is invalid")
+        if not isinstance(target_outcome, Mapping) or not isinstance(failed_outcome, Mapping):
+            raise ValueError("semantic recovery pairwise outcomes are malformed")
+        comparable = ("constraint_digest", "start_turn", "max_turns", "continuation_policy")
+        if any(target_outcome.get(key) != failed_outcome.get(key) for key in comparable):
+            raise ValueError("semantic recovery branches do not share one execution contract")
+        if (
+            str(target_outcome.get("constraint_digest") or "") != spec.digest
+            or target_outcome.get("first_action_accepted") is not True
+            or failed_outcome.get("first_action_accepted") is not True
+            or target_outcome.get("explicit_commit") is not True
+            or target_outcome.get("answer_exact") is not True
+            or target_outcome.get("intent_equivalent") is not True
+            or abs(float(target_outcome.get("semantic_q", -1.0)) - target_q) > 1e-9
+            or abs(float(failed_outcome.get("semantic_q", -1.0)) - failed_q) > 1e-9
+        ):
+            raise ValueError("semantic recovery pairwise outcomes do not support the claim")
+        target_actions = target_outcome.get("actions")
+        failed_actions = failed_outcome.get("actions")
+        if (
+            not isinstance(target_actions, list)
+            or not target_actions
+            or str(target_actions[0]).strip() != action
+            or not isinstance(failed_actions, list)
+            or not failed_actions
+            or str(failed_actions[0]).strip() != failed_action
+        ):
+            raise ValueError("semantic recovery branch first actions do not match the certificate")
+        return _digest(certificate)
     try:
         epsilon = float(certificate["epsilon"])
         q_values = {str(key): float(value) for key, value in certificate["q_values"].items()}

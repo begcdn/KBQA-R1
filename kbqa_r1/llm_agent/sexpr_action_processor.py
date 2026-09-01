@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from collections import Counter, defaultdict
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
 from ..fork_r1 import ForkDecision, build_fork_decision
@@ -17,6 +18,22 @@ from ..sexpr.limit import name_relation_list, tc_time_list
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+_ONTOLOGY_IDENTIFIER = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
+)
+_DATE_LITERAL = re.compile(
+    r"^\d{4}(?:-(?:0[1-9]|1[0-2]))?(?:-(?:0[1-9]|[12]\d|3[01]))?$"
+)
+_DATETIME_LITERAL = re.compile(
+    r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
+    r"T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?"
+    r"(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?$"
+)
+
+
+def _is_supported_date_literal(value: str) -> bool:
+    return bool(_DATE_LITERAL.fullmatch(value) or _DATETIME_LITERAL.fullmatch(value))
 
 
 class SExprActionProcessor:
@@ -581,20 +598,18 @@ class SExprActionProcessor:
 
 
     def _is_ontology_entity(self, value: str) -> bool:
-        """Return True if value looks like a literal_type identifier in the form a.b (exactly one dot).
+        """Return True for a dotted Freebase ontology identifier.
 
         Notes:
         - Must NOT be MID, URL, quoted string, or xsd literal (with ^^)
-        - Must match two segments separated by a single dot.
+        - Must contain at least two non-empty identifier segments.
         """
         if not value or not isinstance(value, str):
             return False
         s = value.strip()
         if s.startswith(('m.', 'g.', 'http', '"')) or ('^^' in s):
             return False
-        # exactly one dot
-        pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
-        return bool(pattern.fullmatch(s))
+        return bool(_ONTOLOGY_IDENTIFIER.fullmatch(s))
     
     def process_merge_action(self, action: ActionResult, function_state: List[str], sample_id: int = None) -> ActionResult:
         """
@@ -869,13 +884,7 @@ class SExprActionProcessor:
                         num_pattern = _re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
                         return bool(num_pattern.fullmatch(val_part))
                     if dtype in date_allowed:
-                        import re as _re
-
-                        # YYYY or YYYY-MM or YYYY-MM-DD
-                        date_basic = _re.compile(r"^\d{4}(?:-(?:0[1-9]|1[0-2]))?(?:-(?:0[1-9]|[12]\d|3[01]))?$")
-                        # ISO datetime: YYYY-MM-DDTHH:MM[:SS]
-                        date_time = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$")
-                        return bool(date_basic.fullmatch(val_part)) or bool(date_time.fullmatch(val_part))
+                        return _is_supported_date_literal(val_part)
                     return False
                 except Exception:
                     return False
@@ -885,9 +894,7 @@ class SExprActionProcessor:
             if bool(num_pattern.fullmatch(s)):
                 return True
             # Also accept plain date-like values without explicit xsd type
-            date_basic = _re.compile(r"^\d{4}(?:-(?:0[1-9]|1[0-2]))?(?:-(?:0[1-9]|[12]\d|3[01]))?$")
-            date_time = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$")
-            return bool(date_basic.fullmatch(s)) or bool(date_time.fullmatch(s))
+            return _is_supported_date_literal(s)
 
         if not _is_supported_cmp_value(str(number)):
             info = (
@@ -1149,6 +1156,12 @@ class SExprActionProcessor:
         except Exception:
             mapping = {}
         self._literal_contains_map = mapping
+
+    def _exact_literal_relation(self, value: str) -> str | None:
+        """Return an exact public literal path before any fuzzy remapping."""
+        relations = getattr(self.relation_retrieval, "literal_relation_list", ()) or ()
+        candidate = str(value).strip()
+        return candidate if candidate in relations else None
     
     def _get_sparql_relations(self, entity_id: str, function_state: List[str] = None) -> List[Tuple[str, str]]:
         """
@@ -1269,9 +1282,7 @@ class SExprActionProcessor:
                 num_pattern = _re.compile(r"^[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
                 return bool(num_pattern.fullmatch(left_val))
             if dtype in date_allowed:
-                date_basic = _re.compile(r"^\d{4}(?:-(?:0[1-9]|1[0-2]))?(?:-(?:0[1-9]|[12]\d|3[01]))?$")
-                date_time = _re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$")
-                return bool(date_basic.fullmatch(left_val)) or bool(date_time.fullmatch(left_val))
+                return _is_supported_date_literal(left_val)
             return False
         except Exception:
             return False
@@ -1632,6 +1643,39 @@ class SExprActionProcessor:
                         action.is_valid = False
                         action.error_message = f"Referenced expression '{expr_token}' not found for Order action"
                         return action
+                    exact_public_relation = self._exact_literal_relation(relation)
+                    if exact_public_relation is not None:
+                        action.arguments = [
+                            action.arguments[0],
+                            expr_token,
+                            exact_public_relation,
+                        ]
+                        if action_index is not None:
+                            exact = SimpleNamespace(
+                                relation_name=exact_public_relation,
+                                relation_id=exact_public_relation,
+                                score=1.0,
+                            )
+                            self._set_action_relation_state(
+                                sample_id=sample_id,
+                                action_index=action_index,
+                                selected_relation=exact,
+                                candidate_relations=[exact_public_relation],
+                                ranked_top5=[exact_public_relation],
+                                state_dict={
+                                    'action_type': action.action_type.name,
+                                    'raw_text': getattr(action, 'raw_text', None),
+                                    'arguments': list(action.arguments),
+                                    'writer': 'process_order_action_exact',
+                                    'selected_relation': exact,
+                                    'ranked_top5': [exact_public_relation],
+                                    'candidate_relations': [exact_public_relation],
+                                    'entity_argument': expr_token,
+                                    'relation_prompt': relation,
+                                },
+                            )
+                        action.is_valid = True
+                        return action
                     # Build candidate relations by scoping function_state to referenced expression
                     fs_scoped = self._truncate_function_state_to_expression(current_function_state, expr_token)
                     candidate_relations = self.relation_retrieval.get_candidate_relations(
@@ -1662,10 +1706,28 @@ class SExprActionProcessor:
                         action.is_valid = False
                         action.error_message = f"No candidate relations available for {expr_token} in Order"
                         return action
-                    selected = self.relation_retrieval.select_best_relations(
-                        relation,
-                        candidate_relations,
-                        source='literal_plain',
+                    exact_relation = next(
+                        (
+                            relation_id
+                            for relation_name, relation_id in candidate_relations
+                            if relation in {relation_name, relation_id}
+                        ),
+                        None,
+                    )
+                    selected = (
+                        [
+                            SimpleNamespace(
+                                relation_name=exact_relation,
+                                relation_id=exact_relation,
+                                score=1.0,
+                            )
+                        ]
+                        if exact_relation is not None
+                        else self.relation_retrieval.select_best_relations(
+                            relation,
+                            candidate_relations,
+                            source='literal_plain',
+                        )
                     )
                     if selected:
                         best_relation = selected[0]
@@ -1726,6 +1788,39 @@ class SExprActionProcessor:
                         action.is_valid = False
                         action.error_message = f"Ontology '{expr_token}' not in candidate ontology types"
                         return action
+                    exact_public_relation = self._exact_literal_relation(relation)
+                    if exact_public_relation is not None:
+                        action.arguments = [
+                            action.arguments[0],
+                            expr_token,
+                            exact_public_relation,
+                        ]
+                        if action_index is not None:
+                            exact = SimpleNamespace(
+                                relation_name=exact_public_relation,
+                                relation_id=exact_public_relation,
+                                score=1.0,
+                            )
+                            self._set_action_relation_state(
+                                sample_id=sample_id,
+                                action_index=action_index,
+                                selected_relation=exact,
+                                candidate_relations=[exact_public_relation],
+                                ranked_top5=[exact_public_relation],
+                                state_dict={
+                                    'action_type': action.action_type.name,
+                                    'raw_text': getattr(action, 'raw_text', None),
+                                    'arguments': list(action.arguments),
+                                    'writer': 'process_order_action_exact',
+                                    'selected_relation': exact,
+                                    'ranked_top5': [exact_public_relation],
+                                    'candidate_relations': [exact_public_relation],
+                                    'entity_argument': expr_token,
+                                    'relation_prompt': relation,
+                                },
+                            )
+                        action.is_valid = True
+                        return action
                     # For ontology type, use literal_relation_list as candidate relations (KBQA-o1 style)
                     try:
                         candidate_relations = [(rel, rel) for rel in (getattr(self.relation_retrieval, 'literal_relation_list', None) or [])]
@@ -1735,10 +1830,28 @@ class SExprActionProcessor:
                         action.is_valid = False
                         action.error_message = f"No literal candidate relations available for ontology '{expr_token}'"
                         return action
-                    selected = self.relation_retrieval.select_best_relations(
-                        relation,
-                        candidate_relations,
-                        source='literal_plain',  # Order + ontology 使用裸 literal index
+                    exact_relation = next(
+                        (
+                            relation_id
+                            for relation_name, relation_id in candidate_relations
+                            if relation in {relation_name, relation_id}
+                        ),
+                        None,
+                    )
+                    selected = (
+                        [
+                            SimpleNamespace(
+                                relation_name=exact_relation,
+                                relation_id=exact_relation,
+                                score=1.0,
+                            )
+                        ]
+                        if exact_relation is not None
+                        else self.relation_retrieval.select_best_relations(
+                            relation,
+                            candidate_relations,
+                            source='literal_plain',
+                        )
                     )
                     if selected:
                         best_relation = selected[0]

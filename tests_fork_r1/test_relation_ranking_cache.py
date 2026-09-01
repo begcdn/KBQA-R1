@@ -3,6 +3,7 @@ import types
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 if "pyodbc" not in sys.modules:
     pyodbc = types.ModuleType("pyodbc")
@@ -167,6 +168,188 @@ def test_merge_accepts_question_inferred_ontology_type_without_gold_candidate():
     assert processed.is_valid is True
     assert processed.arguments == ["expression1", "expression2"]
     assert state.functions[-1] == "expression2 = START('dining.chef')"
+
+
+@pytest.mark.parametrize(
+    "ontology_type",
+    (
+        "base.exoplanetology.exoplanet",
+        "user.patrick.default_domain.warship_v1_1",
+    ),
+)
+def test_merge_accepts_multisegment_freebase_ontology_types(ontology_type):
+    state = FakeMergeState()
+    processor = SExprActionProcessor(
+        FakeHyperRetrieval(),
+        state,
+        hyper_frontier_width=6,
+    )
+    action = ActionResult(
+        action_type=ActionType.MERGE,
+        arguments=["expression1", ontology_type],
+        raw_text=f"Merge [ expression1 | {ontology_type} ]",
+        step_number=1,
+    )
+
+    processed = processor.process_merge_action(
+        action,
+        state.get_sample_function_state(0),
+        sample_id=0,
+    )
+
+    assert processed.is_valid is True
+    assert processed.arguments == ["expression1", "expression2"]
+    assert state.functions[-1] == f"expression2 = START('{ontology_type}')"
+
+
+@pytest.mark.parametrize(
+    "ontology_type",
+    ("people", "m.0123", "people..person", "people.person-name"),
+)
+def test_merge_rejects_malformed_ontology_types(ontology_type):
+    state = FakeMergeState()
+    processor = SExprActionProcessor(
+        FakeHyperRetrieval(),
+        state,
+        hyper_frontier_width=6,
+    )
+    action = ActionResult(
+        action_type=ActionType.MERGE,
+        arguments=["expression1", ontology_type],
+        raw_text=f"Merge [ expression1 | {ontology_type} ]",
+        step_number=1,
+    )
+
+    processed = processor.process_merge_action(
+        action,
+        state.get_sample_function_state(0),
+        sample_id=0,
+    )
+
+    assert processed.is_valid is False
+
+
+class FakeCompareRetrieval:
+    dataset = "grailqa"
+    last_similarity_scores = []
+
+    def select_best_relation_for_cmp(self, relation, _mode):
+        return relation
+
+
+def test_compare_accepts_gold_datetime_with_timezone_offset():
+    processor = SExprActionProcessor(
+        FakeCompareRetrieval(),
+        FakeMergeState(),
+        hyper_frontier_width=6,
+    )
+    value = "2010-06-29T20:30:00-08:00^^http://www.w3.org/2001/XMLSchema#dateTime"
+    action = ActionResult(
+        action_type=ActionType.COMPARE,
+        arguments=["le", "time.event.start_date", value],
+        raw_text=f"Compare [ le | time.event.start_date | {value} ]",
+        step_number=1,
+    )
+
+    processed = processor.process_compare_action(action, sample_id=0)
+
+    assert processed.is_valid is True
+    assert processed.arguments[2] == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "2010-06-29T20:30:00-25:00^^http://www.w3.org/2001/XMLSchema#dateTime",
+        "2010-13-29T20:30:00Z^^http://www.w3.org/2001/XMLSchema#dateTime",
+        "2010-06-29T20:30:00+0800^^http://www.w3.org/2001/XMLSchema#dateTime",
+    ),
+)
+def test_compare_rejects_malformed_typed_datetimes(value):
+    processor = SExprActionProcessor(
+        FakeCompareRetrieval(),
+        FakeMergeState(),
+        hyper_frontier_width=6,
+    )
+    action = ActionResult(
+        action_type=ActionType.COMPARE,
+        arguments=["le", "time.event.start_date", value],
+        raw_text=f"Compare [ le | time.event.start_date | {value} ]",
+        step_number=1,
+    )
+
+    processed = processor.process_compare_action(action, sample_id=0)
+
+    assert processed.is_valid is False
+
+
+class FakeOrderRetrieval:
+    dataset = "grailqa"
+    last_similarity_scores = []
+
+    def __init__(self, exact_relation):
+        self.literal_relation_list = ["time.event.start_date", exact_relation]
+        self.ranker_calls = []
+
+    def get_candidate_relations(self, _function_state, allow_literal_relations=False):
+        assert allow_literal_relations is True
+        return [
+            ("time.event.start_date", "time.event.start_date"),
+        ]
+
+    def select_best_relations(self, query, candidates, source=None):
+        self.ranker_calls.append((query, tuple(candidates), source))
+        return [
+            types.SimpleNamespace(
+                relation_name="time.event.start_date",
+                relation_id="time.event.start_date",
+                score=0.99,
+            )
+        ]
+
+
+def test_order_preserves_exact_nested_live_candidate_before_fuzzy_ranking():
+    exact = (
+        "(JOIN soccer.football_match.substitution "
+        "soccer.football_player_substitution.minute)"
+    )
+    retrieval = FakeOrderRetrieval(exact)
+    state = FakeMergeState()
+    processor = SExprActionProcessor(retrieval, state, hyper_frontier_width=6)
+    action = ActionResult(
+        action_type=ActionType.ORDER,
+        arguments=["ARGMIN", "expression1", exact],
+        raw_text=f"Order [ ARGMIN | expression1 | {exact} ]",
+        step_number=1,
+    )
+
+    processed = processor.process_order_action(
+        action,
+        state.get_sample_function_state(0),
+        sample_id=0,
+    )
+
+    assert processed.is_valid is True
+    assert processed.arguments == ["ARGMIN", "expression1", exact]
+    assert retrieval.ranker_calls == []
+
+
+def test_compare_ranker_preserves_an_exact_literal_relation():
+    retrieval = RelationRetrieval.__new__(RelationRetrieval)
+    retrieval.literal_relation_list = [
+        "boats.ship.length_overall",
+        "time.event.start_date",
+    ]
+    retrieval.last_similarity_scores = []
+
+    candidate = retrieval.select_best_relation_for_cmp(
+        "time.event.start_date",
+        "le",
+    )
+
+    assert candidate.relation_id == "time.event.start_date"
+    assert candidate.score == 1.0
+    assert retrieval.last_similarity_scores == [0.0, 1.0]
 
 
 def test_hyper_find_relation_uses_immutable_question_and_one_public_argument():

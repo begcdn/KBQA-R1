@@ -351,6 +351,20 @@ class RelationRetrieval:
 
         # Use a deterministic ordering of literal relations for downstream consumers
         literal_relation_names = list(self.literal_relation_list)
+
+        # An exact executable identifier is already the strongest possible
+        # resolution. Fuzzy ranking is only for natural-language descriptions.
+        if gen_argument in literal_relation_names:
+            self.last_similarity_scores = [
+                1.0 if relation == gen_argument else 0.0
+                for relation in literal_relation_names
+            ]
+            return RelationCandidate(
+                relation_name=gen_argument,
+                relation_id=gen_argument,
+                score=1.0,
+                is_reverse=False,
+            )
         
         # Check if we have a pre-built index for literal relations
         # if (self.simcse_lit and hasattr(self.simcse_lit, 'index') and 
