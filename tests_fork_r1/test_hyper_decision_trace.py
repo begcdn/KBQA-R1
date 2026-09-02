@@ -1,4 +1,7 @@
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import MethodType, SimpleNamespace
 
 import numpy as np
@@ -10,6 +13,24 @@ from kbqa_r1.fork_r1 import ForkDecision, RelationCandidate
 from kbqa_r1.hyper_r1 import HypothesisGraph
 from kbqa_r1.llm_agent.sexpr_generation import SExprLLMGenerationManager
 from kbqa_r1.llm_agent.sexpr_state_manager import SExprStateManager
+
+
+class _NonReentrantTokenizer:
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._active = False
+
+    def __call__(self, text, **_kwargs):
+        with self._guard:
+            if self._active:
+                raise RuntimeError("Already borrowed")
+            self._active = True
+        try:
+            time.sleep(0.005)
+            return {"offset_mapping": [(i, i + 1) for i in range(len(text))]}
+        finally:
+            with self._guard:
+                self._active = False
 
 
 def _manager(masked: bool):
@@ -46,6 +67,29 @@ def _manager(masked: bool):
 
     manager._hyper_action_constraint = MethodType(constraint, manager)
     return manager
+
+
+def test_action_span_tokenization_is_safe_across_execution_threads():
+    manager = SExprLLMGenerationManager.__new__(SExprLLMGenerationManager)
+    manager.tokenizer = _NonReentrantTokenizer()
+    manager.action_parser = SimpleNamespace(
+        parse_single_action_response=lambda _prediction: None
+    )
+    manager._hyper_turn_actions = {}
+    manager._hyper_turn_invalid_spans = {}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda sample_id: manager._prepare_hyper_turn_actions(
+                    "<think>continue</think>", sample_id, 0
+                ),
+                range(32),
+            )
+        )
+
+    assert results == [[]] * 32
+    assert len(manager._hyper_turn_actions) == 32
 
 
 def test_masked_and_unmasked_capture_the_same_decision_contract():

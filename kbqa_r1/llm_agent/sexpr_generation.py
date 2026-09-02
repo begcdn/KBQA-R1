@@ -10,6 +10,7 @@ import os
 import re
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -107,6 +108,8 @@ class SExprLLMGenerationManager:
     _call_counter = -1
     # Class variable for tracking debug saves (limit to 10 total)
     _debug_save_counter = 0
+    # Fast tokenizers reject overlapping mutable calls from worker threads.
+    _tokenizer_call_lock = Lock()
     
     def __init__(
         self,
@@ -1042,13 +1045,14 @@ class SExprLLMGenerationManager:
 
     def _annotate_action_token_spans(
         self, prediction: str, actions: List[ActionResult]
-    ) -> None:
-        encoded = self.tokenizer(
-            prediction,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        offsets = encoded.get("offset_mapping")
+    ):
+        with self._tokenizer_call_lock:
+            encoded = self.tokenizer(
+                prediction,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            offsets = encoded.get("offset_mapping")
         if offsets is None:
             raise RuntimeError("HyPER-R1 requires tokenizer offset mappings for action credit")
         for action in actions:
@@ -1057,6 +1061,7 @@ class SExprLLMGenerationManager:
             action.token_span = self._char_to_token_span(
                 action.source_span, offsets
             )
+        return offsets
 
     @staticmethod
     def _char_to_token_span(
@@ -1080,17 +1085,8 @@ class SExprLLMGenerationManager:
         """Parse once and retain exact spans for valid and malformed actions."""
         strict_action = self.action_parser.parse_single_action_response(prediction)
         actions = [strict_action] if strict_action is not None else []
-        self._annotate_action_token_spans(prediction, actions)
+        offsets = self._annotate_action_token_spans(prediction, actions)
         self._hyper_turn_actions[(sample_id, int(turn))] = list(actions)
-
-        encoded = self.tokenizer(
-            prediction,
-            add_special_tokens=False,
-            return_offsets_mapping=True,
-        )
-        offsets = encoded.get("offset_mapping")
-        if offsets is None:
-            raise RuntimeError("HyPER-R1 requires tokenizer offset mappings for action credit")
         recognized = [action.source_span for action in actions if action.source_span]
         invalid_spans: List[Tuple[int, int]] = []
         for block in re.finditer(
