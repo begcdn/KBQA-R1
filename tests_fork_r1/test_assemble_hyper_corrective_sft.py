@@ -273,9 +273,8 @@ def test_assembles_exact_deterministic_question_disjoint_mixture(tmp_path):
         manifests.append(manifest)
 
     expected = {
-        "ordinary_v23": 10,
+        "ordinary_v23": 13,
         "autonomous_success": 5,
-        "protocol_recovery": 3,
         "semantic_recovery": 2,
     }
     assert manifests[0]["actual_rows"] == {"train": expected, "dev": expected}

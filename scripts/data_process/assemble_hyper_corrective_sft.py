@@ -55,9 +55,12 @@ from kbqa_r1.action_constraints import HyPERActionConstraintSpec
 
 
 MIXTURE = {
-    "ordinary_v23": 50,
+    # Structural decoding removes protocol-invalid actions at runtime. Keep
+    # the corrective stage focused on executable semantic regret while
+    # retaining enough original decisions to resist forgetting.
+    "ordinary_v23": 65,
     "autonomous_success": 25,
-    "protocol_recovery": 15,
+    "protocol_recovery": 0,
     "semantic_recovery": 10,
 }
 ASSEMBLY_SCHEMA_VERSION = "hyper-corrective-assembly-v1"
@@ -493,6 +496,7 @@ def _load_rollout_candidates(
     path: Path,
     *,
     expected_masked: bool,
+    include_protocol_recoveries: bool = True,
     seed: int,
     dev_fraction: float,
     test_ids: set[str],
@@ -568,7 +572,15 @@ def _load_rollout_candidates(
             previous = decision
         if failures:
             turn, _, kind, decision = min(failures, key=lambda value: (value[0], value[1]))
+            if not isinstance(decision.get("correction"), Mapping):
+                if include_protocol_recoveries:
+                    raise ValueError(
+                        f"{kind} recovery lacks correction metadata"
+                    )
+                continue
             corrected, certifier_hash = _correction_messages(decision, failure_kind=kind)
+            if not include_protocol_recoveries:
+                continue
             recovery_record = {**deepcopy(dict(decision)), "messages": corrected}
             recoveries.append(
                 _candidate(
@@ -974,6 +986,9 @@ def assemble_corrective_dataset(
     masked_success, masked_recovery = _load_rollout_candidates(
         masked_rollouts,
         expected_masked=True,
+        include_protocol_recoveries=any(
+            values["protocol_recovery"] for values in counts.values()
+        ),
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,
@@ -982,6 +997,9 @@ def assemble_corrective_dataset(
     unmasked_success, unmasked_recovery = _load_rollout_candidates(
         unmasked_rollouts,
         expected_masked=False,
+        include_protocol_recoveries=any(
+            values["protocol_recovery"] for values in counts.values()
+        ),
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,

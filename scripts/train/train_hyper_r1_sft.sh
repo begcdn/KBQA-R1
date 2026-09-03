@@ -20,6 +20,44 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 schema = report.get("quality_schema")
+if report.get("schema_version") == "hyper-corrective-assembly-v1":
+    required = {
+        "question_disjoint": True,
+        "test_question_overlap": 0,
+        "student_visible_recovery_marker": False,
+        "fixed_state_weight": 1.0,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": report.get(key)}
+        for key, expected in required.items()
+        if report.get(key) != expected
+    }
+    mixture = report.get("mixture_percent", {})
+    actual = report.get("actual_rows", {})
+    if sum(mixture.values()) != 100:
+        mismatches["mixture_percent"] = mixture
+    if mixture.get("semantic_recovery", 0) <= 0:
+        mismatches["semantic_recovery"] = mixture.get("semantic_recovery")
+    for partition in ("train", "dev"):
+        expected_rows = report.get("requested_rows", {}).get(partition)
+        if sum(actual.get(partition, {}).values()) != expected_rows:
+            mismatches[f"actual_rows.{partition}"] = actual.get(partition)
+    expected_outputs = {"train_decision.parquet", "dev_decision.parquet"}
+    if not expected_outputs.issubset(report.get("output_sha256", {})):
+        mismatches["output_sha256"] = sorted(report.get("output_sha256", {}))
+    if mismatches:
+        raise SystemExit(
+            "HyPER-R1 corrective corpus failed its invariants: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    print("HyPER-R1 corrective corpus passed structural checks.")
+    print(json.dumps({
+        "schema_version": report["schema_version"],
+        "mixture_percent": mixture,
+        "actual_rows": actual,
+        "question_counts": report.get("question_counts"),
+    }, indent=2))
+    raise SystemExit(0)
 if schema == "hyper_r1_v23_runtime_comparison":
     assertions = report.get("assertions", {})
     failed_assertions = [name for name, passed in assertions.items() if not passed]

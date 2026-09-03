@@ -90,37 +90,36 @@ This is an implementation and feasibility gate, not an answer-quality result.
 Two questions cannot estimate benchmark F1 or prove that the policy has learned
 good long-horizon exploration.
 
-## Next Experiment
+## Corrective Evidence Collected
 
-Use only original training-split questions to build a compact corrective
-dataset:
+The step-7500 policy completed 995 unmasked training-split rollouts. It
+produced 756 explicit exact-answer trajectories. Exact-state executable
+certification retained 174 unique semantic recovery decisions: in every row,
+the alternative action is legal in the same visible state and reaches the
+global semantic-utility upper bound under the same remaining budget.
 
-- 50% stratified ordinary v23 decisions;
+Protocol-invalid actions are now removed by structural decoding, and the
+available rollout corpus does not contain enough independently certified
+protocol corrections to justify the earlier 15% allocation. The compact
+corrective mixture is therefore:
+
+- 65% stratified ordinary v23 decisions;
 - 25% successful autonomous decisions;
-- 15% first protocol/loop/deadline recovery states;
 - 10% legal-semantic recovery states certified by executable regret;
 - at most one recovery state per trajectory;
 - question-disjoint correction train/dev splits;
 - no test failures or test questions in training.
 
-The deterministic assembler and production decision-trace collector are now
-implemented, but the corpus is not yet available. Every live turn records the
-canonical model-visible messages, raw response and action, accepted or failed
-transition observation, message-bound state hash, turn-independent progress
-hashes, and the exact state-conditioned constraint digest. Masked and unmasked
-rollouts compute the same contract; only masked decoding applies it. Each
-trajectory also binds its final Commit or forced terminal state to the exact
-node, turn, and answer F1. Validation and rollout JSONL persist these records
-at the top level without inferring corrections or Q-values.
+## Next Experiment
 
-Before another SFT, collect fresh masked and unmasked training-split rollouts
-with exact run provenance. Protocol corrections must be certified against the
-same visible state. Semantic rows must name the policy's failed legal action
-and demonstrate positive executable regret against a bounded continuation
-oracle; internally consistent scores alone are not sufficient.
+Build a 1,500-row train and 140-row question-disjoint dev corpus from the
+unique evidence above. Starting from the full step-7500 checkpoint, run a
+200-step full-parameter corrective SFT at a low learning rate, saving every 50
+steps. This is about four passes over the compact corpus; the earlier
+1,500-2,000-step estimate would excessively repeat the 174 recovery labels.
 
-Run approximately 25,000-50,000 decisions for 1,500-2,000 low-learning-rate
-steps. Evaluate these pre-GRPO arms on correction-dev:
+Evaluate these pre-GRPO arms on correction-dev and held-out executable
+rollouts:
 
 - A0: current SFT, unmasked;
 - A1: current SFT, masked;

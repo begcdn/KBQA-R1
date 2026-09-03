@@ -45,6 +45,7 @@ ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-flash_attention_2}
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-true}
 TRAINER_LOGGERS=${TRAINER_LOGGERS:-"['console','tensorboard']"}
 MODEL_DTYPE=${MODEL_DTYPE:-fp32}
+LEARNING_RATE=${LEARNING_RATE:-1e-5}
 
 # -----------------------------
 # GPU detection and config
@@ -151,6 +152,7 @@ echo "Attention      : ${ATTN_IMPLEMENTATION}"
 echo "Remove padding : ${USE_REMOVE_PADDING}"
 echo "Loggers        : ${TRAINER_LOGGERS}"
 echo "Model dtype    : ${MODEL_DTYPE}"
+echo "Learning rate  : ${LEARNING_RATE}"
 echo "========================================"
 
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -220,7 +222,7 @@ if [[ "${TRAINER}" == "engine" ]]; then
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_STEPS} \
     trainer.logger="${TRAINER_LOGGERS}" \
-    optim.lr=1e-5 \
+    optim.lr=${LEARNING_RATE} \
     optim.clip_grad=1.0 \
     2>&1 | tee "${LOG_DIR}/${EXP_NAME//\//_}.log"
 else
@@ -251,7 +253,7 @@ else
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.save_freq=${SAVE_FREQ} \
     trainer.logger=['console','tensorboard'] \
-    optim.lr=1e-5 \
+    optim.lr=${LEARNING_RATE} \
     optim.warmup_steps_ratio=0.1 \
     optim.clip_grad=1.0 \
     2>&1 | tee "${LOG_DIR}/${EXP_NAME//\//_}.log"
