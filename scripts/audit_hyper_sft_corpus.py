@@ -80,16 +80,18 @@ def assert_supervised_action_afforded(
         return False
     if action.action_type == ActionType.COMBINE_HYPOTHESES:
         target_value = "|".join(action.arguments)
+        equivalent_targets = {target_value, "|".join(reversed(action.arguments))}
     else:
         if len(action.arguments) != 1:
             raise RuntimeError(
                 f"row {row_index} has invalid arguments for {action.action_type.value}"
             )
         target_value = action.arguments[0]
+        equivalent_targets = {target_value}
     allowed = _rendered_targets(observation, label)
     if action.action_type == ActionType.FIND_RELATION and not allowed:
         allowed = _initial_find_relation_sources(observation)
-    if target_value not in allowed:
+    if equivalent_targets.isdisjoint(allowed):
         raise RuntimeError(
             f"row {row_index} supervises unavailable {action.action_type.value} "
             f"target {target_value}; advertised={sorted(allowed)}"

@@ -48,10 +48,16 @@ def test_rejects_a_stale_graph_identifier():
         )
 
 
-def test_rejects_a_nonadvertised_combine_spelling():
-    with pytest.raises(RuntimeError, match="unavailable Combine target H2\\|H1"):
+def test_accepts_reverse_order_for_advertised_combine_pair():
+    assert MODULE.assert_supervised_action_afforded(
+        OBSERVATION, "<action>Combine [ H2 | H1 ]</action>", row_index=9
+    )
+
+
+def test_rejects_a_nonadvertised_combine_pair():
+    with pytest.raises(RuntimeError, match="unavailable Combine target H2\\|H3"):
         MODULE.assert_supervised_action_afforded(
-            OBSERVATION, "<action>Combine [ H2 | H1 ]</action>", row_index=9
+            OBSERVATION, "<action>Combine [ H2 | H3 ]</action>", row_index=9
         )
 
 
