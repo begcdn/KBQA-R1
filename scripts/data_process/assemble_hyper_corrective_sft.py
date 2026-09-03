@@ -139,7 +139,7 @@ def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
             yield value
 
 
-def _load_test_ids(path: Path) -> set[str]:
+def _load_question_ids(path: Path, *, label: str) -> set[str]:
     text = path.read_text(encoding="utf-8")
     try:
         value = json.loads(text)
@@ -150,7 +150,7 @@ def _load_test_ids(path: Path) -> set[str]:
     elif isinstance(value, dict):
         raw = value.get("question_ids") or value.get("ids")
         if not isinstance(raw, list):
-            raise ValueError("test-ID JSON must contain a question_ids or ids list")
+            raise ValueError(f"{label}-ID JSON must contain a question_ids or ids list")
         ids = {str(item).strip() for item in raw if str(item).strip()}
     else:
         ids = set()
@@ -162,17 +162,17 @@ def _load_test_ids(path: Path) -> set[str]:
             except json.JSONDecodeError:
                 ids.add(line.strip())
                 continue
-            if isinstance(row, str):
-                ids.add(row.strip())
+            if isinstance(row, (str, int)) and not isinstance(row, bool):
+                ids.add(str(row).strip())
             elif isinstance(row, dict):
                 question_id = row.get("question_id") or row.get("id")
                 if question_id is None:
-                    raise ValueError(f"{path}:{line_number}: test row has no ID")
+                    raise ValueError(f"{path}:{line_number}: {label} row has no ID")
                 ids.add(str(question_id))
             else:
-                raise ValueError(f"{path}:{line_number}: invalid test-ID row")
+                raise ValueError(f"{path}:{line_number}: invalid {label}-ID row")
     if not ids:
-        raise ValueError("test question-ID set is empty")
+        raise ValueError(f"{label} question-ID set is empty")
     return ids
 
 
@@ -511,7 +511,9 @@ def _load_rollout_candidates(
         if question_id in test_ids:
             raise ValueError(f"{mode} rollout contains test question {question_id}")
         if question_id not in train_ids:
-            raise ValueError(f"{mode} rollout question {question_id} is absent from v23 train")
+            raise ValueError(
+                f"{mode} rollout question {question_id} is absent from official train"
+            )
         rollout_id = str(_value(trajectory, "rollout_id", "request_id"))
         decisions = sorted(
             trajectory["decisions"],
@@ -756,7 +758,9 @@ def _load_semantic_candidates(
         if question_id in test_ids:
             raise ValueError(f"semantic recovery contains test question {question_id}")
         if question_id not in train_ids:
-            raise ValueError(f"semantic recovery question {question_id} is absent from v23 train")
+            raise ValueError(
+                f"semantic recovery question {question_id} is absent from official train"
+            )
         rollout_id = str(_value(row, "rollout_id", "request_id", default="")).strip()
         if not rollout_id:
             raise ValueError("semantic recovery requires rollout_id")
@@ -943,6 +947,7 @@ def assemble_corrective_dataset(
     masked_rollouts: Path,
     unmasked_rollouts: Path,
     semantic_recoveries: Path,
+    train_question_ids: Path,
     test_question_ids: Path,
     provenance_config: Path,
     output: Path,
@@ -959,6 +964,7 @@ def assemble_corrective_dataset(
         "masked_rollouts": masked_rollouts,
         "unmasked_rollouts": unmasked_rollouts,
         "semantic_recoveries": semantic_recoveries,
+        "train_question_ids": train_question_ids,
         "test_question_ids": test_question_ids,
         "provenance_config": provenance_config,
     }
@@ -976,13 +982,22 @@ def assemble_corrective_dataset(
             "provenance config is incomplete: " + ", ".join(incomplete_provenance)
         )
 
-    test_ids = _load_test_ids(test_question_ids)
-    ordinary, train_ids = _index_ordinary(
+    official_train_ids = _load_question_ids(train_question_ids, label="train")
+    test_ids = _load_question_ids(test_question_ids, label="test")
+    if official_train_ids & test_ids:
+        raise ValueError("official train and held-out question IDs overlap")
+    ordinary, ordinary_train_ids = _index_ordinary(
         ordinary_v23,
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,
     )
+    unknown_ordinary_ids = ordinary_train_ids - official_train_ids
+    if unknown_ordinary_ids:
+        raise ValueError(
+            "v23 ordinary data contains questions absent from official train: "
+            + ", ".join(sorted(unknown_ordinary_ids)[:10])
+        )
     masked_success, masked_recovery = _load_rollout_candidates(
         masked_rollouts,
         expected_masked=True,
@@ -992,7 +1007,7 @@ def assemble_corrective_dataset(
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,
-        train_ids=train_ids,
+        train_ids=official_train_ids,
     )
     unmasked_success, unmasked_recovery = _load_rollout_candidates(
         unmasked_rollouts,
@@ -1003,7 +1018,7 @@ def assemble_corrective_dataset(
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,
-        train_ids=train_ids,
+        train_ids=official_train_ids,
     )
     if not masked_success or not unmasked_success:
         raise ValueError("successful autonomous pool must contain masked and unmasked states")
@@ -1012,7 +1027,7 @@ def assemble_corrective_dataset(
         seed=seed,
         dev_fraction=dev_fraction,
         test_ids=test_ids,
-        train_ids=train_ids,
+        train_ids=official_train_ids,
         provenance=provenance,
     )
     pools = {
@@ -1156,6 +1171,7 @@ def main() -> None:
     parser.add_argument("--masked-rollouts", type=Path, required=True)
     parser.add_argument("--unmasked-rollouts", type=Path, required=True)
     parser.add_argument("--semantic-recoveries", type=Path, required=True)
+    parser.add_argument("--train-question-ids", type=Path, required=True)
     parser.add_argument("--test-question-ids", type=Path, required=True)
     parser.add_argument("--provenance-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -1169,6 +1185,7 @@ def main() -> None:
         masked_rollouts=args.masked_rollouts,
         unmasked_rollouts=args.unmasked_rollouts,
         semantic_recoveries=args.semantic_recoveries,
+        train_question_ids=args.train_question_ids,
         test_question_ids=args.test_question_ids,
         provenance_config=args.provenance_config,
         output=args.output,

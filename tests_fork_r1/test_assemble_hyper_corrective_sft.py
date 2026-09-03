@@ -244,6 +244,8 @@ def _fixture(tmp_path: Path, *, seed=17, dev_fraction=0.5):
     _write_jsonl(masked_path, masked)
     _write_jsonl(unmasked_path, unmasked)
     _write_jsonl(semantic_path, semantic)
+    train_ids = tmp_path / "train_ids.txt"
+    train_ids.write_text("".join(f"{qid}\n" for qid in all_qids), encoding="utf-8")
     test_ids = tmp_path / "test_ids.txt"
     test_ids.write_text("held-out-test\n", encoding="utf-8")
     provenance = tmp_path / "provenance.json"
@@ -253,6 +255,7 @@ def _fixture(tmp_path: Path, *, seed=17, dev_fraction=0.5):
         "masked_rollouts": masked_path,
         "unmasked_rollouts": unmasked_path,
         "semantic_recoveries": semantic_path,
+        "train_question_ids": train_ids,
         "test_question_ids": test_ids,
         "provenance_config": provenance,
         "seed": seed,
@@ -408,18 +411,40 @@ def test_uncertified_semantic_recovery_fails_closed(tmp_path):
         )
 
 
-def test_test_question_in_ordinary_input_is_rejected(tmp_path):
+def test_official_train_and_test_question_overlap_is_rejected(tmp_path):
     inputs = _fixture(tmp_path)
     ordinary = pq.read_table(inputs["ordinary_v23"]).to_pylist()
     leaked = ordinary[0]["extra_info"]["question_id"]
     inputs["test_question_ids"].write_text(leaked + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="contains test question"):
+    with pytest.raises(ValueError, match="official train and held-out question IDs overlap"):
         MODULE.assemble_corrective_dataset(
             **inputs,
             output=tmp_path / "output",
             train_size=20,
             dev_size=20,
         )
+
+
+def test_auxiliary_question_absent_from_official_train_is_rejected(tmp_path):
+    inputs = _fixture(tmp_path)
+    rows = list(MODULE._read_jsonl(inputs["masked_rollouts"]))
+    for row in rows:
+        row.pop("__line_number__", None)
+    rows[0]["question_id"] = "not-in-official-train"
+    _write_jsonl(inputs["masked_rollouts"], rows)
+    with pytest.raises(ValueError, match="absent from official train"):
+        MODULE.assemble_corrective_dataset(
+            **inputs,
+            output=tmp_path / "output",
+            train_size=20,
+            dev_size=20,
+        )
+
+
+def test_numeric_question_id_lines_are_accepted(tmp_path):
+    path = tmp_path / "ids.txt"
+    path.write_text("2100001002000\n", encoding="utf-8")
+    assert MODULE._load_question_ids(path, label="train") == {"2100001002000"}
 
 
 def test_semantic_optimal_set_must_match_q_values(tmp_path):
