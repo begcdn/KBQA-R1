@@ -172,6 +172,7 @@ else
     MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-48}
     MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-16384}
 fi
+TRAINER_LOGGER=${TRAINER_LOGGER:-"[console,tensorboard]"}
 
 # 生成时间戳
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
@@ -281,7 +282,7 @@ python3 -m verl.trainer.main_ppo_kbqa \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${MICRO_BATCH_SIZE} \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     algorithm.kl_ctrl.kl_coef=0.001 \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger="${TRAINER_LOGGER}" \
     trainer.val_only=true \
     trainer.val_before_train=true \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
