@@ -34,6 +34,17 @@ METRICS = (
     "hyper_r1_max_active",
 )
 
+SEARCH_DIAGNOSTICS = (
+    "best_seen_answer_f1",
+    "commit_regret",
+    "exact_answer_seen",
+    "exact_answer_abandoned",
+    "nonterminal_actions_after_first_exact",
+    "exact_hypothesis_parks",
+    "exact_hypothesis_recalls",
+    "exact_answer_regression_edges",
+)
+
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -94,6 +105,131 @@ def _target_values(row: Mapping[str, Any]) -> set[str]:
     return {str(value) for value in target}
 
 
+def _answer_set_f1(predicted: Iterable[Any], gold: Iterable[Any]) -> float:
+    predicted_values = {str(value) for value in predicted}
+    gold_values = {str(value) for value in gold}
+    if not predicted_values and not gold_values:
+        return 1.0
+    if not predicted_values or not gold_values:
+        return 0.0
+    overlap = len(predicted_values & gold_values)
+    if not overlap:
+        return 0.0
+    precision = overlap / len(predicted_values)
+    recall = overlap / len(gold_values)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _snapshot_nodes(decision: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    snapshot = decision.get("private_execution_state")
+    if not isinstance(snapshot, Mapping):
+        return []
+    graph = snapshot.get("graph")
+    if not isinstance(graph, Mapping):
+        return []
+    state = graph.get("state")
+    if not isinstance(state, Mapping):
+        return []
+    nodes = state.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    return [node for node in nodes if isinstance(node, Mapping)]
+
+
+def row_search_diagnostics(row: Mapping[str, Any]) -> dict[str, float]:
+    """Measure search regret from private, evaluator-only graph snapshots."""
+    gold = _target_values(row)
+    decisions = sorted(
+        (
+            decision
+            for decision in row.get("decisions", ())
+            if isinstance(decision, Mapping)
+        ),
+        key=lambda decision: int(decision.get("turn", -1)),
+    )
+    node_f1: dict[str, float] = {}
+    node_parent_ids: dict[str, tuple[str, ...]] = {}
+    first_exact_turn: int | None = None
+    exact_parks = 0
+    exact_recalls = 0
+
+    for decision in decisions:
+        turn = int(decision.get("turn", -1))
+        for node in _snapshot_nodes(decision):
+            node_id = str(node.get("node_id") or "")
+            if not node_id:
+                continue
+            score = _answer_set_f1(node.get("denotation", ()), gold)
+            node_f1[node_id] = score
+            parents = node.get("parent_ids") or ()
+            if isinstance(parents, str):
+                parents = [parents]
+            parent_id = str(node.get("parent_id") or "")
+            normalized_parents = tuple(str(value) for value in parents if value)
+            if not normalized_parents and parent_id:
+                normalized_parents = (parent_id,)
+            node_parent_ids[node_id] = normalized_parents
+            if score >= 1.0 - 1e-9 and first_exact_turn is None:
+                first_exact_turn = turn
+
+        if not decision.get("accepted"):
+            continue
+        action = str(decision.get("policy_action") or "")
+        match = re.fullmatch(r"\s*(Park|Recall)\s*\[\s*(H\d+)\s*\]\s*", action)
+        if match and node_f1.get(match.group(2), 0.0) >= 1.0 - 1e-9:
+            if match.group(1) == "Park":
+                exact_parks += 1
+            else:
+                exact_recalls += 1
+
+    best_seen = max(node_f1.values(), default=0.0)
+    commit_f1 = float(row.get("hyper_r1_commit_answer_f1", 0.0))
+    exact_seen = best_seen >= 1.0 - 1e-9
+    nonterminal_after_exact = 0
+    if first_exact_turn is not None:
+        nonterminal_after_exact = sum(
+            1
+            for decision in decisions
+            if int(decision.get("turn", -1)) >= first_exact_turn
+            and decision.get("accepted")
+            and not str(decision.get("policy_action") or "").startswith("Commit [")
+        )
+    regression_edges = sum(
+        1
+        for node_id, parents in node_parent_ids.items()
+        if node_f1.get(node_id, 0.0) < 1.0 - 1e-9
+        and any(node_f1.get(parent, 0.0) >= 1.0 - 1e-9 for parent in parents)
+    )
+    return {
+        "best_seen_answer_f1": best_seen,
+        "commit_regret": max(0.0, best_seen - commit_f1),
+        "exact_answer_seen": float(exact_seen),
+        "exact_answer_abandoned": float(exact_seen and commit_f1 < 1.0 - 1e-9),
+        "nonterminal_actions_after_first_exact": float(nonterminal_after_exact),
+        "exact_hypothesis_parks": float(exact_parks),
+        "exact_hypothesis_recalls": float(exact_recalls),
+        "exact_answer_regression_edges": float(regression_edges),
+    }
+
+
+def _search_diagnostic_means(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
+    materialized = list(rows)
+    diagnostics = [row_search_diagnostics(row) for row in materialized]
+    result = {
+        key: mean(values[key] for values in diagnostics)
+        for key in SEARCH_DIAGNOSTICS
+        if diagnostics
+    }
+    exact_rows = [
+        values for values in diagnostics if values["exact_answer_seen"] > 0.0
+    ]
+    if exact_rows:
+        result["actions_after_first_exact_when_seen"] = mean(
+            values["nonterminal_actions_after_first_exact"] for values in exact_rows
+        )
+    return result
+
+
 def _trajectory_diagnostics(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     materialized = list(rows)
     commit_samples = 0
@@ -137,12 +273,17 @@ def summarize(path: Path, expected: int) -> dict[str, Any]:
         "expected": expected,
         "completion_rate": len(rows) / expected if expected else 0.0,
         "complete": len(rows) == expected,
-        "overall": {**_metric_means(rows), **_trajectory_diagnostics(rows)},
+        "overall": {
+            **_metric_means(rows),
+            **_trajectory_diagnostics(rows),
+            **_search_diagnostic_means(rows),
+        },
         "by_family": {
             family: {
                 "examples": len(group),
                 **_metric_means(group),
                 **_trajectory_diagnostics(group),
+                **_search_diagnostic_means(group),
             }
             for family, group in sorted(by_family.items())
         },
@@ -169,8 +310,11 @@ def _report(metrics: Mapping[str, Any]) -> str:
         "environment_commit_answer_exact_rate",
         "action_failures_per_question",
         "stale_expanded_failures_per_question",
+        *SEARCH_DIAGNOSTICS,
+        "actions_after_first_exact_when_seen",
     ):
-        lines.append(f"| {key} | {overall[key]:.4f} |")
+        if key in overall:
+            lines.append(f"| {key} | {overall[key]:.4f} |")
     lines.extend((
         "",
         "## By family",

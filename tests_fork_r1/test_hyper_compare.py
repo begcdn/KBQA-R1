@@ -18,6 +18,8 @@ def test_compare_is_paired_and_reports_generalization_slices():
     assert report["overall"]["method_wins"] == 1
     assert report["overall"]["ties"] == 1
     assert report["overall"]["method_execution_attempts"] == pytest.approx(6.0)
+    assert report["overall"]["baseline_commit_regret"] == pytest.approx(0.0)
+    assert report["overall"]["method_exact_answer_abandoned_rate"] == pytest.approx(0.0)
     assert report["by_level"]["zero-shot"]["questions"] == 1
 
 

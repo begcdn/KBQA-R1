@@ -11,6 +11,7 @@ from statistics import mean
 from typing import Dict, Iterable, List, Tuple
 
 from scripts.analyze_hyper_r1_eval import _f1, _number, read_rows
+from scripts.summarize_hyper_gate import row_search_diagnostics
 
 
 def row_id(row: dict) -> str:
@@ -61,6 +62,8 @@ def compare(baseline_rows: Iterable[dict], method_rows: Iterable[dict]) -> dict:
         baseline_calls = [value for value in baseline_calls if value is not None]
         method_calls = [execution_attempts(method[qid]) for qid in ids]
         method_calls = [value for value in method_calls if value is not None]
+        baseline_search = [row_search_diagnostics(baseline[qid]) for qid in ids]
+        method_search = [row_search_diagnostics(method[qid]) for qid in ids]
         return {
             "questions": len(ids),
             "baseline_f1": mean(baseline_f1),
@@ -71,6 +74,24 @@ def compare(baseline_rows: Iterable[dict], method_rows: Iterable[dict]) -> dict:
             "method_exact_match": mean(score == 1.0 for score in method_f1),
             "baseline_execution_attempts": mean(baseline_calls) if baseline_calls else None,
             "method_execution_attempts": mean(method_calls) if method_calls else None,
+            "baseline_best_seen_f1": mean(
+                value["best_seen_answer_f1"] for value in baseline_search
+            ),
+            "method_best_seen_f1": mean(
+                value["best_seen_answer_f1"] for value in method_search
+            ),
+            "baseline_commit_regret": mean(
+                value["commit_regret"] for value in baseline_search
+            ),
+            "method_commit_regret": mean(
+                value["commit_regret"] for value in method_search
+            ),
+            "baseline_exact_answer_abandoned_rate": mean(
+                value["exact_answer_abandoned"] for value in baseline_search
+            ),
+            "method_exact_answer_abandoned_rate": mean(
+                value["exact_answer_abandoned"] for value in method_search
+            ),
             "method_wins": sum(delta > 0 for delta in differences),
             "baseline_wins": sum(delta < 0 for delta in differences),
             "ties": sum(delta == 0 for delta in differences),
