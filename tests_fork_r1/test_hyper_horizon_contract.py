@@ -18,7 +18,8 @@ def test_hyper_entrypoints_default_to_32_turns():
     assert "SEXPR_MAX_TURNS=${SEXPR_MAX_TURNS:-7}" in rejection
     assert "hyper_r1.structural_constraints=${HYPER_R1_STRUCTURAL_CONSTRAINTS}" in rejection
     assert "guided_decoding_backend=${GUIDED_DECODING_BACKEND}" in rejection
-    assert "guided_decoding_disable_fallback=${GUIDED_DECODING_DISABLE_FALLBACK}" in rejection
+    assert "guided_decoding_disable_fallback=true" in rejection
+    assert "bool(envs.VLLM_USE_V1)" in rejection
 
     grpo = _read("scripts/train/train_kbqa_sexpr_generation_grpo.sh")
     assert "max_turns=${max_turns:-32}" in grpo
@@ -33,7 +34,9 @@ def test_hyper_entrypoints_default_to_32_turns():
 def test_vllm_version_bridge_moves_backend_selection_to_engine():
     rollout = _read("verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py")
     assert 'minver="0.10.0"' in rollout
-    assert 'guided_kwargs["backend"] = "xgrammar:no-fallback"' in rollout
+    assert "bool(vllm_envs.VLLM_USE_V1)" in rollout
+    assert '"xgrammar:no-fallback"' in rollout
+    assert '"xgrammar"' in rollout
 
 
 def test_hyper_corpus_helpers_do_not_use_old_24_turn_fallback():

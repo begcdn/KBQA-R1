@@ -381,7 +381,15 @@ class vLLMRollout(BaseRollout):
                     params.min_tokens = 0
                     guided_kwargs = {"regex": spec.response_pattern}
                     if not is_version_ge(pkg="vllm", minver="0.10.0"):
-                        guided_kwargs["backend"] = "xgrammar:no-fallback"
+                        from vllm import envs as vllm_envs
+
+                        # vLLM 0.8 V1 has no fallback backend and rejects the
+                        # legacy no-fallback suffix. V0 still needs the suffix.
+                        guided_kwargs["backend"] = (
+                            "xgrammar"
+                            if bool(vllm_envs.VLLM_USE_V1)
+                            else "xgrammar:no-fallback"
+                        )
                     params.guided_decoding = GuidedDecodingParams(**guided_kwargs)
                     request_sampling_params.append(params)
             outputs = self.inference_engine.generate(

@@ -140,8 +140,17 @@ PY
         GUIDED_DECODING_EXTRA_ARGS+=(
             "+actor_rollout_ref.rollout.engine_kwargs.vllm.guided_decoding_disable_fallback=true"
         )
+    elif python3 - <<'PY' >/dev/null 2>&1
+from vllm import envs
+
+raise SystemExit(0 if bool(envs.VLLM_USE_V1) else 1)
+PY
+    then
+        # vLLM 0.8 V1 only implements xgrammar and rejects the legacy
+        # no-fallback suffix. Selecting xgrammar is strict in this engine.
+        GUIDED_DECODING_BACKEND=xgrammar
     else
-        # vLLM 0.8 encodes the same no-fallback guarantee in the backend name.
+        # Legacy V0 encodes the no-fallback guarantee in the backend name.
         GUIDED_DECODING_BACKEND=xgrammar:no-fallback
     fi
 else
