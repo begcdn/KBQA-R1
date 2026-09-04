@@ -30,9 +30,24 @@ detect_gpu_count() {
     return 1
 }
 
-detect_gpu_count
+EXPLICIT_GPU_SELECTION=false
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a VISIBLE_GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
+    GPU_COUNT=${#VISIBLE_GPU_IDS[@]}
+    EXPLICIT_GPU_SELECTION=true
+    echo "Using ${GPU_COUNT} explicitly selected GPU(s): ${CUDA_VISIBLE_DEVICES}"
+else
+    detect_gpu_count
+fi
 
-if [ "$GPU_COUNT" -eq 16 ]; then
+if [[ "${EXPLICIT_GPU_SELECTION}" == "true" ]]; then
+    N_GPUS_PER_NODE=${GPU_COUNT}
+    TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-1}
+    GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.75}
+    : "${MODEL_PATH:?Set MODEL_PATH when selecting GPUs explicitly}"
+    export BASE_MODEL=${BASE_MODEL:-"${MODEL_PATH}"}
+    echo "Explicit GPU selection: using ${CUDA_VISIBLE_DEVICES}"
+elif [ "$GPU_COUNT" -eq 16 ]; then
     export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
     N_GPUS_PER_NODE=16
     TENSOR_MODEL_PARALLEL_SIZE=4
